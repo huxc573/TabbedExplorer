@@ -470,13 +470,17 @@ namespace TabbedExplorer
             return -1;
         }
 
-        /// <summary>按顺序记下本窗口所有标签的路径（给 Hub 写记忆用）。</summary>
+        /// <summary>
+        /// 按顺序记下本窗口所有标签的路径（给 Hub 写记忆用）。
+        /// **正在起 explorer 的标签也算**：那种还没嵌好、`CurrentPath` 是空的，
+        /// `LivePath` 会退回「我们让它开的那个路径」——否则一次中途保存就会把还没加载完的标签从记忆里抹掉。
+        /// </summary>
         internal List<string> TabPaths()
         {
             List<string> r = new List<string>();
             foreach (ExplorerHost h in hosts)
             {
-                if (h == null || h.CabWindow == IntPtr.Zero) continue;   // 还没嵌好的先不记
+                if (h == null) continue;
                 string p = LivePath(h);
                 if (!string.IsNullOrEmpty(p)) r.Add(p);
             }

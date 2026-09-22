@@ -664,16 +664,21 @@ namespace TabbedExplorer
                 }
                 catch (Exception ex) { Diag.Log("Embed: 还原失败 " + ex.Message); }
 
-                // 接管来的窗口得**主动关掉**：它不是我们的进程，KillOwnExplorer 不会碰它，
-                // 光还原成顶层窗口就会在桌面上多出一个孤零零的资源管理器（关标签却留着窗口，说不通）。
-                if (adopted)
+                // 关标签就该把**窗口**关掉。两种情况都是「只能关窗口、不能杀进程」：
+                //   · 接管来的（不是我们起的进程）；
+                //   · 是我们起的，但那个进程**不能杀** —— 实测 `explorer.exe /n,/separate` 起的窗口
+                //     有时会落在**启动前就存在的 explorer 进程**里（很可能就是桌面那个 shell）。
+                //     之前这种情况只把窗口还原成顶层就完事，结果是：关掉标签，桌面上留一个孤零零的
+                //     资源管理器窗口（累积下来还会进下一次启动的「基线」，看着莫名其妙）。
+                bool willKill = !adopted && ExplorerPid != 0 && !pidsBefore.Contains(ExplorerPid);
+                if (!willKill)
                 {
                     try
                     {
-                        Diag.Step("Embed: 关掉接管的窗口 cab=0x" + CabWindow.ToInt64().ToString("X"));
+                        Diag.Step("Embed: 关掉窗口（不杀进程）cab=0x" + CabWindow.ToInt64().ToString("X"));
                         EmbedApi.PostMessageW(CabWindow, EmbedApi.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                     }
-                    catch (Exception ex) { Diag.Log("Embed: 关接管窗口失败 " + ex.Message); }
+                    catch (Exception ex) { Diag.Log("Embed: 关窗口失败 " + ex.Message); }
                 }
             }
             embedded = false;

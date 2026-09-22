@@ -49,10 +49,18 @@ namespace TabbedExplorer
         private WinEHook hook;
         /// <summary>「谁被显示出来了」的系统广播 —— 用来抓川自己打开的文件夹窗口（Bug 1）。</summary>
         private WinShowWatcher captureWatch;
-        /// <summary>看见了、但还没到点去收的候选窗口（值 = 第一次看见的时刻）。见 TryCapture。</summary>
-        private readonly Dictionary<IntPtr, DateTime> pendingCapture = new Dictionary<IntPtr, DateTime>();
-        /// <summary>「我们主动藏起来、还没收编的」窗口 —— 防闪用（川 2026-09-22：从桌面/开始菜单打开的会闪一下）。</summary>
+        /// <summary>看见了、但还没到点去收的候选窗口（值 = 第一次看见的时刻 + 用来写日志的事件号）。见 TryCapture。</summary>
+        private readonly Dictionary<IntPtr, CaptureCandidate> pendingCapture =
+            new Dictionary<IntPtr, CaptureCandidate>();
+        /// <summary>
+        /// 「我们主动藏起来、还没收编的」窗口 —— 防闪用（川 2026-09-22：从桌面/开始菜单打开的会闪一下）。
+        /// ⚠ 2026-09-22：藏这件事挪到了 watcher 自己的线程上做（见 OnWindowShown），
+        /// 所以这个集合现在是**两个线程都会碰**的 —— 一律走 HiddenByUs / MarkHidden / UnmarkHidden 这三个口，别直接动。
+        /// </summary>
         private readonly HashSet<IntPtr> hiddenByUs = new HashSet<IntPtr>();
+        private readonly object hideLock = new object();
+        /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
+        private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
         /// <summary>候选窗口要「晾」多久才收。够短，川感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
@@ -128,19 +136,14 @@ namespace TabbedExplorer
         {
             hook = new WinEHook();
             hook.WinE += delegate { Post(OnWinE); };
-            hook.NewTabKey += delegate { Post(delegate { Hotkey("Ctrl+T"); }); };
-            hook.CloseTabKey += delegate { Post(delegate { Hotkey("Ctrl+W"); }); };
-            hook.NextTabKey += delegate { Post(delegate { Hotkey("Ctrl+Tab"); }); };
-            hook.PrevTabKey += delegate { Post(delegate { Hotkey("Ctrl+Shift+Tab"); }); };
-            // 2026-09-22 新加的三个（历史 / 恢复关闭 / 收藏夹栏），跟浏览器对齐
-            hook.HistoryKey += delegate { Post(delegate { Hotkey("Ctrl+H"); }); };
-            hook.ReopenTabKey += delegate { Post(delegate { Hotkey("Ctrl+Shift+T"); }); };
-            hook.FavBarKey += delegate { Post(delegate { Hotkey("Ctrl+Shift+B"); }); };
-            // Ctrl+1..9 = 跳到第 N 个标签（参数是 0 基）
+            // 7 条可自定义命令合成一个事件（绑定在 settings.json 的 hotkey_*，见 Hotkeys）。
+            // 这里把「命令标识」翻成 EmbedForm 认识的那个词 —— 两边都用标识，不再用组合键文本。
+            hook.Command += delegate(string cmd) { Post(delegate { Hotkey(cmd); }); };
+            // Ctrl+1..9 = 跳到第 N 个标签（参数是 0 基；这一条不参与自定义）
             hook.GotoTabKey += delegate(int i)
             {
                 int n = i;
-                Post(delegate { Hotkey("Ctrl+" + (n + 1)); });
+                Post(delegate { Hotkey("goto:" + n); });
             };
             hook.Start();
 
@@ -166,6 +169,40 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
+        // 设置窗口（全进程只开一个）
+        //
+        // 原来窗口是 EmbedForm 自己 new + Show 的，于是「齿轮开的」和「托盘菜单『更多选项』开的」
+        // 会变成两个窗口。现在收到 Hub 这一处：谁想开都调 OpenSettings()。
+        // ==================================================================
+
+        private SettingsForm settingsForm;
+
+        /// <summary>打开（或提到前面）设置窗口。齿轮、标签条空白右键、托盘菜单「更多选项」都走这儿。</summary>
+        public void OpenSettings()
+        {
+            try
+            {
+                if (settingsForm != null && !settingsForm.IsDisposed)
+                {
+                    Diag.Step("Hub: 设置窗口已经开着 -> 提到前面");
+                    if (settingsForm.WindowState == FormWindowState.Minimized)
+                        settingsForm.WindowState = FormWindowState.Normal;
+                    settingsForm.Activate();
+                    return;
+                }
+                Diag.Step("Hub: 打开设置窗口");
+                settingsForm = new SettingsForm(this);
+                settingsForm.FormClosed += delegate { settingsForm = null; };
+                // 有前台窗口就认它当 owner（居中到它上面、也跟着它一起最小化）；
+                // 没有（比如从托盘菜单点进来）就独立显示。
+                EmbedForm owner = ForegroundForm();
+                if (owner != null && !owner.IsDisposed) settingsForm.Show(owner);
+                else settingsForm.Show();
+            }
+            catch (Exception ex) { Diag.Log("Hub: 打开设置窗口失败 " + ex); }
+        }
+
+        // ==================================================================
         // 捕获「所有」打开的文件夹（Bug 1）
         //
         // 川的原话：「只捕获了 Win+E 这个按键，而不是所有资源管理器打开的文件夹
@@ -187,17 +224,56 @@ namespace TabbedExplorer
             captureTimer.Tick += delegate { DrainCapture(); };
 
             captureWatch = new WinShowWatcher();
-            captureWatch.WindowShown += delegate(IntPtr h)
-            {
-                // 事件在 UI 线程上（OUTOFCONTEXT 投递到注册它的线程），Post 只是再保险一层
-                Post(delegate { TryCapture(h); });
-            };
-            captureWatch.Start();
-            Diag.Step("Hub: 已开始监听「新打开的文件夹窗口」（捕获所有打开的文件夹，延迟 " + CaptureDelayMs + "ms 接收）");
+            captureWatch.WindowShown += OnWindowShown;
+            // ★ 装在自己的线程上（不是 UI 线程）—— 川报的「外部打开的文件夹还是闪一下」就卡在这里，
+            //   详见 WinShowWatcher 类注释里那段「为什么 Hub 那条非要另起线程」。
+            captureWatch.StartDedicated("TabbedExplorer.CaptureWatch");
+            Diag.Step("Hub: 已开始监听「新打开的文件夹窗口」（专用线程，延迟 " + CaptureDelayMs + "ms 接收）");
+        }
+
+        /// <summary>候选窗口：看见的时刻 + 收到事件时它已经可见了多久（诊断用，见 OnWindowShown）。</summary>
+        private sealed class CaptureCandidate
+        {
+            public DateTime SeenAt;
+            public int ReactMs;
         }
 
         /// <summary>
-        /// 看见一个可能是「川新开的文件夹窗口」的显示事件 —— 先**登记，不当场收**。
+        /// ★★ 看见一个新窗口 —— **在 watcher 自己的线程上同步藏**，不绕 UI 线程。
+        ///
+        /// 为什么要这么较真：`SW_HIDE` 晚 30ms，屏幕上就是「闪一下」。
+        /// 旧写法把藏这件事 Post 回 UI 线程，而 UI 线程可能正忙（菜单模态循环 / 起 explorer / 算布局）
+        /// —— 实测日志里能看到「用户点开文件夹」到「我们藏起来」中间隔了几百毫秒。
+        ///
+        /// 这里只做三件便宜事：粗筛（类名/pid/父窗口）→ 登记 → `SW_HIDE`，然后才把重活 Post 回 UI 线程。
+        /// `IsCapturable` 里读的那几个集合（baseline / claims）本身是锁保护的，在哪个线程调都安全。
+        /// </summary>
+        private void OnWindowShown(IntPtr h, int tick)
+        {
+            try
+            {
+                if (quitting || h == IntPtr.Zero) return;
+                if (!Settings.CaptureAll) return;
+                if (!IsCapturable(h)) return;
+
+                int react = Environment.TickCount - tick;      // 系统报事件 → 我们动手，差了多少毫秒
+                bool wasVisible = EmbedApi.IsWindowVisible(h);
+                if (wasVisible)
+                {
+                    MarkHidden(h);
+                    EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                }
+                Diag.Step(string.Format("Hub: 发现新窗口（事件后 {0}ms，当时{1}）先藏起来 cab=0x{2:X}",
+                    react, wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
+
+                // 后面的账（pendingCapture / 起定时器）回 UI 线程做 —— 那两个是 UI 线程的状态
+                Post(delegate { RegisterCandidate(h, react); });
+            }
+            catch (Exception ex) { Diag.Log("Hub: 处理新窗口事件失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 把候选窗口登记进去，等 700ms 后再收。
         ///
         /// 为什么要拖一下（2026-09-22 实测踩到）：我们给标签起 explorer 时，那个窗口也是「新出现的」，
         /// 而 Hub 这边跟标签那边的监听是**两个独立的钩子**，系统先叫谁不保证。
@@ -207,32 +283,30 @@ namespace TabbedExplorer
         /// 拖这几百毫秒之后，情况就很干净：
         ///   · 是我们自己起的窗口 → 那个标签的 25ms 轮询早就把它**认领**了，这里一看已认领就放手；
         ///   · 是川自己开的窗口 → 没人认领，到点就收。
-        /// 代价是川自己双击打开的文件夹会先露一小会儿（几百毫秒）才并进标签里，这个可以接受。
+        /// ⚠ 注意「拖」的只是**收**（AdoptWindow），**藏**是在 OnWindowShown 里当场做的 ——
+        ///   不然这 700ms 里那个原生窗口就明晃晃地摆在屏幕上，用户看到的就是「闪一下」。
         /// </summary>
-        private void TryCapture(IntPtr h)
+        private void RegisterCandidate(IntPtr h, int react)
         {
-            if (quitting || h == IntPtr.Zero) return;
-            if (!Settings.CaptureAll) return;
-            if (!IsCapturable(h)) return;
+            if (quitting || !Settings.CaptureAll) return;
             if (pendingCapture.ContainsKey(h)) return;
-
-            // ★ 发现就**立刻藏起来**（川 2026-09-22 报「从桌面或开始菜单打开文件夹，还是会闪一下」）。
-            //   原来这里只登记、等 700ms 才去收 —— 这 700ms 里那个原生窗口就明晃晃地摆在屏幕上，
-            //   用户看到的就是「闪一下，然后被吸进我们窗口」。Win+E 那条路之所以不闪，
-            //   就是因为标签那边（ExplorerHost.OnAnyWindowShown）一发现就先 SW_HIDE。这里补齐同一套。
-            //   藏了冒充自己的窗口怎么办？不用担心：粗筛已经排除了「我们已经认领的」和「启动基线」，
-            //   而且真要是我们自己起的那一个，标签那边本来也会把它藏起来。
-            if (EmbedApi.IsWindowVisible(h))
+            if (!EmbedApi.IsWindowVisible(h) && !HiddenByUs(h))
             {
-                EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
-                hiddenByUs.Add(h);
-                Diag.Step(string.Format("Hub: 发现新窗口，先藏起来（别让它闪）cab=0x{0:X}", h.ToInt64()));
+                // 已经不在了（被关掉/被别人接管）—— 没登记的藏也别留着
+                ReleaseIfAbandoned(h);
+                return;
             }
-            pendingCapture[h] = DateTime.Now;
+            pendingCapture[h] = new CaptureCandidate { SeenAt = DateTime.Now, ReactMs = react };
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
         }
 
-        /// <summary>这个窗口现在看起来值不值得收（粗筛，真正的收在 AdoptWindow 里再判一次）。</summary>
+        // hiddenByUs 是双线程访问的（watcher 线程藏、UI 线程收尾）—— 一律走这三个口
+        private bool HiddenByUs(IntPtr h) { lock (hideLock) return hiddenByUs.Contains(h); }
+        private void MarkHidden(IntPtr h) { lock (hideLock) hiddenByUs.Add(h); }
+        private bool UnmarkHidden(IntPtr h) { lock (hideLock) return hiddenByUs.Remove(h); }
+
+        /// <summary>这个窗口现在看起来值不值得收（粗筛，真正的收在 AdoptWindow 里再判一次）。
+        /// **可能在两个线程上被调**（watcher 线程先筛、UI 线程再复核），所以只碰锁保护的集合。</summary>
         private bool IsCapturable(IntPtr h)
         {
             string c = EmbedApi.ClassOf(h);
@@ -240,11 +314,11 @@ namespace TabbedExplorer
             if (EmbedApi.IsClaimed(h)) return false;          // 我们自己起的 / 已经被某个标签收了
             if (EmbedApi.IsBaseline(h)) return false;         // 启动前就在那儿的老窗口（还原、重新显示不算新开）
             // 藏着的多半是我们还没嵌好的 —— 但**我们自己藏起来的那批要认**（防闪就是把它们藏了）
-            if (!EmbedApi.IsWindowVisible(h) && !hiddenByUs.Contains(h)) return false;
+            if (!EmbedApi.IsWindowVisible(h) && !HiddenByUs(h)) return false;
             if (EmbedApi.GetParent(h) != IntPtr.Zero) return false;   // 已经是子窗口 → 被谁嵌走了
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return false;
-            if (pid == Process.GetCurrentProcess().Id) return false;
+            if (pid == ourPid) return false;
             return true;
         }
 
@@ -254,29 +328,31 @@ namespace TabbedExplorer
             if (pendingCapture.Count == 0) { captureTimer.Stop(); return; }
             DateTime now = DateTime.Now;
             List<IntPtr> ready = null;
-            foreach (KeyValuePair<IntPtr, DateTime> kv in new List<KeyValuePair<IntPtr, DateTime>>(pendingCapture))
+            foreach (KeyValuePair<IntPtr, CaptureCandidate> kv in new List<KeyValuePair<IntPtr, CaptureCandidate>>(pendingCapture))
             {
-                if ((now - kv.Value).TotalMilliseconds < CaptureDelayMs) continue;
+                if ((now - kv.Value.SeenAt).TotalMilliseconds < CaptureDelayMs) continue;
                 if (ready == null) ready = new List<IntPtr>();
                 ready.Add(kv.Key);
             }
             if (ready == null) return;
             foreach (IntPtr h in ready)
             {
+                int react = pendingCapture[h].ReactMs;
                 pendingCapture.Remove(h);
-                AdoptWindow(h);
+                AdoptWindow(h, react);
             }
         }
 
         /// <summary>真收：把这个窗口接成当前（它所在那）桌面窗口里的一个新标签。</summary>
-        private void AdoptWindow(IntPtr h)
+        private void AdoptWindow(IntPtr h, int react)
         {
             if (quitting || !Settings.CaptureAll) { ReleaseIfAbandoned(h); return; }
             try
             {
                 if (!IsCapturable(h)) { ReleaseIfAbandoned(h); return; }   // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
                 int pid = EmbedApi.ProcessIdOf(h).ToInt32();
-                Diag.Step(string.Format("Hub: 收下这个新开的文件夹窗口 cab=0x{0:X} pid={1}", h.ToInt64(), pid));
+                Diag.Step(string.Format("Hub: 收下这个新开的文件夹窗口 cab=0x{0:X} pid={1}（防闪反应 {2}ms）",
+                    h.ToInt64(), pid, react));
 
                 Guid d = VirtualDesktop.WindowDesktopId(h);
                 if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
@@ -289,7 +365,7 @@ namespace TabbedExplorer
                     ReleaseIfAbandoned(h);
                     return;
                 }
-                hiddenByUs.Remove(h);      // 归标签了，后面由标签负责显示 / 关闭
+                UnmarkHidden(h);      // 归标签了，后面由标签负责显示 / 关闭
                 f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: 捕获新窗口失败 " + ex.Message); }
@@ -302,7 +378,7 @@ namespace TabbedExplorer
         /// </summary>
         private void ReleaseIfAbandoned(IntPtr h)
         {
-            if (!hiddenByUs.Remove(h)) return;
+            if (!UnmarkHidden(h)) return;
             try
             {
                 if (EmbedApi.IsClaimed(h)) return;                  // 归标签了，标签管
@@ -628,12 +704,13 @@ namespace TabbedExplorer
         }
 
         /// <summary>Ctrl+T / Ctrl+W / Ctrl+Tab：派给「前台那个窗口」。
-        /// 钩子只在「我们进程是前台」时才拦这些键，所以这里找得到就一定是自己人。</summary>
-        private void Hotkey(string what)
+        /// 钩子只在「我们进程是前台」时才拦这些键，所以这里找得到就一定是自己人。
+        /// 参数是**命令标识**（`newtab` …）或 `goto:<0 基下标>`。</summary>
+        private void Hotkey(string cmd)
         {
             EmbedForm f = ForegroundForm();
-            if (f == null) { Diag.Step("Hub: " + what + " 但没有我们的前台窗口，忽略"); return; }
-            f.HandleHotkey(what);
+            if (f == null) { Diag.Step("Hub: 热键 " + cmd + " 但没有我们的前台窗口，忽略"); return; }
+            f.HandleHotkey(cmd);
         }
 
         private EmbedForm ForegroundForm()
@@ -761,6 +838,7 @@ namespace TabbedExplorer
             if (quitWait != null) { try { quitWait.Unregister(null); } catch { } quitWait = null; }
             if (quitEvent != null) { try { quitEvent.Close(); } catch { } quitEvent = null; }
             if (captureWatch != null) { try { captureWatch.Dispose(); } catch { } captureWatch = null; }
+            if (settingsForm != null) { try { settingsForm.Close(); } catch { } settingsForm = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
             if (tray != null)

@@ -225,6 +225,16 @@ namespace TabbedExplorer
         [DllImport("dwmapi.dll", PreserveSig = true)]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
+        /// <summary>
+        /// 把窗口的标题栏（非客户区）刷成深/浅色。
+        ///
+        /// ⚠ 光调 `DwmSetWindowAttribute` 经常**当时看不出效果** —— 川 2026-09-22 报的就是这个：
+        /// 「TabbedExplorer设置」那一行打开时是白的，切出去再切回来才正常。
+        /// 原因是 DWM 在窗口**合成完成**后才按属性画框；属性设早了会被忽略，直到下一次
+        /// 「非客户区被重新评估」（Alt+Tab 激活就是强制重评的时点）。
+        /// 所以这里设完属性再补一条 `SWP_FRAMECHANGED` —— 主动通知系统「框架变了、重新取一遍属性」。
+        /// 调用时机上还得配合：`OnHandleCreated`（尽量早）+ 收到 `WM_NCACTIVATE` 时（每次激活补一枪）。
+        /// </summary>
         public static void ApplyTitleBar(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
@@ -234,6 +244,11 @@ namespace TabbedExplorer
                 // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE（1809+）；老版本用 19
                 if (DwmSetWindowAttribute(hwnd, 20, ref v, 4) != 0)
                     DwmSetWindowAttribute(hwnd, 19, ref v, 4);
+
+                // 逼 DWM 重取一次窗口框架（不移动、不改大小、不抢焦点）
+                EmbedApi.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                    EmbedApi.SWP_FRAMECHANGED | EmbedApi.SWP_NOSIZE | EmbedApi.SWP_NOMOVE |
+                    EmbedApi.SWP_NOZORDER | EmbedApi.SWP_NOACTIVATE);
             }
             catch { }
         }

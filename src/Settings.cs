@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
@@ -72,8 +73,64 @@ namespace TabbedExplorer
         public const int TabWidthMin = 64;
         public const int TabWidthMax = 240;
 
-        /// <summary>菜单里给的几个预设宽度（逻辑像素）。想要别的值直接改 settings.txt。</summary>
-        public static readonly int[] TabWidthPresets = new int[] { 80, 96, 112, 128, 144, 168, 192 };
+        /// <summary>
+        /// 「名称过长时自动加宽」**最多能加到多宽**（逻辑像素）。
+        /// 注意这是**另一个上限**，不是 `TabWidth`：
+        ///   开自动加宽时 `TabWidth` 是**基准宽度**，名字放不下才往上加，最多加到这里。
+        /// 川 2026-09-22 报「单标签页并未加宽」的根因就是原来把它卡在 `TabWidth` 上 ——
+        /// 名字再长，宽也超不过 `TabWidth`，看着就是「没加宽」。
+        /// </summary>
+        public const int TabWidenMax = 240;
+
+        // ==================================================================
+        // 快捷键（川 2026-09-22：设置窗口新增「快捷键」页，程序自己的热键可改）
+        //
+        // 只存「命令 → 组合键文本」这一层；解析 / 匹配在 `Hotkeys`（src/Hotkeys.cs）。
+        // 存成**扁平键** `hotkey_<命令>`（Json.cs 是手写的单层解析，不认嵌套对象）。
+        // ==================================================================
+
+        /// <summary>可自定义的命令（顺序 = 设置窗口里显示的顺序）。</summary>
+        public static readonly string[] HotkeyKeys = new string[]
+        {
+            "newtab", "closetab", "nexttab", "prevtab", "history", "reopen", "favbar"
+        };
+
+        /// <summary>各项的默认组合键（跟浏览器对齐那一套）。</summary>
+        public static readonly string[] HotkeyDefaults = new string[]
+        {
+            "Ctrl+T", "Ctrl+W", "Ctrl+Tab", "Ctrl+Shift+Tab", "Ctrl+H", "Ctrl+Shift+T", "Ctrl+Shift+B"
+        };
+
+        private static readonly Dictionary<string, string> hotkeys =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>某个命令现在绑的组合键文本（没设过 / 设空了 ⇒ 用默认）。</summary>
+        public static string Hotkey(string cmd)
+        {
+            string v;
+            if (!string.IsNullOrEmpty(cmd) && hotkeys.TryGetValue(cmd, out v) && !string.IsNullOrEmpty(v))
+                return v;
+            for (int i = 0; i < HotkeyKeys.Length; i++)
+                if (string.Equals(HotkeyKeys[i], cmd, StringComparison.OrdinalIgnoreCase))
+                    return HotkeyDefaults[i];
+            return "";
+        }
+
+        /// <summary>改一条快捷键并立刻落盘。传空串 = 恢复默认。</summary>
+        public static void SetHotkey(string cmd, string combo)
+        {
+            if (string.IsNullOrEmpty(cmd)) return;
+            if (string.IsNullOrEmpty(combo)) hotkeys.Remove(cmd);
+            else hotkeys[cmd] = combo;
+            Save();
+        }
+
+        /// <summary>全部恢复默认（设置窗口「快捷键」页那个按钮）。</summary>
+        public static void ResetHotkeys()
+        {
+            hotkeys.Clear();
+            Save();
+        }
 
         /// <summary>设置文件 = `&lt;程序目录&gt;\data\settings.json`（JSON，见类注释）。</summary>
         public static string FileName { get { return AppPaths.File("settings.json"); } }
@@ -96,6 +153,15 @@ namespace TabbedExplorer
                     TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
                     FavBar       = Json.GetBool(json, "favbar", false);
                     CaptureAll   = Json.GetBool(json, "captureall", true);
+                    hotkeys.Clear();
+                    for (int i = 0; i < HotkeyKeys.Length; i++)
+                    {
+                        string v = Json.Get(json, "hotkey_" + HotkeyKeys[i]);
+                        // 读到的跟默认一样就不存 —— 让文件里只留「川真改过」的那几条
+                        if (!string.IsNullOrEmpty(v) &&
+                            !string.Equals(v, HotkeyDefaults[i], StringComparison.OrdinalIgnoreCase))
+                            hotkeys[HotkeyKeys[i]] = v;
+                    }
                     Diag.Step("设置: " + Describe());
                     return;
                 }
@@ -159,10 +225,11 @@ namespace TabbedExplorer
                 sb.Append("  \"_note\": \"TabbedExplorer 设置。就在程序目录的 data\\\\ 下，拷走整个文件夹就带走了设置和标签记忆。\",\r\n");
                 sb.Append("  \"_capture\": \"perdesktop = 每张虚拟桌面各一个窗口、各记一套标签；migrate = 全进程只一个窗口，Win+E 把它搬到当前桌面\",\r\n");
                 sb.Append("  \"_theme\": \"system = 跟随系统应用模式；light / dark = 强制\",\r\n");
-                sb.Append("  \"_tabwidth\": \"标签页宽度，逻辑像素，64 ~ 240；开了 tabautowiden 时它就是「单个标签最宽能到多少」\",\r\n");
-                sb.Append("  \"_tabautowiden\": \"true = 文件夹名太长时这个标签自己加宽（上限 tabwidth）；false = 所有标签一样宽\",\r\n");
+                sb.Append("  \"_tabwidth\": \"标签页宽度，逻辑像素，64 ~ 240；关掉 tabautowiden 时所有标签就都是这个宽\",\r\n");
+                sb.Append("  \"_tabautowiden\": \"true = 名字太长时这个标签自己加宽（最多 400 逻辑像素）；false = 所有标签一样宽\",\r\n");
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
+                sb.Append("  \"_hotkeys\": \"程序自己的快捷键，格式 Ctrl+Shift+T / Alt+F4 这样；留空或删掉这一行 = 用默认。Ctrl+1..9 跳标签是固定的、不在这里。\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
@@ -170,7 +237,24 @@ namespace TabbedExplorer
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
-                sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append("\r\n");
+                sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
+                // 快捷键：只写「跟默认不一样」的那些（默认值不落文件，以后换默认值能跟着走）
+                StringBuilder hb = new StringBuilder();
+                for (int i = 0; i < HotkeyKeys.Length; i++)
+                {
+                    string v;
+                    if (!hotkeys.TryGetValue(HotkeyKeys[i], out v)) continue;
+                    if (string.IsNullOrEmpty(v)) continue;
+                    if (string.Equals(v, HotkeyDefaults[i], StringComparison.OrdinalIgnoreCase)) continue;
+                    hb.Append("  \"hotkey_").Append(HotkeyKeys[i]).Append("\": \"")
+                      .Append(v.Replace("\\", "\\\\").Replace("\"", "\\\""))
+                      .Append("\",\r\n");
+                }
+                sb.Append(hb.ToString());
+                // 上面每一项末尾都带逗号，这里补最后一行收尾（JSON 末尾多余逗号不合法）
+                string body = sb.ToString();
+                int last = body.LastIndexOf(",\r\n");
+                sb = new StringBuilder(body.Substring(0, last) + "\r\n");
                 sb.Append("}\r\n");
 
                 // 跟记忆一样：先写临时文件再换过去，半途被硬杀不会留下半截文件。
@@ -187,9 +271,10 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7}",
+            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} hotkeys={8}",
                 Text(Capture), KeepTabs ? 1 : 0, Text(Color), TabWidth,
-                TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0);
+                TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
+                hotkeys.Count);
         }
 
         // ==================================================================

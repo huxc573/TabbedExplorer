@@ -12,7 +12,8 @@ namespace TabbedExplorer
     ///
     /// 钩子线程会读它，所以这里的东西必须是**只读 / 线程安全**的：
     ///   · `HasOverflow` 只读一个已算好的 bool 字段（**不能**在钩子里触发重排布局）；
-    ///   · `SwitchTab` / `ScrollStrip` 只往 UI 线程投递（`Defer`），自己不动界面。
+    ///   · `StripWheel` / `ScrollStrip` 只往 UI 线程投递（`Defer`），自己不动界面；
+    ///     唯一的例外是 `HasOverflow`，只读一个已经算好的 bool。
     /// </summary>
     internal sealed class WheelTarget
     {
@@ -21,9 +22,13 @@ namespace TabbedExplorer
         public IntPtr FavBar;
         /// <summary>标签是不是多到需要横向滚动（没开自动缩窄时才会 true）。</summary>
         public Func<bool> HasOverflow;
-        /// <summary>滚轮在标签条上：切前后标签（参数 = 原始 delta）。</summary>
-        public Action<int> SwitchTab;
-        /// <summary>滚轮在内容区：横向滚标签条。</summary>
+        /// <summary>
+        /// 滚轮落在**标签条**上。参数 =（标签条客户区 x, 原始 delta），返回值 = 吞不吞。
+        /// 为什么要给 x：同一条标签条上两种行为 —— **标签区**滚轮 = 切前后标签，
+        /// **右边那排按钮**上的滚轮 = 横向滑标签（川 2026-09-22 要的，见 TabStrip.InButtonArea）。
+        /// </summary>
+        public Func<int, int, bool> StripWheel;
+        /// <summary>滚轮在内容区（且标签溢出）：横向滚标签条。</summary>
         public Action<int> ScrollStrip;
     }
 
@@ -76,17 +81,22 @@ namespace TabbedExplorer
 
     /// <summary>
     /// 全局低级鼠标钩子 —— 只为滚轮一件事（川 2026-09-22 要的）：
-    ///   · 滚轮在**标签条**上 = 切换前后标签页；
-    ///   · 滚轮在**非标签条**区域（内容区）= 横向滚动标签条（没开自动缩窄、标签溢出时才有意义）。
+    ///   · 滚轮在**标签**上 = 切换前后标签页；
+    ///   · 滚轮在**右边那排按钮**上 = 横向滑标签（溢出了才有意义）；
+    ///   · 滚轮在**内容区**且标签溢出 = 横向滚标签条（含 Shift+滚轮）。
     ///
     /// 为什么要用钩子而不是控件的 `OnMouseWheel`：内容区是**跨进程嵌进来的真 explorer 窗口**，
     /// 滚轮消息直接投给它（鼠标在谁身上就归谁），我们的窗体根本收不到 —— 也没法在它之前插一脚。
     /// WH_MOUSE_LL 是唯一能在消息派发**之前**看到滚轮、并且决定吞不吞的地方。
     ///
+    /// 关于 Shift+滚轮：资源管理器的文件列表本来就支持 Shift+滚轮 = **原生横向滚动**
+    /// （这是 shell 自己实现的，不经我们）。所以我们**只在标签溢出时**接管内容区的滚轮，
+    /// 没溢出时一律放行 —— 这时候川在文件列表里按 Shift+滚轮，拿到的就是原生的横向滚动。
+    ///
     /// 三条自我约束（跟 WinEHook 一个道理，抄过来）：
     ///   1. 回调里**只准读状态 + 判定 + 投递**，不写日志、不碰界面；超时会被系统悄悄摘钩子。
     ///   2. 装在**独立线程**的消息循环上，不占 UI 线程。
-    ///   3. **只在标签确实溢出时**才吞内容区的滚轮 —— 否则文件列表的滚动会莫名其妙失效。
+    ///   3. **只在真有意义时**才吞内容区的滚轮 —— 否则文件列表的滚动会莫名其妙失效。
     /// </summary>
     internal sealed class MouseWheelHook : IDisposable
     {
@@ -113,6 +123,9 @@ namespace TabbedExplorer
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool ScreenToClient(IntPtr hWnd, ref POINT pt);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
@@ -144,7 +157,7 @@ namespace TabbedExplorer
                 Diag.Log("WheelHook: 安装失败 err=" + Marshal.GetLastWin32Error());
                 return;
             }
-            Diag.Step("WheelHook: 已安装（标签条上滚轮=切标签；内容区滚轮=横向滚标签）");
+            Diag.Step("WheelHook: 已安装（标签上滚轮=切标签；按钮区/内容区=横滚标签条）");
             ctx = new ApplicationContext();
             Application.Run(ctx);
             if (hHook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(hHook);
@@ -189,13 +202,16 @@ namespace TabbedExplorer
 
             if (w == t.TabStrip)
             {
-                // 标签条上：切换前后标签页
-                if (t.SwitchTab != null) t.SwitchTab(delta);
-                return true;
+                // 标签条上，分左右两半：标签区 = 切标签；右边那排按钮 = 横滑标签（溢出了才吞）
+                POINT c = pt;
+                ScreenToClient(t.TabStrip, ref c);
+                if (t.StripWheel != null) return t.StripWheel(c.x, delta);
+                return false;
             }
             if (w == t.FavBar) return false;           // 收藏夹栏自己有横向滚动，别抢
 
-            // 内容区：只有标签真的溢出时才接管（否则会把文件列表的滚动弄没了）
+            // 内容区：只有标签真的溢出时才接管（否则会把文件列表的滚动弄没了，
+            // 包括 shell 原生的 Shift+滚轮横向滚动）
             if (t.HasOverflow == null || !t.HasOverflow()) return false;
             if (t.ScrollStrip != null) t.ScrollStrip(delta);
             return true;

@@ -38,6 +38,21 @@ namespace TabbedExplorer
             /// 托盘菜单不看这个字段（它统一用 `✓ ` 前缀表示「当前是哪个 / 开没开」）。
             /// </summary>
             public string Group;
+            /// <summary>
+            /// **只在设置窗口里出现**，托盘菜单里不排它（川 2026-09-22：
+            /// 「删除一些不方便以菜单形式设置的内容」）。
+            /// 典型是数值输入项（标签页宽度 → 菜单里塞一排预设值很别扭）和纯说明行。
+            /// </summary>
+            public bool WindowOnly;
+            /// <summary>
+            /// 数值项（设置窗口里画成数字输入框，可自己敲）。`NumMax &gt; 0` 表示「这是一条数值项」。
+            /// 托盘菜单里一律不排（`WindowOnly` 会自动置上）。
+            /// </summary>
+            public int NumMin, NumMax, NumStep;
+            /// <summary>数值项现在的值。</summary>
+            public Func<int> NumGet;
+            /// <summary>数值项改一下要干什么。</summary>
+            public Action<int> NumSet;
         }
 
         private static Node Sep() { return new Node(); }
@@ -55,6 +70,25 @@ namespace TabbedExplorer
         private static Node Branch(string text, List<Node> kids)
         {
             return new Node { Text = text, Children = kids };
+        }
+
+        /// <summary>
+        /// 数值项（设置窗口里画成可自己敲的数字输入框）。托盘菜单里不排 —— 菜单里塞一排预设
+        /// 值很别扭（川 2026-09-22：「标签页宽度也可自己输入数值」）。
+        /// </summary>
+        private static Node Num(string text, int min, int max, int step, Func<int> get, Action<int> set)
+        {
+            return new Node
+            {
+                Text = text, NumMin = min, NumMax = max, NumStep = step,
+                NumGet = get, NumSet = set, WindowOnly = true
+            };
+        }
+
+        /// <summary>只在设置窗口里出现的纯说明行（菜单里列一行点了没反应的灰字没意义）。</summary>
+        private static Node Info(string text)
+        {
+            return new Node { Text = text, WindowOnly = true };
         }
 
         // ==================================================================
@@ -92,15 +126,13 @@ namespace TabbedExplorer
                        () => hub.SetKeepTabs(!Settings.KeepTabs)));
             n.Add(Sep());
 
-            // ④ 标签页宽度（预设几个常用值；想要别的直接改 settings.json）
-            List<Node> widths = new List<Node>();
-            foreach (int w in Settings.TabWidthPresets)
-            {
-                int val = w;
-                widths.Add(Leaf(val + " 像素", () => Settings.TabWidth == val,
-                                () => hub.SetTabWidth(val)));
-            }
-            n.Add(Branch("标签页宽度", widths));
+            // ④ 标签页宽度（川 2026-09-22：「也可自己输入数值」）
+            //    原来是「80/96/112/…」一串预设的子菜单 —— 只能挑不能敲，而且托盘菜单里挂着一层子菜单很难点。
+            //    现在改成设置窗口里的数字输入框（64~240 逻辑像素），菜单里不排它。
+            n.Add(Num("标签页宽度（逻辑像素，" + Settings.TabWidthMin + " ~ " + Settings.TabWidthMax + "）",
+                      Settings.TabWidthMin, Settings.TabWidthMax, 8,
+                      delegate { return Settings.TabWidth; },
+                      delegate(int w) { hub.SetTabWidth(w); }));
 
             // ⑤ 自适应宽度（2026-09-22 川要拆成两项：加宽 / 缩窄）
             n.Add(Leaf("自适应宽度：名称过长时自动加宽",
@@ -136,10 +168,10 @@ namespace TabbedExplorer
             // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有
             // （改动攒 800ms 落盘 + 退出前再存），所以手动这一下只在「怕它没来得及存」时用。
             n.Add(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow()));
-            n.Add(Leaf("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）", null, null));
-            // 川 2026-09-22 问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能，
-            // 原因写在这儿（他的说法是「我看你直接删了」，怕以后再问一遍）：
-            n.Add(Leaf("注：嵌进来的是子窗口，没有标题栏/快速访问工具栏 —— 资源管理器左上角那排抓不回来", null, null));
+            n.Add(Info("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）"));
+            // 川 2026-09-22 问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
+            // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：
+            // 这里**不再写这行说明**，要了解去 README/CHANGELOG 看（那条记在 README 的已知限制里）。
             return n;
         }
 
@@ -178,6 +210,12 @@ namespace TabbedExplorer
             TraySettings ts = new TraySettings();
             ts.Root = new MenuItem("设置");
             ts.Root.MenuItems.AddRange(ToMenus(Spec(hub), ts));
+
+            // 川 2026-09-22：「右键设置 菜单最后加：更多选项」——
+            // 菜单里只留「在菜单里设着顺手」的那些，别的都去设置窗口；这一条就是入口。
+            // 同时也是「删掉那些不方便以菜单形式设置的内容」的兜底：删掉的东西窗口里都还能改。
+            ts.Root.MenuItems.Add(MenuFx.Sep());
+            ts.Root.MenuItems.Add(MenuFx.Item("更多选项…（打开设置窗口）", delegate { hub.OpenSettings(); }));
             return ts;
         }
 
@@ -186,14 +224,16 @@ namespace TabbedExplorer
             List<MenuItem> r = new List<MenuItem>();
             foreach (Node nd in nodes)
             {
-                if (nd.Text == null) { r.Add(new MenuItem("-")); continue; }
+                if (nd.WindowOnly) continue;                      // 只在设置窗口里出现（数值项 / 纯说明行）
+                if (nd.Text == null) { r.Add(MenuFx.Sep()); continue; }
 
                 MenuItem mi = new MenuItem(nd.Text);
                 if (nd.Checked != null) mi.Checked = nd.Checked();   // 自绘时按这个画勾（见 MenuFx）
                 if (nd.Click != null)
                 {
                     Action a = nd.Click;
-                    mi.Click += delegate { a(); };
+                    string label = nd.Text;
+                    mi.Click += delegate { Diag.Step("菜单项: " + label); a(); };
                 }
                 else mi.Enabled = false;
 

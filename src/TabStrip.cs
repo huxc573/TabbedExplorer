@@ -90,10 +90,15 @@ namespace TabbedExplorer
         private static readonly Rectangle[] wbtnRects = new Rectangle[3];   // 见 WBtn 枚举
         private int dividerX;
         private int toolsLeft;
+        /// <summary>标签区右界（画的时候裁到这儿、命中判定也以它为准）。由 EnsureLayout 算一次，两边共用。</summary>
+        private int tabsClipRight;
 
-        // 标签宽度：跟着设置走（逻辑像素 ×DPI）。自适应开着时它当上限。
+        // 标签宽度：跟着设置走（逻辑像素 ×DPI）。
+        //   `MaxTabWidth` = 「标签页宽度」那一项，也就是**基准宽度**；
+        //   `WidenMaxWidth` = 开「名称过长时自动加宽」后**最多能加到多宽**（见 EnsureLayout ①）。
         private int MinTabWidth { get { return Math.Min(Px(72), MaxTabWidth); } }
         private int MaxTabWidth { get { return Px(Settings.TabWidth); } }
+        private int WidenMaxWidth { get { return Math.Max(MaxTabWidth, Px(Settings.TabWidenMax)); } }
         private int NewButtonWidth { get { return Px(28); } }
         private int ToolButtonWidth { get { return Px(32); } }
         private int SettingsButtonWidth { get { return Px(34); } }
@@ -124,7 +129,14 @@ namespace TabbedExplorer
 
         private readonly Font titleFont;      // 标签文字（**不加粗** —— 川 2026-09-22：加粗留给悬停提示）
         private readonly Font tipTitleFont;   // 悬停提示里「文件夹名」那一行的字体（加粗）
-        private readonly Font glyphFont;      // 右侧工具按钮 / 窗口按钮的 MDL2 字形
+        private readonly Font glyphFont;      // 右侧工具按钮的 MDL2 字形
+        /// <summary>
+        /// 窗口按钮（最小化 / 最大化 / 关闭）的字形 —— **比工具按钮小一号**。
+        /// MDL2 里这三个字形（E921/E922/E923/E8BB）是**填满 em 框**的，同样 12px 下看着比
+        /// 齿轮 / 星星 / 历史那几个大一圈（川 2026-09-22 报的「三个按钮图标太大了，和其它不统一」）。
+        /// 10px 正好是 Win10 原生标题栏里这三个字形的尺寸（96dpi 下量到约 10px）。
+        /// </summary>
+        private readonly Font wbtnFont;
 
         /// <summary>窗口没激活（失活）时整体降色 —— 底色和文字都跟原生标题栏一个逻辑。</summary>
         public bool Inactive
@@ -187,6 +199,7 @@ namespace TabbedExplorer
             titleFont = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             tipTitleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
             glyphFont = new Font("Segoe MDL2 Assets", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
+            wbtnFont = new Font("Segoe MDL2 Assets", Px(10), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
             tips.InitialDelay = 350;    // 停一下再弹，别鼠标一扫过就满屏提示
@@ -308,8 +321,14 @@ namespace TabbedExplorer
             // 标签区右界：「+」也得排得下，所以再让出一个「+」的宽度
             int areaRight = Math.Max(Px(40), toolsLeft - NewButtonWidth - Px(2));
             int avail = Math.Max(Px(30), areaRight - Px(2));
+            tabsClipRight = Math.Max(0, areaRight);
 
             // ① 每个标签想要的宽度
+            //
+            // ⚠ 2026-09-22 川报「开启名称过长时自动加宽时，单标签页并未加宽」——
+            //   根因：原来把加宽也卡在 `TabWidth` 上（`min(MaxTabWidth, need)`），
+            //   于是名字再长、宽也超不过「标签页宽度」那一项，看着就是没加宽。
+            //   现在 `TabWidth` 是**基准宽度**：名字放得下就一样宽，放不下才往上加，上限 `TabWidenMax`。
             int[] want = new int[tabs.Count];
             int total = 0;
             for (int i = 0; i < tabs.Count; i++)
@@ -321,8 +340,11 @@ namespace TabbedExplorer
                 {
                     // 图标 + 左右留白 + 右边给关闭按钮留位
                     int need = Px(TextPadLeft) + IconSize + Px(IconGap) + t + CloseAreaWidth + Px(4);
-                    w = Math.Max(MinTabWidth, Math.Min(MaxTabWidth, need));
+                    w = Math.Max(MaxTabWidth, Math.Min(WidenMaxWidth, need));
+                    // 再夹一次「标签区可用宽度」：一个超长名字也不许把别的标签全挤出去
+                    if (w > avail) w = Math.Max(MinTabWidth, avail);
                 }
+                if (w < MinTabWidth) w = MinTabWidth;
                 want[i] = w;
                 total += w;
             }
@@ -358,7 +380,17 @@ namespace TabbedExplorer
         /// <summary>标签区能画到哪儿（右边那排按钮的左边）。画标签时要按它裁，不能压到按钮上。</summary>
         private int TabsClipRight
         {
-            get { EnsureLayout(); return Math.Max(0, toolsLeft - NewButtonWidth - Px(2)); }
+            get { EnsureLayout(); return Math.Max(0, tabsClipRight); }
+        }
+
+        /// <summary>
+        /// 这个 x 是不是落在**右边那排按钮**上（竖向分割线、齿轮、窗口按钮都算）。
+        /// 给滚轮分派用：标签条上滚轮 = 切标签，**按钮区**上滚轮 = 横向滑标签。
+        /// ⚠ 可能在钩子线程上被调 —— 只读一个已经算好的 int，不触发重排（见 WheelHook 的三条约束）。
+        /// </summary>
+        public bool InButtonArea(int x)
+        {
+            return toolsLeft > 0 && x >= toolsLeft;
         }
 
         /// <summary>标签有没有多到需要横向滚动（没开自动缩窄时会出现）。</summary>
@@ -476,6 +508,11 @@ namespace TabbedExplorer
         private int HitTest(Point p)
         {
             EnsureLayout();     // 位置随时可能变（标签增删 / 窗口改宽），先重算一遍
+            // ⚠ 「标签和右边那排按钮是同一层」的另一半（川 2026-09-22）：
+            //   标签溢出了的话，最后几个标签的矩形是**伸到按钮底下**的（只被裁掉了不画）。
+            //   命中判定不过这一刀，在右边空白处右键就会弹「标签右键」（那个 x 坐落在被裁掉的
+            //   那半个标签里）—— 川报的「右边空白菜单没反应」就是这个。先按裁剪线切一刀。
+            if (p.X >= Math.Max(0, tabsClipRight)) return -1;
             for (int i = 0; i < bounds.Count; i++)
             {
                 if (bounds[i].Contains(p)) return i;
@@ -536,7 +573,8 @@ namespace TabbedExplorer
 
             // 标签一律不许压到右边那排按钮上（没开自动缩窄时总宽可能超出可视区）—— 裁一刀。
             Region oldClip = g.Clip;
-            g.SetClip(new Rectangle(0, 0, Math.Max(1, TabsClipRight), Height));
+            int clipR = Math.Max(1, TabsClipRight);
+            g.SetClip(new Rectangle(0, 0, clipR, Height));
 
             for (int i = 0; i < tabs.Count; i++)
             {
@@ -617,6 +655,12 @@ namespace TabbedExplorer
 
             // 底部与容器分隔
             g.Clip = oldClip;      // 右边那排按钮 / 加号不受上面那一刀的影响
+
+            // ---- 标签溢出时的位置指示条（川 2026-09-22 要的「隐藏进度条」）----
+            // 就画在标签区**贴底**一条细条上：底 = 标签区宽度，滑块 = 当前能看到的那一段。
+            // 它在裁剪区之外（先 Clip 恢复再画），不然滑块永远只能看到左边一截。
+            DrawScrollIndicator(g, tabsClipRight, stroke);
+
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
             // “+” 新建：紧跟在最后一个标签右边（位置由 EnsureLayout 算）
@@ -666,9 +710,37 @@ namespace TabbedExplorer
                     g.FillRectangle(new SolidBrush(i == (int)WBtn.Close ? Color.FromArgb(232, 17, 35) : Theme.Hover), b);
                 Color fg = (i == hoverWBtn) ? Color.White
                          : (inactive ? Theme.TextInactive : Theme.Text);
-                TextRenderer.DrawText(g, glyph[i], glyphFont, b, fg,
+                TextRenderer.DrawText(g, glyph[i], wbtnFont, b, fg,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
+        }
+
+        /// <summary>
+        /// 标签溢出时贴在标签区底部的一条**位置指示条**（川 2026-09-22 要的「隐藏进度条」）。
+        /// 轨道 = 标签区宽度，滑块宽 = 「看得见的那一段 / 全部」的比例，滑块位置 = 滚到哪儿了。
+        /// 没溢出就不画（没超出屏幕的时候画一条进度条只会是干扰）。
+        /// </summary>
+        private void DrawScrollIndicator(Graphics g, int areaRight, float stroke)
+        {
+            if (maxScroll <= 0 || tabs.Count < 2) return;
+            int x0 = Px(2);
+            int w = areaRight - x0 - Px(2);
+            if (w < Px(24)) return;
+
+            int h = Math.Max(2, Px(3));
+            int y = Height - h - Math.Max(0, Px(1));
+            int content = w + maxScroll;
+            if (content <= 0) return;
+
+            int thumbW = (int)((long)w * w / content);
+            if (thumbW < Px(24)) thumbW = Math.Min(Px(24), w);
+            int span = Math.Max(1, maxScroll);
+            int thumbX = x0 + (int)((long)(w - thumbW) * Math.Min(scrollX, span) / span);
+
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(inactive ? 38 : 54, Theme.Text)))
+                g.FillRectangle(b, x0, y, w, h);
+            using (SolidBrush b = new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent))
+                g.FillRectangle(b, thumbX, y, thumbW, h);
         }
 
         /// <summary>
@@ -922,6 +994,7 @@ namespace TabbedExplorer
                 if (titleFont != null) titleFont.Dispose();
                 if (tipTitleFont != null) tipTitleFont.Dispose();
                 if (glyphFont != null) glyphFont.Dispose();
+                if (wbtnFont != null) wbtnFont.Dispose();
             }
             base.Dispose(disposing);
         }

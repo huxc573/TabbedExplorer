@@ -421,40 +421,40 @@ namespace TabbedExplorer
                 string p = items[i].Path;
                 if (FavStore.IsFolder(p))
                 {
-                    m.Add(new MenuItem("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(p); }));
+                    m.Add(MenuFx.Item("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(p); }));
                 }
                 else
                 {
-                    m.Add(new MenuItem("用默认程序打开", delegate
+                    m.Add(MenuFx.Item("用默认程序打开", delegate
                     {
                         try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
                         catch (Exception ex) { Toast.Show("打不开", ex.Message); }
                     }));
                 }
-                m.Add(new MenuItem("复制完整路径", delegate
+                m.Add(MenuFx.Item("复制完整路径", delegate
                 {
                     try { Clipboard.SetText(p); }
                     catch (Exception ex) { Diag.Log("收藏夹栏: 复制失败 " + ex.Message); }
                 }));
-                m.Add(new MenuItem("-"));
-                m.Add(new MenuItem("从收藏夹移除", delegate
+                m.Add(MenuFx.Sep());
+                m.Add(MenuFx.Item("从收藏夹移除", delegate
                 {
                     // 只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**
                     if (FavStore.Remove(p)) { Reload(); Diag.Step("收藏夹栏: 移除 " + p); }
                 }));
-                m.Add(new MenuItem("-"));
+                m.Add(MenuFx.Sep());
             }
 
-            m.Add(new MenuItem("刷新收藏夹栏", delegate { Reload(); }));
-            m.Add(new MenuItem("打开收藏夹数据目录", delegate
+            m.Add(MenuFx.Item("刷新收藏夹栏", delegate { Reload(); }));
+            m.Add(MenuFx.Item("打开收藏夹数据目录", delegate
             {
                 try { Process.Start("explorer.exe", "\"" + AppPaths.DataDir + "\""); }
                 catch (Exception ex) { Toast.Show("打不开数据目录", ex.Message); }
             }));
-            m.Add(new MenuItem("-"));
-            MenuItem hide = new MenuItem("隐藏收藏夹栏（Ctrl+Shift+B）");
-            hide.Click += delegate { if (HideRequested != null) HideRequested(this, EventArgs.Empty); };
-            m.Add(hide);
+            m.Add(MenuFx.Sep());
+            // 快捷键文本跟着设置走（可自定义，别写死）
+            m.Add(MenuFx.Item("隐藏收藏夹栏（" + Hotkeys.Combo("favbar") + "）",
+                delegate { if (HideRequested != null) HideRequested(this, EventArgs.Empty); }));
 
             Point at = e.Location;
             MenuFx.Show(MenuFx.Build(m.ToArray()), this, at,

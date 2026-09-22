@@ -12,7 +12,8 @@ namespace TabbedExplorer
     ///   1) **无条件**吞掉 Win+E，改由我们开窗 —— Win+E 是 explorer 在**按键层面**处理的，
     ///      没有 shell verb、没有注册表项可以改（试过改 CommandStore 之类都拦不住），
     ///      唯一能在它之前截住的办法就是 WH_KEYBOARD_LL。
-    ///   2) **只在我们窗口是前台时**接管标签快捷键 Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab。
+    ///   2) **只在我们窗口是前台时**接管标签快捷键（新建/关闭/前后标签/历史/恢复/收藏夹栏 + Ctrl+1..9）。
+    ///      这些绑定是**可自定义**的，真源在 settings.json 的 `hotkey_*`（解析在 Hotkeys）。
     ///
     /// 为什么标签快捷键也得走钩子（2026-09-22 川報「Ctrl+T 完全没效果，Ctrl+W 直接把程序关掉了」）：
     /// 真正持有键盘焦点的是**嵌进来的 explorer 子进程**（跨进程 SetParent 进来的那个窗口树），
@@ -34,15 +35,10 @@ namespace TabbedExplorer
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
-        private const int VK_TAB = 0x09;
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
         private const int VK_E = 0x45;
-        private const int VK_T = 0x54;
-        private const int VK_W = 0x57;
-        private const int VK_H = 0x48;
-        private const int VK_B = 0x42;
         private const int VK_1 = 0x31;      // 主键盘的 1..9（Ctrl+1..9 = 第 N 个标签）
         private const int VK_9 = 0x39;
         private const int VK_LWIN = 0x5B;
@@ -58,24 +54,21 @@ namespace TabbedExplorer
 
         /// <summary>吞到 Win+E 了。**在钩子线程上触发**，订阅者自己往 UI 线程转。</summary>
         public event Action WinE;
-        /// <summary>吞到 Ctrl+T（新标签）。</summary>
-        public event Action NewTabKey;
-        /// <summary>吞到 Ctrl+W（关当前标签）。</summary>
-        public event Action CloseTabKey;
-        /// <summary>吞到 Ctrl+Tab / Ctrl+Shift+Tab（下一个 / 上一个标签）。</summary>
-        public event Action NextTabKey;
-        public event Action PrevTabKey;
-        /// <summary>吞到 Ctrl+H（历史记录）。</summary>
-        public event Action HistoryKey;
-        /// <summary>吞到 Ctrl+Shift+T（恢复刚关掉的标签页）。</summary>
-        public event Action ReopenTabKey;
-        /// <summary>吞到 Ctrl+Shift+B（显示/隐藏收藏夹栏）。</summary>
-        public event Action FavBarKey;
-        /// <summary>吞到 Ctrl+1..9（跳到第 N 个标签）。参数是 0 基下标（Ctrl+1 → 0）。</summary>
+
+        /// <summary>
+        /// 吞到了一条**可自定义**的命令。参数是命令标识（`newtab` / `closetab` / `nexttab` /
+        /// `prevtab` / `history` / `reopen` / `favbar` —— 就是 `Settings.HotkeyKeys` 那 7 条），
+        /// 绑的组合键由 `Hotkeys`（settings.json 里可改）说了算。
+        /// 2026-09-22 改的：原来是一条命令一个事件、组合键写死在本文件里；
+        /// 现在合成一个事件，加/改绑定只动 settings.json 和设置窗口。
+        /// </summary>
+        public event Action<string> Command;
+
+        /// <summary>吞到 Ctrl+1..9（跳到第 N 个标签）。**这一条不参与自定义**（没法绑「一串」键）。参数是 0 基下标。</summary>
         public event Action<int> GotoTabKey;
 
         /// <summary>
-        /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管 Ctrl 系快捷键** ——
+        /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管快捷键** ——
         /// 否则就成了全局霸占 Ctrl+W（浏览器里关标签、别的编辑器里存盘都会被我吃掉）。
         /// 每张虚拟桌面一个窗口之后，这里不再拿它当唯一判据，见 OursIsForeground。
         /// </summary>
@@ -108,7 +101,7 @@ namespace TabbedExplorer
                 Diag.Log("WinEHook: 安装失败 err=" + Marshal.GetLastWin32Error());
                 return;
             }
-            Diag.Step("WinEHook: 已安装（Win+E 无条件；Ctrl+T/Ctrl+W/Ctrl+Tab 仅前台是我们时）");
+            Diag.Step("WinEHook: 已安装（Win+E 无条件；其余快捷键仅我们前台时，绑定见 settings.json 的 hotkey_*）");
             ctx = new ApplicationContext();
             Application.Run(ctx);            // 本线程的消息循环，钩子靠它活着
             if (hHook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(hHook);
@@ -139,6 +132,12 @@ namespace TabbedExplorer
         }
 
         /// <summary>这个键要不要吞掉。**只读状态 + 投递事件**，别的什么都不做（见类注释第 1 条）。</summary>
+        /// <remarks>
+        /// 组合键现在是**可自定义**的（`Hotkeys.Match`，见 settings.json 的 `hotkey_*`）：
+        /// 这里只把「当前按下的键 + 修饰键状态」拿去表里比一下，命中就报命令名。
+        /// 为了不给系统添负担，先做**最便宜的早退**（一个 Ctrl/Alt 都没按就直接放行），
+        /// 再去问「前台是不是我们」—— `OursIsForeground` 要调几个 Win32，别每次按键都做。
+        /// </remarks>
         private bool Handle(int vk)
         {
             bool win = Down(VK_LWIN) || Down(VK_RWIN);
@@ -151,20 +150,21 @@ namespace TabbedExplorer
             }
 
             bool ctrl = Down(VK_CONTROL);
-            if (!ctrl || win || Down(VK_MENU)) return false;   // Alt 一起按的放过（Ctrl+Alt+X 不是我们的）
+            bool alt = Down(VK_MENU);
+            // 有效绑定至少带一个 Ctrl 或 Alt（Shift 可以一起按，但不能是唯一修饰键，见 Hotkeys.Apply）
+            if ((!ctrl && !alt) || win) return false;
             if (!OursIsForeground()) return false;             // 别的程序里按 Ctrl+W 必须原样放行
 
-            bool shift = Down(VK_SHIFT);
-            if (vk == VK_T && !shift) { Raise(NewTabKey); return true; }
-            if (vk == VK_W && !shift) { Raise(CloseTabKey); return true; }
-            if (vk == VK_TAB) { Raise(shift ? PrevTabKey : NextTabKey); return true; }
-            // ---- 2026-09-22 新加的三个，都跟浏览器对齐 ----
-            if (vk == VK_T && shift) { Raise(ReopenTabKey); return true; }   // Ctrl+Shift+T 恢复关闭的标签
-            if (vk == VK_H && !shift) { Raise(HistoryKey); return true; }    // Ctrl+H 历史记录
-            // ⚠ 收藏夹栏必须是 **Ctrl+Shift+B**：Ctrl+B 在资源管理器里是「导航窗格」，别抢
-            if (vk == VK_B && shift) { Raise(FavBarKey); return true; }
-            // Ctrl+1..9 = 跳到第 N 个标签（浏览器那套）。只吞不按 Shift 的。
-            if (vk >= VK_1 && vk <= VK_9 && !shift)
+            string cmd = Hotkeys.Match(vk, ctrl, Down(VK_SHIFT), alt);
+            if (cmd != null)
+            {
+                Action<string> a = Command;
+                if (a != null) a(cmd);
+                return true;
+            }
+
+            // Ctrl+1..9 = 跳到第 N 个标签（浏览器那套；固定，不参与自定义）。只吞没按 Shift / Alt 的。
+            if (ctrl && !alt && !Down(VK_SHIFT) && vk >= VK_1 && vk <= VK_9)
             {
                 int n = vk - VK_1;
                 Action<int> a = GotoTabKey;

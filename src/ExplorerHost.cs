@@ -333,7 +333,7 @@ namespace TabbedExplorer
         /// 立刻把它藏掉。轮询最快也要 25ms，这一位才是「一点不闪」的关键。
         /// 回调在 UI 线程上（WINEVENT_OUTOFCONTEXT 投递到注册它的那个线程的消息队列）。
         /// </summary>
-        private void OnAnyWindowShown(IntPtr h)
+        private void OnAnyWindowShown(IntPtr h, int tick)
         {
             if (disposed || pendingCab != IntPtr.Zero) return;   // 已经盯上了，轮询那边每轮都会藏
 
@@ -348,8 +348,10 @@ namespace TabbedExplorer
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return;
 
-            Diag.Step(string.Format("Embed: 新窗口刚显示就藏掉 cab=0x{0:X} pid={1}", h.ToInt64(), pid));
+            // 先藏再写日志（日志是文件 IO，虽然只有零点几毫秒，但防闪这种事越早越好）
             EmbedApi.ShowWindow(h, SW_HIDE);
+            Diag.Step(string.Format("Embed: 新窗口刚显示就藏掉 cab=0x{0:X} pid={1}（事件后 {2}ms）",
+                h.ToInt64(), pid, Environment.TickCount - tick));
             EmbedApi.Claim(h);          // 先登记再往下走：Hub 的监听（如果插在我们前面）一看已登记就不抢了
             pendingCab = h;
             pendingPid = pid;

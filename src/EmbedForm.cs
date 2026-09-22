@@ -37,6 +37,12 @@ namespace TabbedExplorer
 
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
+        /// <summary>
+        /// 一格滚轮横向滑标签条滑多远（逻辑像素）。不除以 120 —— 一格滚轮就是一步，
+        /// 滑一小段能看清，多了会「哗」地跳过去。
+        /// </summary>
+        private static int TabScrollStep { get { return Px(60); } }
+
         private const int WM_NCHITTEST = 0x0084;
         private const int WM_NCACTIVATE = 0x0086;
         private const int WM_GETMINMAXINFO = 0x0024;
@@ -57,9 +63,6 @@ namespace TabbedExplorer
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
-
-        /// <summary>设置窗口（齿轮 / 空白右键打开的独立窗口；同一时刻只留一个）。</summary>
-        private SettingsForm settingsForm;
 
         /// <summary>刚关掉的标签路径（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
         private readonly List<string> closedTabs = new List<string>();
@@ -235,15 +238,27 @@ namespace TabbedExplorer
             DoLayout();
 
             // 滚轮这件事登记给全局钩子（内容区是跨进程嵌进来的窗口，我们的窗体收不到它的滚轮消息）。
-            // 三个回调都在**钩子线程**上被调用 —— 这里只读状态 / 往 UI 线程投递，绝不动界面。
+            // 回调都在**钩子线程**上被调用 —— 这里只读状态 / 往 UI 线程投递，绝不动界面。
             WheelRouter.Register(new WheelTarget
             {
                 Form = Handle,
                 TabStrip = tabStrip.Handle,
                 FavBar = favBar.Handle,
                 HasOverflow = delegate { return tabStrip.OverflowCached; },
-                SwitchTab = delegate(int delta) { Defer(delegate { CycleTab(delta > 0 ? -1 : 1); }); },
-                ScrollStrip = delegate(int delta) { Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -Px(80) : Px(80)); }); }
+                // 标签条上：左半边（标签）切前后标签，右半边（那排按钮）横向滑标签（川 2026-09-22）
+                StripWheel = delegate(int x, int delta)
+                {
+                    if (tabStrip.InButtonArea(x))
+                    {
+                        // 没溢出就没什么可滑的 —— 别吞，让消息落到它该去的地方
+                        if (!tabStrip.OverflowCached) return false;
+                        Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); });
+                        return true;
+                    }
+                    Defer(delegate { CycleTab(delta > 0 ? -1 : 1); });
+                    return true;
+                },
+                ScrollStrip = delegate(int delta) { Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); }); }
             });
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
@@ -648,46 +663,52 @@ namespace TabbedExplorer
         // 热键 / 标签
         // ==================================================================
 
-        /// <summary>Hub 把热键派过来（钩子那边只知道「前台是我们」，具体哪个窗口由它找）。</summary>
-        internal void HandleHotkey(string what)
+        /// <summary>
+        /// Hub 把热键派过来（钩子那边只知道「前台是我们」，具体哪个窗口由它找）。
+        ///
+        /// 参数是**命令标识**（`newtab` / `closetab` / `nexttab` / `prevtab` / `history` / `reopen` /
+        /// `favbar`，或 `goto:<0 基下标>`）—— 不再是「Ctrl+T」这种文本：
+        /// 组合键现在可自定义（见 Hotkeys），写成文本的话这儿就得到处跟着改。
+        /// </summary>
+        internal void HandleHotkey(string cmd)
         {
-            if (what == "Ctrl+T") { HotkeyNewTab(); return; }
-            if (what == "Ctrl+W") { HotkeyCloseTab(); return; }
-            if (what == "Ctrl+Tab") { CycleTab(1); return; }
-            if (what == "Ctrl+Shift+Tab") { CycleTab(-1); return; }
-            // Ctrl+1..9：跳到第 N 个标签（浏览器那套）。注意判断要卡在数字上 ——
-            // "Ctrl+T"/"Ctrl+W" 也是这个长度，字符不是数字就落下去。
-            if (what.Length == 6 && what.StartsWith("Ctrl+", StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(cmd)) return;
+
+            // Ctrl+1..9 这一族带参数，单独接
+            if (cmd.StartsWith("goto:", StringComparison.Ordinal))
             {
-                char c = what[5];
-                if (c >= '1' && c <= '9') { GotoTab(c - '1'); return; }
-            }
-            // ---- 2026-09-22 新加的三个（都跟浏览器对齐）----
-            if (what == "Ctrl+H")
-            {
-                Diag.Step("EmbedForm: 热键 Ctrl+H -> 历史记录");
-                if (!Visible) Show();
-                Defer(ShowHistoryMenu);
+                int n;
+                if (int.TryParse(cmd.Substring(5), out n)) GotoTab(n);
                 return;
             }
-            if (what == "Ctrl+Shift+T")
+
+            switch (cmd)
             {
-                Diag.Step("EmbedForm: 热键 Ctrl+Shift+T -> 恢复关闭的标签");
-                ReopenClosedTab();
-                return;
+                case "newtab": HotkeyNewTab(); return;
+                case "closetab": HotkeyCloseTab(); return;
+                case "nexttab": CycleTab(1); return;
+                case "prevtab": CycleTab(-1); return;
+                case "history":
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 历史记录");
+                    if (!Visible) Show();
+                    Defer(ShowHistoryMenu);
+                    return;
+                case "reopen":
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 恢复关闭的标签");
+                    ReopenClosedTab();
+                    return;
+                case "favbar":
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 收藏夹栏开关");
+                    if (hub != null) hub.SetFavBar(!favBarOn);
+                    return;
             }
-            if (what == "Ctrl+Shift+B")
-            {
-                Diag.Step("EmbedForm: 热键 Ctrl+Shift+B -> 收藏夹栏开关");
-                if (hub != null) hub.SetFavBar(!favBarOn);
-                return;
-            }
+            Diag.Log("EmbedForm: 不认识的热键命令 " + cmd);
         }
 
         /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。目标是「此电脑」（川报的 bug 4）。</summary>
         private void HotkeyNewTab()
         {
-            Diag.Step("EmbedForm: 热键 Ctrl+T -> 新标签（此电脑）");
+            Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo("newtab") + " -> 新标签（此电脑）");
             if (!Visible) Show();
             NewTab(ExplorerView.ThisPcPath);
         }
@@ -704,18 +725,18 @@ namespace TabbedExplorer
         private void HotkeyCloseTab()
         {
             int i = activeIndex >= 0 ? activeIndex : hosts.Count - 1;
-            Diag.Step("EmbedForm: 热键 Ctrl+W -> 关标签 idx=" + i);
+            Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo("closetab") + " -> 关标签 idx=" + i);
             if (i < 0) { HideToTray(); return; }
             CloseTab(i);
         }
 
-        /// <summary>Ctrl+Tab / Ctrl+Shift+Tab：在标签之间循环。</summary>
+        /// <summary>Ctrl+Tab / Ctrl+Shift+Tab：在标签之间循环（滚轮切标签也走这儿 —— 日志别写成「热键」）。</summary>
         private void CycleTab(int delta)
         {
             if (hosts.Count < 2) return;
             int n = hosts.Count;
             int i = ((activeIndex + delta) % n + n) % n;
-            Diag.Step("EmbedForm: 热键 Ctrl+Tab -> 切到 idx=" + i);
+            Diag.Step("EmbedForm: 切标签 -> idx=" + i + "（" + (delta > 0 ? "下一个" : "上一个") + "）");
             Activate(i);
         }
 
@@ -1190,25 +1211,8 @@ namespace TabbedExplorer
         private void ShowSettingsWindow()
         {
             if (hub == null || IsDisposed || Disposing) return;
-            try
-            {
-                if (settingsForm != null && !settingsForm.IsDisposed)
-                {
-                    Diag.Step("EmbedForm: 设置窗口已经开着 -> 提到前面");
-                    if (settingsForm.WindowState == FormWindowState.Minimized)
-                        settingsForm.WindowState = FormWindowState.Normal;
-                    settingsForm.Activate();
-                    return;
-                }
-                Diag.Step("EmbedForm: 打开设置窗口");
-                settingsForm = new SettingsForm(hub);
-                settingsForm.FormClosed += delegate { settingsForm = null; };
-                settingsForm.Show(this);
-            }
-            catch (Exception ex)
-            {
-                Diag.Log("EmbedForm: 打开设置窗口失败 " + ex);
-            }
+            // 窗口的所有权收到 Hub（全进程只开一个）—— 齿轮、空白右键、托盘菜单「更多选项」都是这一个。
+            hub.OpenSettings();
         }
 
         // ==================================================================
@@ -1293,7 +1297,24 @@ namespace TabbedExplorer
             else NewTab(p);
         }
 
-        /// <summary>标签上右键：复制文件夹名 / 复制完整路径 / 关闭（川点名的三条）。</summary>
+        /// <summary>
+        /// 建一条菜单项：点下去**先在日志里记一笔**再执行（实现在 `MenuFx.Item`，收藏夹栏那份菜单也用同一个）。
+        /// 川 2026-09-22 连着两轮报「右键菜单功能没实现」—— 这里加一行日志是为了以后不用猜：
+        /// 「菜单弹出来了但点了没反应」和「点了、动作自己失败了」在日志里是两回事。
+        /// </summary>
+        private static MenuItem Mi(string text, Action a) { return MenuFx.Item(text, a); }
+
+        /// <summary>分隔线（菜单项一律走 Mi，分隔线也收在这儿）。</summary>
+        private static MenuItem SepItem() { return MenuFx.Sep(); }
+
+        /// <summary>某个 ExplorerHost 现在在 hosts 里排第几（关标签会把索引挪位，按引用找）。</summary>
+        private int IndexOfHost(ExplorerHost h)
+        {
+            for (int i = 0; i < hosts.Count; i++) if (hosts[i] == h) return i;
+            return -1;
+        }
+
+        /// <summary>标签上右键：复制 / 打开 / 收藏 / 关（含「关闭其它 / 左边 / 右边」—— 川 2026-09-22 新增）。</summary>
         private void ShowTabMenu(int idx)
         {
             if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
@@ -1302,10 +1323,10 @@ namespace TabbedExplorer
             string target = PathRules.Restorable(live) ? live : hosts[idx].TargetPath;
 
             List<MenuItem> m = new List<MenuItem>();
-            m.Add(new MenuItem("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
-            m.Add(new MenuItem("复制完整路径", delegate { CopyText(target, "完整路径"); }));
-            m.Add(new MenuItem("-"));
-            m.Add(new MenuItem("在新标签页打开", delegate
+            m.Add(Mi("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
+            m.Add(Mi("复制完整路径", delegate { CopyText(target, "完整路径"); }));
+            m.Add(SepItem());
+            m.Add(Mi("在新标签页打开", delegate
             {
                 if (!PathRules.Restorable(target))
                 {
@@ -1315,7 +1336,7 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
-            m.Add(new MenuItem("复制标签页", delegate
+            m.Add(Mi("复制标签页", delegate
             {
                 if (!PathRules.Restorable(target))
                 {
@@ -1325,19 +1346,58 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
-            m.Add(new MenuItem("添加到收藏夹栏", delegate
-            {
-                Defer(delegate { AddToFavorites(target); });
-            }));
-            m.Add(new MenuItem("重新打开刚关闭的标签页(Ctrl+Shift+T)",
+            m.Add(Mi("添加到收藏夹栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
+            m.Add(Mi("重新打开刚关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
                 delegate { Defer(ReopenClosedTab); }));
-            m.Add(new MenuItem("-"));
-            m.Add(new MenuItem("关闭标签页(Ctrl+W)", delegate { Defer(delegate { CloseTab(idx); }); }));
+            m.Add(SepItem());
+            m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
+            // ---- 川 2026-09-22 新增的三条（跟浏览器右键对表）----
+            // 只剩一个标签 / 当前就在最左（右）时置灰 —— 点了什么也不发生的项还不如直接灰着
+            m.Add(Mi("关闭其它标签页", hosts.Count > 1
+                ? (Action)delegate { Defer(delegate { CloseOtherTabs(idx); }); } : null));
+            m.Add(Mi("关闭左边标签页", idx > 0
+                ? (Action)delegate { Defer(delegate { CloseTabsBefore(idx); }); } : null));
+            m.Add(Mi("关闭右边标签页", idx < hosts.Count - 1
+                ? (Action)delegate { Defer(delegate { CloseTabsAfter(idx); }); } : null));
+            m.Add(SepItem());
+            m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
             Rectangle b = tabStrip.TabBounds(idx);
             Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
             MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
                 "标签右键 idx=" + idx);
+        }
+
+        /// <summary>关闭除了 keep 之外的所有标签。</summary>
+        private void CloseOtherTabs(int keep)
+        {
+            if (keep < 0 || keep >= hosts.Count || hosts.Count <= 1) return;
+            ExplorerHost k = hosts[keep];
+            Diag.Step("EmbedForm: 关闭其它标签页（保留 idx=" + keep + "）");
+            for (int i = hosts.Count - 1; i >= 0; i--)
+            {
+                if (hosts[i] != k && i < hosts.Count) CloseTab(i);
+            }
+            int n = IndexOfHost(k);
+            if (n >= 0) Activate(n);
+        }
+
+        /// <summary>关闭 idx 左边（不含）的所有标签。</summary>
+        private void CloseTabsBefore(int idx)
+        {
+            if (idx <= 0 || idx >= hosts.Count) return;
+            Diag.Step("EmbedForm: 关闭左边标签页（idx=" + idx + " 左边共 " + idx + " 个）");
+            for (int i = idx - 1; i >= 0; i--) CloseTab(i);
+            Activate(0);
+        }
+
+        /// <summary>关闭 idx 右边（不含）的所有标签。</summary>
+        private void CloseTabsAfter(int idx)
+        {
+            if (idx < 0 || idx >= hosts.Count - 1) return;
+            Diag.Step("EmbedForm: 关闭右边标签页（idx=" + idx + " 右边共 " + (hosts.Count - 1 - idx) + " 个）");
+            for (int i = hosts.Count - 1; i > idx; i--) CloseTab(i);
+            Activate(Math.Min(idx, hosts.Count - 1));
         }
 
         /// <summary>把这个位置加进收藏夹栏（收藏夹是我们自己那份 data\favorites.json，见 FavStore）。</summary>
@@ -1356,30 +1416,46 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 标签条空白处右键 —— 那三个新功能也在这儿放一份（川要的），
-        /// 顺带把「新建标签页」写出来（这块空白本来双击就是新建，写明白更好）。
+        /// 标签条**空白处**右键（标签右边的空条 + 标签左边的空条都算）。
+        ///
+        /// 川 2026-09-22 报「右边空白菜单的功能还没实现」—— 两个原因，都在这儿收掉：
+        ///   ① 真的定位错了：标签溢出时最后半个标签的矩形伸到了按钮底下，右键落在那一块被
+        ///      `HitTest` 认成「标签」而不是「空白」（修在 TabStrip.HitTest）；
+        ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 收藏夹栏 / 三个关标签 / 设置都放进来。
+        /// 每条都从 `Mi` 建 —— 点下去日志里会留一行，以后不用再猜「到底点没点中」。
         /// </summary>
         private void ShowBlankMenu()
         {
             if (IsDisposed || Disposing) return;
             List<MenuItem> m = new List<MenuItem>();
-            m.Add(new MenuItem("新建标签页(Ctrl+T)", delegate { Defer(delegate { NewTab(ExplorerView.ThisPcPath); }); }));
-            m.Add(new MenuItem("-"));
-            m.Add(new MenuItem("历史记录(Ctrl+H)", delegate { Defer(ShowHistoryMenu); }));
-            m.Add(new MenuItem("恢复关闭的标签页(Ctrl+Shift+T)", delegate { Defer(ReopenClosedTab); }));
+            m.Add(Mi("新建标签页(" + Hotkeys.Combo("newtab") + ")",
+                delegate { Defer(delegate { NewTab(ExplorerView.ThisPcPath); }); }));
+            m.Add(SepItem());
+            m.Add(Mi("历史记录(" + Hotkeys.Combo("history") + ")", delegate { Defer(ShowHistoryMenu); }));
+            m.Add(Mi("恢复关闭的标签页(" + Hotkeys.Combo("reopen") + ")", delegate { Defer(ReopenClosedTab); }));
 
             bool on = favBarOn;
             // 勾选走 `MenuItem.Checked`（自绘那一列会画勾，见 MenuFx）——
             // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（川报过）。
-            MenuItem favItem = new MenuItem("显示收藏夹栏(Ctrl+Shift+B)", delegate
+            MenuItem favItem = Mi("显示收藏夹栏(" + Hotkeys.Combo("favbar") + ")", delegate
             {
                 if (hub != null) hub.SetFavBar(!on);
             });
             favItem.Checked = on;
             m.Add(favItem);
 
-            m.Add(new MenuItem("-"));
-            m.Add(new MenuItem("设置", delegate { Defer(ShowSettingsWindow); }));
+            // 三个关标签的动作（跟标签右键同一套，作用于**当前标签**）
+            int cur = activeIndex;
+            m.Add(SepItem());
+            m.Add(Mi("关闭其它标签页", (cur >= 0 && hosts.Count > 1)
+                ? (Action)delegate { Defer(delegate { CloseOtherTabs(cur); }); } : null));
+            m.Add(Mi("关闭左边标签页", (cur > 0)
+                ? (Action)delegate { Defer(delegate { CloseTabsBefore(cur); }); } : null));
+            m.Add(Mi("关闭右边标签页", (cur >= 0 && cur < hosts.Count - 1)
+                ? (Action)delegate { Defer(delegate { CloseTabsAfter(cur); }); } : null));
+
+            m.Add(SepItem());
+            m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
             Point at = tabStrip.PointToScreen(blankAt);
             MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
@@ -1433,29 +1509,12 @@ namespace TabbedExplorer
         /// </summary>
         protected override void OnPreviewKeyDown(PreviewKeyDownEventArgs e)
         {
-            if (e.Control && e.KeyCode == Keys.T)
+            // 可自定义的那 7 条走同一张绑定表（`Hotkeys`）—— 跟钩子那条主路用的是**同一份**配置，
+            // 不然改完快捷键会出现「explorer 里好使、点在我们自己的标签条上就不好使」这种怪事。
+            string cmd = Hotkeys.MatchKeyData(e.KeyData);
+            if (cmd != null)
             {
-                // Ctrl+Shift+T（恢复关闭的标签）跟 Ctrl+T 只差一个 Shift，先判带 Shift 的那个
-                if (e.Shift) ReopenClosedTab(); else HotkeyNewTab();
-                e.IsInputKey = true;
-                return;
-            }
-            if (e.Control && e.KeyCode == Keys.W) { HotkeyCloseTab(); e.IsInputKey = true; return; }
-            if (e.Control && e.KeyCode == Keys.H)
-            {
-                Defer(ShowHistoryMenu);
-                e.IsInputKey = true;
-                return;
-            }
-            if (e.Control && e.Shift && e.KeyCode == Keys.B)
-            {
-                if (hub != null) hub.SetFavBar(!favBarOn);
-                e.IsInputKey = true;
-                return;
-            }
-            if (e.Control && e.KeyCode == Keys.Tab)
-            {
-                CycleTab(e.Shift ? -1 : 1);
+                HandleHotkey(cmd);
                 e.IsInputKey = true;
                 return;
             }
@@ -1508,11 +1567,7 @@ namespace TabbedExplorer
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason + " 桌面=" + DesktopKey);
-            if (settingsForm != null)
-            {
-                try { settingsForm.Close(); settingsForm.Dispose(); } catch { }
-                settingsForm = null;
-            }
+            // 设置窗口现在归 Hub 管（它会在自己 Dispose 时收）—— 这里不再碰。
             try { trimTimer.Stop(); trimTimer.Dispose(); } catch { }
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }

@@ -216,6 +216,36 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 建一条菜单项：点下去**先在日志里记一笔**再执行。
+        ///
+        /// 川 2026-09-22 连着两轮报「右键菜单功能没实现」—— 加这一行是为了以后不用猜：
+        /// 「菜单弹出来了但点了没反应」和「点了、动作自己失败了」在日志里是两回事
+        /// （前者只会有「弹出/关闭」，后者一定会留下 `菜单项: xxx`）。
+        /// **全程序的右键菜单都从这一条建**（菜单项别自己 `new MenuItem`）。
+        /// `a == null` 就是一条灰着的项（当前做不了的动作，比如「关闭左边标签页」在没有左邻居时）。
+        /// </summary>
+        public static MenuItem Item(string text, Action a)
+        {
+            MenuItem m = new MenuItem(text);
+            if (a == null) { m.Enabled = false; return m; }
+            m.Click += delegate
+            {
+                Diag.Step("菜单项: " + text);
+                try { a(); }
+                catch (Exception ex) { Diag.Log("菜单项失败: " + text + " " + ex.Message); }
+            };
+            return m;
+        }
+
+        /// <summary>分隔线（老式 MenuItem 用 `"-"` 表示分隔线）。</summary>
+        public static MenuItem Sep()
+        {
+            MenuItem m = new MenuItem("-");
+            m.Enabled = false;
+            return m;
+        }
+
+        /// <summary>
         /// 弹菜单（**模态**：一直阻塞到菜单关掉）。所有调用点都走这儿 ——
         /// 免得又出现「某处忘了记日志、出问题查不出来」。
         /// </summary>

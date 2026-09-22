@@ -104,6 +104,10 @@ namespace TabbedExplorer
             Theme.Mode = Settings.Color;   // 跟随系统 / 浅色 / 深色
             Theme.Reload();                // 先定下深浅色，后面所有自绘都按它来
 
+            // 快捷键（可自定义，存在 settings.json 的 hotkey_*）—— 必须在**装钩子之前**解析好：
+            // WinEHook 的判定是拿这张表比整数（见 Hotkeys）。
+            try { Hotkeys.Reload(); } catch (Exception ex) { LogFatal("解析快捷键失败: " + ex.Message); }
+
             // 进程级深色必须在**创建任何窗口之前**声明：uxtheme 的 SetPreferredAppMode
             // 是进程级开关，窗口建好之后才设，shell 的文件列表那一层（DirectUIHWND）
             // 不会跟着变 —— 只改到外框，表现就是「外壳深、列表白」。

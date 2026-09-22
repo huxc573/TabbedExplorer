@@ -16,3 +16,6 @@ probe/*.txt
 
 # 本机临时
 *.tmp
+
+# 图标源图（app.ico 由 tools/make-icon.py 生成，源图留一份但不必进库）
+!app-icon-1024.png

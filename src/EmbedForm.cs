@@ -75,6 +75,7 @@ namespace TabbedExplorer
             MinimumSize = new Size(Px(640), Px(420));
             StartPosition = FormStartPosition.CenterScreen;
             KeyPreview = true;
+            Icon = ShellIcon.AppIcon(false);   // 任务栏 / Alt+Tab 用程序自己的图标
 
             // 无边框 + 自绘标题栏。
             // 嵌入进来的 explorer 是子窗口、没有标题栏，而它的快速访问工具栏恰好画在
@@ -280,10 +281,10 @@ namespace TabbedExplorer
 
         private void SetupResident()
         {
-            // 托盘图标就用「新建文件夹」那颗（shell32.dll,-319），一眼认得出是资源管理器。
-            Icon icon = ShellIcon.LoadIcon("shell32.dll", -319);
+            // 托盘图标 = **程序自己的图标**（exe 里编进去的那颗）。
+            // 以前借的是 shell32.dll 的「新建文件夹」——那是资源管理器的图标，不是我们的。
             tray = new NotifyIcon();
-            tray.Icon = icon != null ? icon : SystemIcons.Application;
+            tray.Icon = ShellIcon.AppIcon(true);
             tray.Text = "TabbedExplorer（接 Win+E）";
             tray.Visible = true;
 
@@ -505,10 +506,12 @@ namespace TabbedExplorer
             content.Controls.Add(h.Host);
             hosts.Add(h);
             tabStrip.AddTab("打开中…");
+            h.SetIconTarget(TabStrip.TabIconSize);      // 告诉它图标画多大（设备像素）
 
             h.Ready += delegate(object s, EventArgs e) { OnHostReady(h); };
             h.Failed += delegate(object s, EventArgs e) { OnHostFailed(h); };
             h.TitleChanged += delegate(object s, EventArgs e) { OnHostTitleChanged(h); };
+            h.IconChanged += delegate(object s, EventArgs e) { OnHostIconChanged(h); };
             h.Died += OnHostDied;
 
             SetStatus("正在打开 " + path + " …（新 explorer 窗口约需 3 秒）");
@@ -521,6 +524,7 @@ namespace TabbedExplorer
             int i = hosts.IndexOf(h);
             if (i < 0) return;                       // 已经关掉了
             tabStrip.SetTitle(i, h.CurrentDisplayName);
+            tabStrip.SetIcon(i, h.TabIcon);
             if (i == activeIndex)
             {
                 h.Host.Visible = true;
@@ -541,12 +545,21 @@ namespace TabbedExplorer
             if (i < 0) return;
             string t = h.CurrentDisplayName;
             tabStrip.SetTitle(i, t);
+            tabStrip.SetIcon(i, h.TabIcon);          // 导航后文件夹图标也会换（同一个窗口，换的是它自己挂的图标）
             if (i == activeIndex)
             {
                 Text = t;
                 titleBar.Title = t;
                 SetStatus(t);
             }
+        }
+
+        /// <summary>标签图标变了（explorer 按当前文件夹换掉了窗口自己那颗图标）。</summary>
+        private void OnHostIconChanged(ExplorerHost h)
+        {
+            int i = hosts.IndexOf(h);
+            if (i < 0) return;
+            tabStrip.SetIcon(i, h.TabIcon);
         }
 
         private void OnHostFailed(ExplorerHost h)

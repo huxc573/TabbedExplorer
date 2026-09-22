@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
 
 namespace TabbedExplorer
 {
@@ -177,6 +178,52 @@ namespace TabbedExplorer
             catch { }
             finally { raw.Dispose(); }
             return result;
+        }
+
+        /// <summary>
+        /// 把一个**别人的** HICON 画成我们的位图（典型：读 explorer 窗口自己挂的那颗文件夹图标，
+        /// 见 `EmbedApi.WindowIcon`）。
+        /// ⚠ **不 DestroyIcon** —— 句柄不是我们创建的；调用方拿到位图后请立刻不再持有原句柄。
+        /// </summary>
+        public static Bitmap FromForeignHIcon(IntPtr hIcon, int target)
+        {
+            if (hIcon == IntPtr.Zero || target <= 0) return null;
+            try { return RenderIcon(hIcon, target, false); }
+            catch (Exception ex)
+            {
+                Diag.Log("ShellIcon: 渲染外部 HICON 失败 " + ex.Message);
+                return null;
+            }
+        }
+
+        private static Icon appSmall, appBig;
+
+        /// <summary>
+        /// **程序自己的图标** —— exe 里用 `/win32icon:app.ico` 编进去的那颗。
+        /// 托盘、任务栏、Alt+Tab 全用它；取不到才退回系统默认图标。
+        /// （以前托盘借的是 shell32.dll 的「新建文件夹」，那是资源管理器的图标，不是我们的。）
+        /// </summary>
+        public static Icon AppIcon(bool small)
+        {
+            try
+            {
+                if (small && appSmall != null) return appSmall;
+                if (!small && appBig != null) return appBig;
+
+                Icon src = null;
+                try { src = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+                catch { }
+                if (src == null) return SystemIcons.Application;
+
+                int sz = small ? SystemInformation.SmallIconSize.Width : 32;
+                Icon pick;
+                try { pick = new Icon(src, sz, sz); }
+                catch { pick = (Icon)src.Clone(); }
+
+                if (small) appSmall = pick; else appBig = pick;
+                return pick;
+            }
+            catch { return SystemIcons.Application; }
         }
 
         /// <summary>取图标做成 Icon（托盘用）。取不到返回 null。</summary>

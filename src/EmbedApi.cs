@@ -224,6 +224,45 @@ namespace TabbedExplorer
         [DllImport("user32.dll", EntryPoint = "SendMessageW")]
         public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
 
+        // ⚠ 64 位下没有 `GetClassLongPtr` 这个导出，必须点 W/A 后缀那颗。
+        [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
+        private static extern IntPtr GetClassLongPtr(IntPtr h, int index);
+
+        private const uint WM_GETICON = 0x007F;
+        private const int ICON_SMALL = 0;
+        private const int ICON_BIG = 1;
+        private const int ICON_SMALL2 = 2;
+        private const int GCLP_HICON = -14;
+        private const int GCLP_HICONSM = -34;
+
+        /// <summary>
+        /// 窗口**自己**挂着的那颗图标。
+        ///
+        /// 关键事实（2026-09-22 实测）：explorer 会按**当前文件夹**换掉这个窗口的图标 ——
+        /// 在「图片」里读出来的是图片文件夹那颗照片图标，把它和 `SHGetFileInfo(该文件夹)` 给的
+        /// 32px 图标逐像素比对，**差异 = 0**。所以「标签左边显示当前文件夹的实时图标」
+        /// 不需要自己拼路径（也拼不出来：/n,/separate 的窗口不在 shell 的窗口集合里），
+        /// 直接读它就行，导航之后它会自己变。
+        ///
+        /// ⚠ 返回的是**别人进程**的 HICON：可以拿去 DrawIconEx（USER 对象是会话级共享的），
+        /// 但**绝对不能 DestroyIcon**，也不要在导航之后继续持有 —— 立刻画进自己的位图再放手。
+        /// 优先取大图标(32px)：标签图标是 Px(16)=24@150%，32 缩下来比 16 放大清晰得多。
+        /// </summary>
+        public static IntPtr WindowIcon(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return IntPtr.Zero;
+            try
+            {
+                IntPtr h = SendMessageW(hwnd, WM_GETICON, new IntPtr(ICON_BIG), IntPtr.Zero);
+                if (h == IntPtr.Zero) h = SendMessageW(hwnd, WM_GETICON, new IntPtr(ICON_SMALL2), IntPtr.Zero);
+                if (h == IntPtr.Zero) h = SendMessageW(hwnd, WM_GETICON, new IntPtr(ICON_SMALL), IntPtr.Zero);
+                if (h == IntPtr.Zero) h = GetClassLongPtr(hwnd, GCLP_HICON);
+                if (h == IntPtr.Zero) h = GetClassLongPtr(hwnd, GCLP_HICONSM);
+                return h;
+            }
+            catch { return IntPtr.Zero; }
+        }
+
         [DllImport("user32.dll")]
         public static extern bool IsZoomed(IntPtr h);
 

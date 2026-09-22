@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
@@ -59,6 +60,15 @@ namespace TabbedExplorer
         private IntPtr pendingCab = IntPtr.Zero;   // 已发现、已藏起、在等它加载完的那个窗口
         private int pendingPid;
         private DateTime cabSeenAt;
+
+        /// <summary>这个标签左边要显示的图标（= 当前文件夹的图标，导航后自己会变）。</summary>
+        public Bitmap TabIcon { get { return tabIcon; } }
+        /// <summary>图标变了（刚嵌好 / 用户在里导航了）。</summary>
+        public event EventHandler IconChanged;
+
+        private Bitmap tabIcon;
+        private IntPtr lastIconHandle = IntPtr.Zero;
+        private int iconTarget;
 
         private uint origStyle;
         private WRECT origRect;
@@ -258,6 +268,7 @@ namespace TabbedExplorer
                 if (tb != TopBlank) { TopBlank = tb; LayoutCab(true); }
                 Diag.Step("Embed: 顶部空白 = " + TopBlank + "px");
                 settle.Start();
+                RefreshIcon(true);          // 接手时先要一颗图标（当前文件夹的）
 
                 Focus();
                 lastTitle = CurrentDisplayName;
@@ -287,6 +298,53 @@ namespace TabbedExplorer
                 TopBlank = tb;
                 LayoutCab(true);
             }
+        }
+
+        /// <summary>上层（标签条）告诉我们图标要画多大（设备像素）。</summary>
+        public void SetIconTarget(int px)
+        {
+            iconTarget = px;
+            RefreshIcon(true);
+        }
+
+        /// <summary>
+        /// 读窗口自己那颗图标并画成我们的位图。
+        /// 见 `EmbedApi.WindowIcon`：explorer 会按当前文件夹换掉它，所以这就是「实时文件夹图标」。
+        /// force = 忽略「句柄没变」的短路（首次 / 尺寸变了时用）。
+        /// </summary>
+        private void RefreshIcon(bool force)
+        {
+            if (disposed || !embedded || CabWindow == IntPtr.Zero || iconTarget <= 0) return;
+            try
+            {
+                IntPtr h = EmbedApi.WindowIcon(CabWindow);
+                if (h == IntPtr.Zero) return;
+                if (!force && h == lastIconHandle) return;
+
+                Bitmap b = ShellIcon.FromForeignHIcon(h, iconTarget);
+                if (b == null) return;
+                if (IsBlank(b)) { b.Dispose(); return; }   // 句柄刚好被换掉的瞬间会画不上去，别把好图标盖成空白
+
+                lastIconHandle = h;
+                Bitmap old = tabIcon;
+                tabIcon = b;
+                EventHandler e = IconChanged;
+                if (e != null) e(this, EventArgs.Empty);   // 先把新图标交给标签条
+                if (old != null) { try { old.Dispose(); } catch { } }   // 此刻它已经没人引用了
+            }
+            catch (Exception ex) { Diag.Log("Embed: 取标签图标失败 " + ex.Message); }
+        }
+
+        private static bool IsBlank(Bitmap b)
+        {
+            try
+            {
+                for (int y = 0; y < b.Height; y++)
+                    for (int x = 0; x < b.Width; x++)
+                        if (b.GetPixel(x, y).A != 0) return false;
+                return true;
+            }
+            catch { return true; }
         }
 
         private void LayoutCab(bool force)
@@ -391,6 +449,12 @@ namespace TabbedExplorer
             }
 
             string t = CurrentDisplayName;
+
+            // 图标：explorer 会按「当前文件夹」换掉窗口自己挂的那颗图标。
+            // 每轮都问一下句柄（很便宜），变了才重新画 —— 这样即使图标比标题晚一步才更新，
+            // 下个 500ms 也追得上。
+            RefreshIcon(false);
+
             if (string.Equals(t, lastTitle, StringComparison.Ordinal)) return;
             lastTitle = t;
             Diag.Step("Embed: 标题变了 -> " + t);

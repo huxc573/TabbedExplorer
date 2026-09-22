@@ -18,6 +18,8 @@ namespace TabbedExplorer
         {
             public string Title = "";
             public bool Active;
+            /// <summary>当前文件夹的图标（由上层从 explorer 窗口读出来，导航后会换）。</summary>
+            public Image Icon;
         }
 
         private static readonly float DpiScale = ReadDpi();
@@ -56,8 +58,11 @@ namespace TabbedExplorer
         private int CloseAreaWidth { get { return Px(22); } }
         private int CloseBoxSize { get { return Px(16); } }
 
-        // 标签左边那颗文件夹图标（取 shell 原件，与资源管理器里一致）
+        // 标签左边那颗图标：正常由上层从 explorer 窗口读（= 当前文件夹的实时图标）。
+        // 这个通用文件夹只是「还没拿到」时的占位，以及取不到时的兼底。
         private static int IconSize { get { return Px(16); } }
+        /// <summary>标签图标的目标尺寸（设备像素）。外面给 ExplorerHost 设尺寸时用这个。</summary>
+        public static int TabIconSize { get { return IconSize; } }
         private const int TextPadLeft = 6;
         private const int IconGap = 5;
         private static Bitmap folderIcon;
@@ -106,6 +111,15 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             if (tabs[index].Title == title) return;
             tabs[index].Title = title;
+            Invalidate();
+        }
+
+        /// <summary>换掉某个标签的图标（当前文件夹的实时图标，导航后上层会再调）。</summary>
+        public void SetIcon(int index, Image icon)
+        {
+            if (index < 0 || index >= tabs.Count) return;
+            if (tabs[index].Icon == icon) return;
+            tabs[index].Icon = icon;
             Invalidate();
         }
 
@@ -221,11 +235,18 @@ namespace TabbedExplorer
                 bool roomForClose = tab.Width > Px(80);
                 int textRight = tab.Right - (showClose && roomForClose ? CloseAreaWidth : Px(8));
 
-                // 标签左边那颗文件夹图标
+                // 标签左边那颗图标：优先用 explorer 窗口给的那颗（当前文件夹的实时图标），
+                // 还没拿到就先用通用文件夹顶着。
                 int isz = IconSize;
-                if (EnsureFolderIcon())
+                Image ic = tabs[i].Icon;
+                if (ic == null)
                 {
-                    g.DrawImage(folderIcon,
+                    EnsureFolderIcon();
+                    ic = folderIcon;
+                }
+                if (ic != null)
+                {
+                    g.DrawImage(ic,
                         new Rectangle(tab.Left + Px(TextPadLeft), tab.Top + (tab.Height - isz) / 2, isz, isz));
                 }
 

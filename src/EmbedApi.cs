@@ -71,6 +71,10 @@ namespace TabbedExplorer
 
         public const int GWL_STYLE = -16;
 
+        /// <summary>ShowWindow 的两个常用值（防闪那条路全靠 SW_HIDE）。</summary>
+        public const int SW_HIDE = 0;
+        public const int SW_SHOW = 5;
+
         // ---- 窗口样式位 ----
         public const uint WS_CHILD = 0x40000000;
         public const uint WS_MINIMIZE = 0x20000000;

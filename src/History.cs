@@ -14,19 +14,18 @@ namespace TabbedExplorer
     ///   - `History` 记的是**一路去过哪儿**，是只增不减的一条流水，关标签也不会消失 ——
     ///     就是浏览器那个「历史记录」。
     ///
-    /// 存 `<程序目录>\data\history.txt`（绿色便携，见 AppPaths），纯文本，一行一条，新的在前：
+    /// 存 `<程序目录>\data\history.json`（绿色便携，见 AppPaths）：
     ///   <code>
-    ///   # TabbedExplorer history v1
-    ///   D:\FB.Data
-    ///   ::{20D04FE0-3AEA-1069-A2D8-08002B30309D}
+    ///   { "history": ["D:\\FB.Data", "::{20D04FE0-...}", "shell:Downloads"] }
     ///   </code>
-    /// 故意不带时间戳：川要的是「挑一个再去一次」，不是考古；带时间反而让文件变脏、还得处理时区。
+    /// 新的在前。**故意不带时间戳**：川要的是「挑一个再去一次」，不是考古；带时间反而让文件变脏、还得处理时区。
     /// 重复访问只把那条提到最前面，不会刷屏。
+    ///
+    /// 2026-09-22 川要求「配置一律 json」：原来那版是 `history.txt`，现在见到老文件会读过来、写成 json，
+    /// 再把老文件改名成 `.migrated` 留着（不删）。
     /// </summary>
     internal static class History
     {
-        private const string Header = "# TabbedExplorer history v1（一行一个路径，最上面是最近去的；删掉某行就少一条）";
-
         /// <summary>最多留多少条。够翻就行，文件也小。</summary>
         private const int Max = 120;
 
@@ -36,7 +35,10 @@ namespace TabbedExplorer
         private static readonly List<string> items = new List<string>();
         private static bool loaded;
 
-        public static string FileName { get { return AppPaths.File("history.txt"); } }
+        public static string FileName { get { return AppPaths.File("history.json"); } }
+
+        /// <summary>老版本的纯文本历史 —— 只在迁移时读一次。</summary>
+        public static string LegacyFileName { get { return AppPaths.File("history.txt"); } }
 
         /// <summary>最近去过的地方（新的在前）。返回的是内部列表的拷贝，外面随便用。</summary>
         public static List<string> Recent
@@ -50,17 +52,43 @@ namespace TabbedExplorer
             loaded = true;
             try
             {
-                if (!File.Exists(FileName)) return;
-                foreach (string raw in File.ReadAllLines(FileName, Encoding.UTF8))
+                if (File.Exists(FileName))
                 {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line[0] == '#') continue;
-                    if (!items.Contains(line)) items.Add(line);
-                    if (items.Count >= Max) break;
+                    LoadJson(File.ReadAllText(FileName, Encoding.UTF8));
+                    Diag.Step("历史: 读进 " + items.Count + " 条");
+                    return;
                 }
-                Diag.Step("历史: 读进 " + items.Count + " 条");
+                if (File.Exists(LegacyFileName))
+                {
+                    Diag.Step("历史: 发现老的 history.txt，迁移到 history.json");
+                    LoadLegacyText();
+                    Save();
+                    try { File.Move(LegacyFileName, LegacyFileName + ".migrated"); } catch { }
+                    Diag.Step("历史: 迁移完成 " + items.Count + " 条");
+                }
             }
             catch (Exception ex) { Diag.Log("历史: 读失败 " + ex.Message); }
+        }
+
+        private static void LoadJson(string json)
+        {
+            foreach (string p in Json.Strings(Json.GetBlock(json, "history")))
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                if (!items.Contains(p)) items.Add(p);
+                if (items.Count >= Max) break;
+            }
+        }
+
+        private static void LoadLegacyText()
+        {
+            foreach (string raw in File.ReadAllLines(LegacyFileName, Encoding.UTF8))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#') continue;
+                if (!items.Contains(line)) items.Add(line);
+                if (items.Count >= Max) break;
+            }
         }
 
         /// <summary>
@@ -92,8 +120,10 @@ namespace TabbedExplorer
             {
                 Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
-                sb.Append(Header).Append("\r\n");
-                foreach (string p in items) sb.Append(p).Append("\r\n");
+                sb.Append("{\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 的历史记录（去过哪些文件夹），新的在前。删掉某一项就少一条记录。\",\r\n");
+                sb.Append("  \"history\": ").Append(Json.Array(items)).Append("\r\n");
+                sb.Append("}\r\n");
                 string tmp = FileName + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
                 if (File.Exists(FileName)) File.Delete(FileName);
@@ -146,14 +176,14 @@ namespace TabbedExplorer
                 }
                 if (list.Count > n)
                 {
-                    MenuItem more = new MenuItem("（还有 " + (list.Count - n) + " 条更早的，看 data\\history.txt）");
+                    MenuItem more = new MenuItem("（还有 " + (list.Count - n) + " 条更早的，看 data\\history.json）");
                     more.Enabled = false;
                     r.Add(more);
                 }
             }
 
             r.Add(new MenuItem("-"));
-            // 直接打开那个 txt（系统默认编辑器），比弹一个「在资源管理器里定位」省事，
+            // 直接打开那个 json（系统默认程序），比弹一个「在资源管理器里定位」省事，
             // 也避免我们自己又去起一个 explorer 窗口被自己的捕获逻辑再抓一遍。
             r.Add(new MenuItem("打开历史记录文件", delegate
             {
@@ -163,7 +193,6 @@ namespace TabbedExplorer
             r.Add(new MenuItem("清空历史记录", delegate
             {
                 Clear();
-                Toast.Show("历史记录", "已清空。");
             }));
             return r.ToArray();
         }

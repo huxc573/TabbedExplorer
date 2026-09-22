@@ -253,6 +253,15 @@ namespace TabbedExplorer
                 AllowAndTheme(root);
                 List<IntPtr> all = WinFind.All(root);
                 for (int i = 0; i < all.Count; i++) AllowAndTheme(all[i]);
+
+                // 换完主题再要求整棵树重画一遍（异步，不等它画完）。
+                // 为什么需要：SetWindowTheme 只在**子应用名真的变了**的时候才让窗口重画，
+                // 来回切颜色时会碰到「目标值跟现状一样」的那一步，它觉得无事可做，
+                // 上一轮留下的像素就摆在屏幕上 —— 川截图里那个「一半深一半浅」。
+                NativeMethods.RedrawWindow(root, IntPtr.Zero, IntPtr.Zero,
+                    NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ERASE
+                    | NativeMethods.RDW_FRAME | NativeMethods.RDW_ALLCHILDREN);
+
                 Diag.Log("Theme: shell 子窗口上色 " + (all.Count + 1) + " 个，dark=" + IsDark);
             }
             catch { }
@@ -263,6 +272,14 @@ namespace TabbedExplorer
             if (h == IntPtr.Zero) return;
             // 明确传「要不要深」：强制浅色时必须让它回到浅色主题，否则停在深色。
             DarkMode.AllowWindow(h, IsDark);
+            // 先设成**反的那一边**，再设目标值 —— 保证这一轮真的发生了两次主题切换。
+            // 同值重复设 = 空操作（它连 WM_THEMECHANGED 都不发），
+            // 而「深色 -> 跟随系统(深)」这种切法目标值恰好等于现状，光设一次等于什么都没做。
+            try
+            {
+                NativeMethods.SetWindowTheme(h, IsDark ? "Explorer" : "DarkMode_Explorer", null);
+            }
+            catch { }
             StyleShellWindow(h);
         }
 
@@ -321,15 +338,74 @@ namespace TabbedExplorer
         ///
         /// ⚠ 只对「普通提示」成立：气泡（balloon）样式下 comctl 不叫 OwnerDraw。
         /// </summary>
-        public static void StyleTip(ToolTip t)
+        public static void StyleTip(ToolTip t) { StyleTip(t, null); }
+
+        /// <summary>
+        /// 同上，但可以指定**第一行**用哪套字体（川 2026-09-22：悬停提示里文件夹名加粗、路径不加粗）。
+        ///
+        /// 两个细节：
+        ///   · `ToolTip` **没有 `Font` 属性**（跟 Label 那些控件不一样），改不了系统那套字体，
+        ///     所以尺寸也得自己量、自己交回去 —— 见 `OnTipPopup`。不然粗体那一行会被截掉。
+        ///   · 字体是按 ToolTip 实例记的（`OnTipDraw` / `OnTipPopup` 都是静态处理器，
+        ///     得知道这次是哪个提示在画）。
+        /// </summary>
+        public static void StyleTip(ToolTip t, Font firstLineFont)
         {
             if (t == null) return;
             t.OwnerDraw = true;
-            t.BackColor = MenuBack;     // comctl 自己算尺寸时会参考它
+            t.BackColor = MenuBack;
             t.ForeColor = Text;
+            if (firstLineFont != null) tipFirstLine[t] = firstLineFont;
             t.Draw -= OnTipDraw;        // 幂等：重复 Style 同一个对象不会挂两遍
             t.Draw += OnTipDraw;
+            t.Popup -= OnTipPopup;
+            t.Popup += OnTipPopup;
         }
+
+        /// <summary>
+        /// 自己量两行提示的尺寸（`ToolTip` 没有 `Font`，comctl 那套尺寸是照系统字体算的，
+        /// 我们第一行是粗体、比系统宽，不改尺寸会被截掉）。
+        /// 宽 = 两行里更宽的那个 + 左右内缩；高 = 两行行高 + 行距 + 上下内缩。
+        /// 数字要跟 `OnTipDraw` 里的内缩保持一致（左右 6、上下 4、行距 2）。
+        /// 单行提示不插手 —— 交给系统自己量。
+        /// </summary>
+        private static void OnTipPopup(object sender, PopupEventArgs e)
+        {
+            try
+            {
+                ToolTip src = sender as ToolTip;
+                if (src == null || e.AssociatedControl == null) return;
+
+                Font first;
+                if (!tipFirstLine.TryGetValue(src, out first) || first == null) return;
+
+                string text = src.GetToolTip(e.AssociatedControl);
+                if (string.IsNullOrEmpty(text)) return;
+                int br = text.IndexOf("\r\n", StringComparison.Ordinal);
+                if (br < 0) return;
+
+                Font body = e.AssociatedControl.Font;
+                if (body == null) body = first;
+
+                string line1 = text.Substring(0, br);
+                string line2 = text.Substring(br + 2);
+
+                TextFormatFlags mf = TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding
+                                   | TextFormatFlags.SingleLine;
+                Size s1 = TextRenderer.MeasureText(line1, first,
+                    new Size(int.MaxValue, int.MaxValue), mf);
+                Size s2 = TextRenderer.MeasureText(line2, body,
+                    new Size(int.MaxValue, int.MaxValue), mf);
+
+                e.ToolTipSize = new Size(
+                    Math.Max(s1.Width, s2.Width) + 12,
+                    s1.Height + s2.Height + 2 + 8);
+            }
+            catch { }
+        }
+
+        /// <summary>哪个提示的第一行该用粗体（没登记的就整块用 `e.Font`）。</summary>
+        private static readonly Dictionary<ToolTip, Font> tipFirstLine = new Dictionary<ToolTip, Font>();
 
         private static void OnTipDraw(object sender, DrawToolTipEventArgs e)
         {
@@ -345,7 +421,33 @@ namespace TabbedExplorer
                 // 文字贴着边框内缩几个像素，别顶到线上
                 Rectangle tr = new Rectangle(r.Left + 6, r.Top + 4,
                                              Math.Max(1, r.Width - 12), Math.Max(1, r.Height - 8));
-                TextRenderer.DrawText(e.Graphics, e.ToolTipText, e.Font, tr, fore,
+
+                string text = e.ToolTipText ?? "";
+                ToolTip src = sender as ToolTip;
+                Font first = null;
+                if (src != null) tipFirstLine.TryGetValue(src, out first);
+
+                int br = text.IndexOf("\r\n", StringComparison.Ordinal);
+                if (first == null || br < 0)
+                {
+                    TextRenderer.DrawText(e.Graphics, text, first ?? e.Font, tr, fore,
+                        TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
+                        TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+                    return;
+                }
+
+                // 两行：第一行（文件夹名）用粗体，后面（完整路径）用细体
+                string line1 = text.Substring(0, br);
+                string line2 = text.Substring(br + 2);
+                Size s1 = TextRenderer.MeasureText(line1, first, new Size(tr.Width, 0),
+                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                TextRenderer.DrawText(e.Graphics, line1, first,
+                    new Rectangle(tr.Left, tr.Top, tr.Width, Math.Max(1, s1.Height)), fore,
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
+                    TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(e.Graphics, line2, e.Font,
+                    new Rectangle(tr.Left, tr.Top + s1.Height + 2,
+                                  tr.Width, Math.Max(1, tr.Height - s1.Height - 2)), fore,
                     TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
                     TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
             }

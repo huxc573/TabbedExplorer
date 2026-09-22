@@ -37,6 +37,8 @@ namespace TabbedExplorer
             public bool Active;
             /// <summary>当前文件夹的图标（由上层从 explorer 窗口读出来，导航后会换）。</summary>
             public Image Icon;
+            /// <summary>标题文字的像素宽（只在换标题时量一次 —— 自适应宽度每个鼠标事件都要用它算布局）。</summary>
+            public int TextW;
         }
 
         private static readonly float DpiScale = ReadDpi();
@@ -120,7 +122,8 @@ namespace TabbedExplorer
             return folderIcon != null;
         }
 
-        private readonly Font titleFont;      // 标签文字（加粗）
+        private readonly Font titleFont;      // 标签文字（**不加粗** —— 川 2026-09-22：加粗留给悬停提示）
+        private readonly Font tipTitleFont;   // 悬停提示里「文件夹名」那一行的字体（加粗）
         private readonly Font glyphFont;      // 右侧工具按钮 / 窗口按钮的 MDL2 字形
 
         /// <summary>窗口没激活（失活）时整体降色 —— 底色和文字都跟原生标题栏一个逻辑。</summary>
@@ -171,6 +174,8 @@ namespace TabbedExplorer
         public event IndexEventHandler OrderChanged;   // 拖拽排序后：原索引
         /// <summary>标签条**空白区域**（不是标签、不是按钮）上按了右键。</summary>
         public event Action<Point> BlankRightClicked;
+        /// <summary>在标签条上滚滚轮（川 2026-09-22：标签条上滚轮 = 切换前后标签页）。参数是 delta（正=往上滚=上一个）。</summary>
+        public event Action<int> TabWheel;
 
         public TabStrip()
         {
@@ -178,7 +183,9 @@ namespace TabbedExplorer
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.Selectable, true);
             Height = Px(StdHeight);
-            titleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
+            // 标签标题**不加粗**（川：加粗留给悬停提示）；悬停提示里名字那行加粗、路径不加粗。
+            titleFont = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
+            tipTitleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
             glyphFont = new Font("Segoe MDL2 Assets", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
@@ -186,7 +193,7 @@ namespace TabbedExplorer
             tips.ReshowDelay = 80;
             tips.AutoPopDelay = 8000;
             tips.ShowAlways = true;     // 见字段注释：不开的话窗口没激活就不弹
-            Theme.StyleTip(tips);       // 背景 / 字体跟着颜色模式（bug 3）
+            Theme.StyleTip(tips, tipTitleFont);   // 背景 / 字体跟着颜色模式；名字那行加粗
             Theme.Changed += delegate { BackColor = BarBack; tips.BackColor = Theme.MenuBack; tips.ForeColor = Theme.Text; Invalidate(); };
         }
 
@@ -194,7 +201,7 @@ namespace TabbedExplorer
 
         public void AddTab(string title)
         {
-            tabs.Add(new TabItem { Title = title });
+            tabs.Add(new TabItem { Title = title ?? "", TextW = MeasureTitle(title) });
             Invalidate();
         }
 
@@ -202,8 +209,22 @@ namespace TabbedExplorer
         {
             if (index < 0 || index >= tabs.Count) return;
             if (tabs[index].Title == title) return;
-            tabs[index].Title = title;
+            tabs[index].Title = title ?? "";
+            tabs[index].TextW = MeasureTitle(tabs[index].Title);
             Invalidate();
+        }
+
+        /// <summary>标题文字有多宽（自适应宽度要用）。空标题给个最小宽度，别缩成一条缝。</summary>
+        private int MeasureTitle(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return Px(40);
+            try
+            {
+                Size sz = TextRenderer.MeasureText(s, titleFont, new Size(Px(800), Px(40)),
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                return Math.Max(Px(30), sz.Width);
+            }
+            catch { return Px(60); }
         }
 
         /// <summary>换完整路径 —— 只在悬停提示里用（「此电脑」这类没有真实路径的由上层给友好名）。</summary>
@@ -229,6 +250,7 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             tabs.RemoveAt(index);
             if (hoverIndex == index) hoverIndex = -1;
+            scrollX = 0;                 // 标签少了一个，底下那些也可能能露出来了
             Invalidate();
         }
 
@@ -256,6 +278,12 @@ namespace TabbedExplorer
         /// <summary>
         /// 排一次版。右侧那一排是**固定**的（窗口按钮 + 齿轮 + 竖线 + 三个功能按钮），
         /// 标签和「+」只在剩下的宽度里排。尺寸只由 Width + 标签数决定，鼠标事件里可以随手重算。
+        ///
+        /// 宽度规则（2026-09-22 川要求拆成两项）：
+        ///   ① `tabautowiden` 开 → 每个标签按**自己那行文字**的宽度来（夹在 MinTabWidth ~ TabWidth 之间）；
+        ///      关 → 一律 `TabWidth`。
+        ///   ② `tabautofit` 开 → 全排加起来挤不下就**一起缩窄**（下限 MinTabWidth）；
+        ///      关 → 不缩，但**总宽仍然不越过右边那排按钮**：多出来的部分靠横向滚动看（`scrollX`）。
         /// </summary>
         private void EnsureLayout()
         {
@@ -277,25 +305,89 @@ namespace TabbedExplorer
             toolsLeft = toolRects[(int)Tool.History].Left;
 
             bounds.Clear();
-            int avail = Math.Max(Px(60), toolsLeft - NewButtonWidth - Px(10));
-            int w = MaxTabWidth;
-            if (tabs.Count > 0 && Settings.TabAutoFit)
-            {
-                int need = tabs.Count * MaxTabWidth;
-                if (need > avail) w = Math.Max(MinTabWidth, avail / tabs.Count);
-            }
-            int x = Px(2);
+            // 标签区右界：「+」也得排得下，所以再让出一个「+」的宽度
+            int areaRight = Math.Max(Px(40), toolsLeft - NewButtonWidth - Px(2));
+            int avail = Math.Max(Px(30), areaRight - Px(2));
+
+            // ① 每个标签想要的宽度
+            int[] want = new int[tabs.Count];
+            int total = 0;
             for (int i = 0; i < tabs.Count; i++)
             {
-                bounds.Add(new Rectangle(x, 0, w, Height));
-                x += w;
+                int t = tabs[i].TextW;
+                if (t <= 0) t = MeasureTitle(tabs[i].Title);
+                int w = MaxTabWidth;
+                if (Settings.TabAutoWiden)
+                {
+                    // 图标 + 左右留白 + 右边给关闭按钮留位
+                    int need = Px(TextPadLeft) + IconSize + Px(IconGap) + t + CloseAreaWidth + Px(4);
+                    w = Math.Max(MinTabWidth, Math.Min(MaxTabWidth, need));
+                }
+                want[i] = w;
+                total += w;
             }
 
+            // ② 挤不下就一起缩窄（这一项单独有开关）
+            if (tabs.Count > 0 && Settings.TabAutoFit && total > avail)
+            {
+                int w = Math.Max(MinTabWidth, avail / tabs.Count);
+                for (int i = 0; i < want.Length; i++) want[i] = w;
+                total = w * tabs.Count;
+            }
+
+            // ③ 没开缩窄：总宽也不许越过右边按钮 —— 多的部分靠横向滚动
+            maxScroll = Math.Max(0, total + Px(4) - avail);
+            if (scrollX > maxScroll) scrollX = maxScroll;
+            if (scrollX < 0) scrollX = 0;
+            overflow = (maxScroll > 0);
+
+            int x = Px(2) - scrollX;
+            for (int i = 0; i < tabs.Count; i++)
+            {
+                bounds.Add(new Rectangle(x, 0, want[i], Height));
+                x += want[i];
+            }
+
+            // 「+」紧跟在最后一个标签右边；挤到边上了就贴在按钮左边（浏览器就是这样）
             int nx = (tabs.Count > 0) ? x + Px(4) : Px(4);
-            int limit = toolsLeft - NewButtonWidth - Px(2);
+            int limit = areaRight - NewButtonWidth;
             if (nx > limit) nx = Math.Max(Px(2), limit);
             newRect = new Rectangle(nx, 0, NewButtonWidth, Height);
         }
+
+        /// <summary>标签区能画到哪儿（右边那排按钮的左边）。画标签时要按它裁，不能压到按钮上。</summary>
+        private int TabsClipRight
+        {
+            get { EnsureLayout(); return Math.Max(0, toolsLeft - NewButtonWidth - Px(2)); }
+        }
+
+        /// <summary>标签有没有多到需要横向滚动（没开自动缩窄时会出现）。</summary>
+        public bool HasOverflow { get { return maxScroll > 0; } }
+
+        /// <summary>
+        /// 同上，但**不重算布局** —— 只读上一次排版的结果。
+        /// 给滚轮钩子的判定用（钩子线程上只准读、不准触发重排，见 MouseWheelHook 类注释）。
+        /// </summary>
+        public bool OverflowCached { get { return overflow; } }
+
+        private volatile bool overflow;
+
+        /// <summary>横向滚动标签区（滚轮在**非标签条**区域时用它）。返回是否真的动了。</summary>
+        public bool ScrollTabsBy(int dx)
+        {
+            EnsureLayout();
+            if (maxScroll <= 0) return false;
+            int old = scrollX;
+            scrollX += dx;
+            if (scrollX > maxScroll) scrollX = maxScroll;
+            if (scrollX < 0) scrollX = 0;
+            if (scrollX == old) return false;
+            Invalidate();
+            return true;
+        }
+
+        private int scrollX;
+        private int maxScroll;
 
         private Rectangle NewButtonBounds()
         {
@@ -442,6 +534,10 @@ namespace TabbedExplorer
 
             float stroke = Math.Max(1f, DpiScale);
 
+            // 标签一律不许压到右边那排按钮上（没开自动缩窄时总宽可能超出可视区）—— 裁一刀。
+            Region oldClip = g.Clip;
+            g.SetClip(new Rectangle(0, 0, Math.Max(1, TabsClipRight), Height));
+
             for (int i = 0; i < tabs.Count; i++)
             {
                 Rectangle tab = bounds[i];
@@ -520,6 +616,7 @@ namespace TabbedExplorer
             }
 
             // 底部与容器分隔
+            g.Clip = oldClip;      // 右边那排按钮 / 加号不受上面那一刀的影响
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
             // “+” 新建：紧跟在最后一个标签右边（位置由 EnsureLayout 算）
@@ -713,17 +810,8 @@ namespace TabbedExplorer
 
             if (e.Button == MouseButtons.Right)
             {
-                int ri = HitTest(e.Location);
-                if (ri >= 0)
-                {
-                    if (TabRightClicked != null) TabRightClicked(this, ri);
-                }
-                else if (ToolAt(e.Location) < 0 && WBtnAt(e.Location) < 0 &&
-                         !NewButtonBounds().Contains(e.Location))
-                {
-                    // 空白区域（不是标签、不是按钮）
-                    if (BlankRightClicked != null) BlankRightClicked(e.Location);
-                }
+                // 右键一律交给 OnMouseUp 发（见那里的说明：在 MouseDown 里发会被紧接着的
+                // 「右键抬起」消息当场关掉菜单）。这里什么都不做。
                 return;
             }
 
@@ -780,6 +868,28 @@ namespace TabbedExplorer
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+
+            // ⚠ 右键菜单必须在 **MouseUp** 里发（2026-09-22 川报「空白处和标签右键功能均没有实现」）：
+            // 在 MouseDown 里叫起菜单时，紧接着那条「右键抬起」消息会投到刚弹出来的菜单窗口上
+            // （菜单自己抓着鼠标捕获），菜单把它当成「点在别处」→ 当场关掉。
+            // 于是：菜单一闪而过、或者用户点哪个条目都对不上 —— 看着就是「右键没功能」。
+            // 等到按钮抬起来再弹，就没有这条多余的消息了。
+            if (e.Button == MouseButtons.Right)
+            {
+                int ri = HitTest(e.Location);
+                if (ri >= 0)
+                {
+                    if (TabRightClicked != null) TabRightClicked(this, ri);
+                }
+                else if (ToolAt(e.Location) < 0 && WBtnAt(e.Location) < 0 &&
+                         !NewButtonBounds().Contains(e.Location))
+                {
+                    // 空白区域（不是标签、不是按钮）
+                    if (BlankRightClicked != null) BlankRightClicked(e.Location);
+                }
+                return;
+            }
+
             if (dragFromIndex >= 0 && dragOverIndex >= 0 && dragFromIndex != dragOverIndex)
             {
                 int from = dragFromIndex, to = dragOverIndex;
@@ -791,12 +901,24 @@ namespace TabbedExplorer
             Invalidate();
         }
 
+        /// <summary>
+        /// 标签条上的滚轮 = **切换前后标签页**（川 2026-09-22）。
+        /// 横向滚动标签条是另一个入口：滚轮在非标签条区域时由上层（EmbedForm）转发到 `ScrollTabsBy`。
+        /// </summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (tabs.Count < 2) return;
+            if (TabWheel != null) TabWheel(e.Delta);
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
                 if (tips != null) tips.Dispose();
                 if (titleFont != null) titleFont.Dispose();
+                if (tipTitleFont != null) tipTitleFont.Dispose();
                 if (glyphFont != null) glyphFont.Dispose();
             }
             base.Dispose(disposing);

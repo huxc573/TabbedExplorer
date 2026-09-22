@@ -96,6 +96,13 @@ namespace TabbedExplorer
         /// <summary>备用窗口已经加载好了（可以用了）。</summary>
         private bool reserveReady;
 
+        /// <summary>
+        /// 切完标签等一会儿再收非激活标签的内存（见 TrimInactiveTabs）。
+        /// 用延时是为了别在 Ctrl+Tab 快速来回切时反复「收了又读回来」——
+        /// 那比不省内存还糟（每次切回来都要重新缺页）。
+        /// </summary>
+        private readonly Timer trimTimer = new Timer();
+
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
 
@@ -186,12 +193,24 @@ namespace TabbedExplorer
                 blankAt = p;
                 Defer(ShowBlankMenu);
             };
+            // 标签条上滚轮 = 切换前后标签页（川 2026-09-22）
+            tabStrip.TabWheel += delegate(int delta)
+            {
+                CycleTab(delta > 0 ? -1 : 1);
+            };
 
             favBar = new FavBar();
             favBar.ItemClicked += delegate(string path)
             {
                 Diag.Step("EmbedForm: 收藏夹 -> " + path);
                 NewTab(path);
+            };
+            // 最左边那枚收藏夹图标：点一下开数据目录（川要的「最左加个收藏夹图标」，
+            // 点了有实际去处 —— 别做成一个点了没反应的装饰）
+            favBar.LeadClicked += delegate
+            {
+                Diag.Step("EmbedForm: 收藏夹图标 -> 打开数据目录");
+                NewTab(AppPaths.DataDir);
             };
             // 收藏夹栏上右键「隐藏收藏夹栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
             favBar.HideRequested += delegate
@@ -214,6 +233,26 @@ namespace TabbedExplorer
             ApplyTheme();
             Theme.Changed += delegate { OnThemeChanged(); };
             DoLayout();
+
+            // 滚轮这件事登记给全局钩子（内容区是跨进程嵌进来的窗口，我们的窗体收不到它的滚轮消息）。
+            // 三个回调都在**钩子线程**上被调用 —— 这里只读状态 / 往 UI 线程投递，绝不动界面。
+            WheelRouter.Register(new WheelTarget
+            {
+                Form = Handle,
+                TabStrip = tabStrip.Handle,
+                FavBar = favBar.Handle,
+                HasOverflow = delegate { return tabStrip.OverflowCached; },
+                SwitchTab = delegate(int delta) { Defer(delegate { CycleTab(delta > 0 ? -1 : 1); }); },
+                ScrollStrip = delegate(int delta) { Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -Px(80) : Px(80)); }); }
+            });
+
+            // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
+            trimTimer.Interval = 3000;
+            trimTimer.Tick += delegate
+            {
+                trimTimer.Stop();
+                TrimInactiveTabs();
+            };
 
             // 标签**不在这里开**：要等第一次现身时才知道该还原什么
             // （见 EnsureFirstTab：按本桌面记着的路径把标签摆回来，没记过才开一个「此电脑」）。
@@ -378,21 +417,28 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 颜色模式变了（或系统主题变了）：自己的外壳重画 + 标题栏重设。
-        /// 强制浅/深时（不是「跟随系统」）再去动嵌进来的 explorer ——
-        /// 它是**独立进程**，我们只能逐窗口 SetWindowTheme 尽力而为，
-        /// 文件列表那一层仍按它自己的系统主题画，这条限制要在界面上说清楚。
+        /// 颜色模式变了（或系统主题变了）：自己的外壳重画 + 标题栏重设 +
+        /// 把嵌进来的 explorer 逐个重新上一遍主题。
+        ///
+        /// ⚠ 每一次切换都要走完，**包括切回「跟随系统」**。
+        /// 早先这里碰到 System 就直接 return，于是「强制深色 -> 跟随系统(而系统是浅色)」
+        /// 这一步只把外壳刷成浅色、嵌进来的 explorer 还停在深色 ——
+        /// 就是川 2026-09-22 截图里那个「一半深一半浅」。
+        /// System 不等于「不用管」，它只是把目标值换成「当前系统值」而已。
         /// </summary>
         private void OnThemeChanged()
         {
             if (IsDisposed || Disposing) return;
             ApplyTheme();
             Theme.ApplyTitleBar(Handle);
-            if (Settings.Color == Settings.ColorMode.System) return;
             foreach (ExplorerHost h in hosts)
             {
                 if (h != null) h.Restyle();
             }
+            // 预热好的备用窗口不在 hosts 里，但它也是嵌好的真窗口，一样要跟上。
+            if (reserve != null) reserve.Restyle();
+            // 容器自己的底：嵌进来那块我们刷不到（别人的进程），至少别让接缝露旧色。
+            try { content.Invalidate(true); } catch { }
         }
 
         /// <summary>外面（Hub）改完设置让我重刷外观。</summary>
@@ -1049,6 +1095,32 @@ namespace TabbedExplorer
             hosts[idx].Focus();
             Text = tabStrip.Tabs[idx].Title;   // 任务栏 / Alt+Tab 的显示名（自绘标题栏删了，就剩这一处用途）
             MarkDirty();     // 「当时选中那个」也要记
+            // 刚离开的那个标签先别动：过 3 秒还没被切回来，才当它真的凉了。
+            trimTimer.Stop();
+            trimTimer.Start();
+        }
+
+        /// <summary>
+        /// 把**非当前**标签的 explorer 进程驻留内存收一收（川 2026-09-22 的优化 3）。
+        ///
+        /// 为什么值当：一个标签 = 一个独立 explorer.exe，非激活那几十 MB 全在别人进程里，
+        /// 我们自己进程怎么省都省不出这一块。
+        /// 为什么延时 3 秒：来回切（对比两个目录）时收完马上又读回来更亏，
+        /// 所以只在「停留够久」之后做一次。
+        /// </summary>
+        private void TrimInactiveTabs()
+        {
+            if (IsDisposed || Disposing) return;
+            int n = 0;
+            for (int i = 0; i < hosts.Count; i++)
+            {
+                if (i == activeIndex) continue;      // 当前标签留着，不然切回去要重新载入
+                ExplorerHost h = hosts[i];
+                if (h == null) continue;
+                h.TrimMemory();
+                n++;
+            }
+            if (n > 0) Diag.Step("EmbedForm: 收了 " + n + " 个非激活标签的内存");
         }
 
         private void CloseTab(int idx)
@@ -1161,32 +1233,46 @@ namespace TabbedExplorer
         private void ShowHistoryMenu()
         {
             if (IsDisposed || Disposing) return;
-            ShowPopupAtTool(TabStrip.Tool.History, History.BuildMenu(delegate(string p)
+            ShowPopupAtTool(TabStrip.Tool.History, History.BuildMenu(OpenFromHistory), "历史记录");
+        }
+
+        /// <summary>
+        /// 从「历史记录 / 收藏夹」挑了一个位置 —— 开成新标签（已经开着就切过去）。
+        /// 单独抽出来是为了能记日志：川报过「历史里选了条目没打开」，有日志才查得下去。
+        /// </summary>
+        private void OpenFromHistory(string p)
+        {
+            Diag.Step("EmbedForm: 历史/收藏夹 -> " + p);
+            Defer(delegate
             {
-                Diag.Step("EmbedForm: 历史 -> " + p);
-                Defer(delegate
+                if (IsDisposed || Disposing) return;
+                if (!Visible) Show();
+                if (!PathRules.Restorable(p))
                 {
-                    if (!Visible) Show();
-                    int dup = IndexOfPath(p);
-                    if (dup >= 0) Activate(dup);
-                    else NewTab(p);
-                });
-            }));
+                    Diag.Step("EmbedForm: 这个位置开不了（没有真实路径），跳过：" + p);
+                    return;
+                }
+                int dup = IndexOfPath(p);
+                if (dup >= 0)
+                {
+                    Diag.Step("EmbedForm: 这个位置已经有标签了，切过去 idx=" + dup);
+                    Activate(dup);
+                }
+                else NewTab(p);
+            });
         }
 
         /// <summary>
         /// 在某个工具按钮正下方弹一份菜单。
         /// 锚点跟齿轮那条同一个算法：按**按钮中心**定位，菜单自己会往回挪（不会跑出屏幕）。
+        /// 菜单一律走 `MenuFx`（自绘 + 前后各一行日志）。
         /// </summary>
-        private void ShowPopupAtTool(TabStrip.Tool tool, MenuItem[] items)
+        private void ShowPopupAtTool(TabStrip.Tool tool, MenuItem[] items, string what)
         {
             if (items == null || items.Length == 0) return;
             Rectangle b = tabStrip.ToolButtonBounds(tool);
             Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            ContextMenu m = new ContextMenu(items);
-            try { m.Show(tabStrip, tabStrip.PointToClient(at)); }
-            catch (Exception ex) { Diag.Log("EmbedForm: 弹菜单失败 " + ex); }
-            finally { try { m.Dispose(); } catch { } }
+            MenuFx.Show(MenuFx.Build(items), tabStrip, tabStrip.PointToClient(at), what);
         }
 
         /// <summary>Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出）。</summary>
@@ -1239,6 +1325,10 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
+            m.Add(new MenuItem("添加到收藏夹栏", delegate
+            {
+                Defer(delegate { AddToFavorites(target); });
+            }));
             m.Add(new MenuItem("重新打开刚关闭的标签页(Ctrl+Shift+T)",
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(new MenuItem("-"));
@@ -1246,10 +1336,23 @@ namespace TabbedExplorer
 
             Rectangle b = tabStrip.TabBounds(idx);
             Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            ContextMenu cm = new ContextMenu(m.ToArray());
-            try { cm.Show(tabStrip, tabStrip.PointToClient(at)); }
-            catch (Exception ex) { Diag.Log("EmbedForm: 标签右键菜单失败 " + ex); }
-            finally { try { cm.Dispose(); } catch { } }
+            MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
+                "标签右键 idx=" + idx);
+        }
+
+        /// <summary>把这个位置加进收藏夹栏（收藏夹是我们自己那份 data\favorites.json，见 FavStore）。</summary>
+        private void AddToFavorites(string path)
+        {
+            string name;
+            if (!FavStore.Add(path, out name))
+            {
+                Toast.Show("加不进收藏夹", string.IsNullOrEmpty(name)
+                    ? "这个位置没有真实路径（库 / 虚拟文件夹），收藏夹放不了。"
+                    : "「" + name + "」已经在收藏夹里了。");
+                return;
+            }
+            Diag.Step("EmbedForm: 加入收藏夹 -> " + path);
+            Toast.Show("已加入收藏夹", name);   // 用户主动做的动作，值得回一句
         }
 
         /// <summary>
@@ -1266,19 +1369,21 @@ namespace TabbedExplorer
             m.Add(new MenuItem("恢复关闭的标签页(Ctrl+Shift+T)", delegate { Defer(ReopenClosedTab); }));
 
             bool on = favBarOn;
-            m.Add(new MenuItem((on ? "✓ " : "   ") + "显示收藏夹栏(Ctrl+Shift+B)", delegate
+            // 勾选走 `MenuItem.Checked`（自绘那一列会画勾，见 MenuFx）——
+            // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（川报过）。
+            MenuItem favItem = new MenuItem("显示收藏夹栏(Ctrl+Shift+B)", delegate
             {
                 if (hub != null) hub.SetFavBar(!on);
-            }));
+            });
+            favItem.Checked = on;
+            m.Add(favItem);
 
             m.Add(new MenuItem("-"));
             m.Add(new MenuItem("设置", delegate { Defer(ShowSettingsWindow); }));
 
-            ContextMenu cm = new ContextMenu(m.ToArray());
             Point at = tabStrip.PointToScreen(blankAt);
-            try { cm.Show(tabStrip, tabStrip.PointToClient(at)); }
-            catch (Exception ex) { Diag.Log("EmbedForm: 空白右键菜单失败 " + ex); }
-            finally { try { cm.Dispose(); } catch { } }
+            MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
+                "标签条空白右键");
         }
 
         private void CopyText(string text, string what)
@@ -1408,6 +1513,7 @@ namespace TabbedExplorer
                 try { settingsForm.Close(); settingsForm.Dispose(); } catch { }
                 settingsForm = null;
             }
+            try { trimTimer.Stop(); trimTimer.Dispose(); } catch { }
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }
 

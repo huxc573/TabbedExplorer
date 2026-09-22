@@ -14,6 +14,39 @@ namespace TabbedExplorer
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
         public static extern int SetWindowTheme(IntPtr hwnd, string pszSubAppName, string pszSubIdList);
 
+        // ---- 整棵窗口树重画（换颜色模式后把残留像素刷掉；见 Theme.StyleShellTree）----
+        public const uint WM_THEMECHANGED = 0x031A;
+        public const uint RDW_INVALIDATE = 0x0001;
+        public const uint RDW_ERASE = 0x0004;
+        public const uint RDW_FRAME = 0x0400;
+        public const uint RDW_ALLCHILDREN = 0x0080;
+
+        /// <summary>
+        /// 让窗口（含整棵子树）重画。
+        /// **故意不带 RDW_UPDATENOW** —— 那会同步等对方进程走完 WM_PAINT，
+        /// 嵌进来的 explorer 是别人的进程，忙的时候会把我们卡住。
+        /// 只发「失效」通知，让它自己挑时间画，够用了。
+        /// </summary>
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+
+        // ---- 非激活标签省内存（见 ExplorerHost.TrimMemory）----
+        public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        public const uint PROCESS_SET_QUOTA = 0x0100;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        /// <summary>把一个进程的驻留页尽量换出去（psapi）。不动进程本身，只是让它按需再缺页读回。</summary>
+        [DllImport("psapi.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool EmptyWorkingSet(IntPtr hProcess);
+
         // ---- 窗口查找 ----
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

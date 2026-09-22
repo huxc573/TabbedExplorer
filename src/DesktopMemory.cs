@@ -82,15 +82,19 @@ namespace TabbedExplorer
     /// 存的是**地址栏上的那个字符串**、不是我们当初传给 explorer 的路径 —— 川在标签里一路点进去
     /// 之后，要记的是他最后停在哪儿。
     ///
-    /// 文件是纯文本 `&lt;程序目录&gt;\data\desktops.txt`（绿色便携，见 AppPaths），一行一个标签：
+    /// 文件是 JSON `&lt;程序目录&gt;\data\desktops.json`（绿色便携，见 AppPaths）：
     ///   <code>
-    ///   # TabbedExplorer desktops v1
-    ///   [090efe42-....]
-    ///   * D:\FB.Data
-    ///     ::{20D04FE0-3AEA-1069-A2D8-08002B30309D}
+    ///   {
+    ///     "desktops": [
+    ///       { "id": "090efe42-...", "active": "D:\\FB.Data",
+    ///         "tabs": ["::{20D04FE0-...}", "D:\\Shortcut"] }
+    ///     ]
+    ///   }
     ///   </code>
-    /// `*` 是那张桌面上「当时选中的那个标签」。故意不用 JSON：本机没有 NuGet，
-    /// 手写解析越简单越好，而且出问题时川自己打开就能看、能改、能删。
+    /// `active` = 那张桌面上「当时选中的那个标签」。
+    /// 2026-09-22 川要求「配置文件一律 json」：原来那版是 `desktops.txt`，现在 `Load` 见到老文件会
+    /// 读进来、写成 json，再把老文件改名成 `.migrated` 留着（不删）。
+    /// 格式换了，但那条老规矩没变：**出问题时川自己打开就能看、能改、能删**。
     /// </summary>
     internal sealed class DesktopMemory
     {
@@ -101,12 +105,14 @@ namespace TabbedExplorer
             public string Active;
         }
 
-        private const string Header = "# TabbedExplorer desktops v1";
-
         /// <summary>数据目录：程序目录下的 `data\`（见 AppPaths）—— 拷走整个文件夹就把记忆带走了。</summary>
         public static string Folder { get { return AppPaths.DataDir; } }
 
-        public static string FileName { get { return Path.Combine(Folder, "desktops.txt"); } }
+        /// <summary>记忆文件（JSON，2026-09-22 川要求「配置一律 json」）。</summary>
+        public static string FileName { get { return Path.Combine(Folder, "desktops.json"); } }
+
+        /// <summary>老版本的纯文本记忆 —— 只在迁移时读一次。</summary>
+        public static string LegacyFileName { get { return Path.Combine(Folder, "desktops.txt"); } }
 
         private readonly Dictionary<string, Bucket> map =
             new Dictionary<string, Bucket>(StringComparer.OrdinalIgnoreCase);
@@ -137,33 +143,25 @@ namespace TabbedExplorer
             try
             {
                 string f = FileName;
-                if (!File.Exists(f)) { Diag.Step("记忆: 还没有 " + f + "（第一次跑）"); return; }
-
-                string cur = null;
-                int n = 0;
-                foreach (string raw in File.ReadAllLines(f, Encoding.UTF8))
+                if (File.Exists(f))
                 {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line[0] == '#') continue;
-
-                    if (line[0] == '[' && line[line.Length - 1] == ']')
-                    {
-                        cur = line.Substring(1, line.Length - 2).Trim();
-                        Ensure(cur);
-                        continue;
-                    }
-                    if (cur == null) continue;
-
-                    bool active = (line[0] == '*');
-                    string p = (active ? line.Substring(1) : line).Trim();
-                    if (p.Length == 0) continue;
-
-                    Bucket b = Ensure(cur);
-                    b.Paths.Add(p);
-                    if (active) b.Active = p;
-                    n++;
+                    int n = LoadJson(File.ReadAllText(f, Encoding.UTF8));
+                    Diag.Step("记忆: 读到 " + map.Count + " 张桌面 / " + n + " 个标签 <- " + f);
+                    return;
                 }
-                Diag.Step("记忆: 读到 " + map.Count + " 张桌面 / " + n + " 个标签 <- " + f);
+
+                // 老版本的 desktops.txt：读过来、写成 json，再把老文件改名留着（不删）
+                if (File.Exists(LegacyFileName))
+                {
+                    Diag.Step("记忆: 发现老的 desktops.txt，迁移到 desktops.json");
+                    int n = LoadLegacyText();
+                    Save();
+                    try { File.Move(LegacyFileName, LegacyFileName + ".migrated"); } catch { }
+                    Diag.Step("记忆: 迁移完成 " + map.Count + " 张桌面 / " + n + " 个标签");
+                    return;
+                }
+
+                Diag.Step("记忆: 还没有 " + f + "（第一次跑）");
             }
             catch (Exception ex)
             {
@@ -172,23 +170,90 @@ namespace TabbedExplorer
             }
         }
 
+        /// <summary>
+        /// 读 json。形状（我们自己写的，固定）：
+        /// <code>
+        /// {
+        ///   "_note": "说明",
+        ///   "desktops": [
+        ///     { "id": "090efe42-...", "active": "D:\\", "tabs": ["D:\\", "::{20D04FE0-...}"] }
+        ///   ]
+        /// }
+        /// </code>
+        /// </summary>
+        private int LoadJson(string json)
+        {
+            int n = 0;
+            string arr = Json.GetBlock(json, "desktops");
+            foreach (string obj in Json.Objects(arr))
+            {
+                string key = Json.Get(obj, "id");
+                if (string.IsNullOrEmpty(key)) continue;
+                Bucket b = Ensure(key);
+                foreach (string p in Json.Strings(Json.GetBlock(obj, "tabs")))
+                {
+                    if (string.IsNullOrEmpty(p)) continue;
+                    b.Paths.Add(p);
+                    n++;
+                }
+                string act = Json.Get(obj, "active");
+                if (!string.IsNullOrEmpty(act)) b.Active = act;
+            }
+            return n;
+        }
+
+        /// <summary>读老格式（`# 头` + `[guid]` 段落 + 一行一个路径，`*` 标选中）。</summary>
+        private int LoadLegacyText()
+        {
+            string cur = null;
+            int n = 0;
+            foreach (string raw in File.ReadAllLines(LegacyFileName, Encoding.UTF8))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#') continue;
+
+                if (line[0] == '[' && line[line.Length - 1] == ']')
+                {
+                    cur = line.Substring(1, line.Length - 2).Trim();
+                    Ensure(cur);
+                    continue;
+                }
+                if (cur == null) continue;
+
+                bool active = (line[0] == '*');
+                string p = (active ? line.Substring(1) : line).Trim();
+                if (p.Length == 0) continue;
+
+                Bucket b = Ensure(cur);
+                b.Paths.Add(p);
+                if (active) b.Active = p;
+                n++;
+            }
+            return n;
+        }
+
         public void Save()
         {
             try
             {
                 Directory.CreateDirectory(Folder);
                 StringBuilder sb = new StringBuilder();
-                sb.Append(Header).Append("\r\n");
+                sb.Append("{\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 按虚拟桌面记住的标签页。id = 那张桌面的 GUID（换桌面/重排都不会变）；active = 当时选中的那个标签。\",\r\n");
+                sb.Append("  \"_hint\": \"开不了的项（库 / 别处删掉的目录）启动时会自动跳过，不用手改。整个 data 文件夹拷走就把记忆带走了。\",\r\n");
+                sb.Append("  \"desktops\": [\r\n");
+
+                bool first = true;
                 foreach (KeyValuePair<string, Bucket> kv in map)
                 {
                     if (kv.Value == null || kv.Value.Paths.Count == 0) continue;   // 没标签的桌面就别留段落
-                    sb.Append('[').Append(kv.Key).Append("]\r\n");
-                    foreach (string p in kv.Value.Paths)
-                    {
-                        bool act = !string.IsNullOrEmpty(kv.Value.Active) && PathRules.Same(p, kv.Value.Active);
-                        sb.Append(act ? "* " : "  ").Append(p).Append("\r\n");
-                    }
+                    if (!first) sb.Append(",\r\n");
+                    first = false;
+                    sb.Append("    { \"id\": ").Append(Json.Str(kv.Key));
+                    sb.Append(", \"active\": ").Append(Json.Str(kv.Value.Active ?? ""));
+                    sb.Append(", \"tabs\": ").Append(Json.Array(kv.Value.Paths)).Append(" }");
                 }
+                sb.Append("\r\n  ]\r\n}\r\n");
 
                 // 先写临时文件再换过去：写到一半被硬杀也不会把好文件截断成半截。
                 string tmp = FileName + ".tmp";

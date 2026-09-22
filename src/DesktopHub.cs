@@ -51,6 +51,8 @@ namespace TabbedExplorer
         private WinShowWatcher captureWatch;
         /// <summary>看见了、但还没到点去收的候选窗口（值 = 第一次看见的时刻）。见 TryCapture。</summary>
         private readonly Dictionary<IntPtr, DateTime> pendingCapture = new Dictionary<IntPtr, DateTime>();
+        /// <summary>「我们主动藏起来、还没收编的」窗口 —— 防闪用（川 2026-09-22：从桌面/开始菜单打开的会闪一下）。</summary>
+        private readonly HashSet<IntPtr> hiddenByUs = new HashSet<IntPtr>();
         private System.Windows.Forms.Timer captureTimer;
         /// <summary>候选窗口要「晾」多久才收。够短，川感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
@@ -109,6 +111,8 @@ namespace TabbedExplorer
             {
                 miShow, miSave, traySettings.Root, new MenuItem("-"), miQuit
             });
+            // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（川报的「没和其它选项一样居左对齐」）
+            MenuFx.Hook(trayMenu);
             tray.ContextMenu = trayMenu;
             tray.DoubleClick += delegate { OnWinE(); };
         }
@@ -211,18 +215,32 @@ namespace TabbedExplorer
             if (!Settings.CaptureAll) return;
             if (!IsCapturable(h)) return;
             if (pendingCapture.ContainsKey(h)) return;
+
+            // ★ 发现就**立刻藏起来**（川 2026-09-22 报「从桌面或开始菜单打开文件夹，还是会闪一下」）。
+            //   原来这里只登记、等 700ms 才去收 —— 这 700ms 里那个原生窗口就明晃晃地摆在屏幕上，
+            //   用户看到的就是「闪一下，然后被吸进我们窗口」。Win+E 那条路之所以不闪，
+            //   就是因为标签那边（ExplorerHost.OnAnyWindowShown）一发现就先 SW_HIDE。这里补齐同一套。
+            //   藏了冒充自己的窗口怎么办？不用担心：粗筛已经排除了「我们已经认领的」和「启动基线」，
+            //   而且真要是我们自己起的那一个，标签那边本来也会把它藏起来。
+            if (EmbedApi.IsWindowVisible(h))
+            {
+                EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                hiddenByUs.Add(h);
+                Diag.Step(string.Format("Hub: 发现新窗口，先藏起来（别让它闪）cab=0x{0:X}", h.ToInt64()));
+            }
             pendingCapture[h] = DateTime.Now;
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
         }
 
-        /// <summary>这个窗口现在看起来值不值得收（粗筛，真正的收在 Capture 里再判一次）。</summary>
-        private static bool IsCapturable(IntPtr h)
+        /// <summary>这个窗口现在看起来值不值得收（粗筛，真正的收在 AdoptWindow 里再判一次）。</summary>
+        private bool IsCapturable(IntPtr h)
         {
             string c = EmbedApi.ClassOf(h);
             if (c != "CabinetWClass" && c != "ExploreWClass") return false;
             if (EmbedApi.IsClaimed(h)) return false;          // 我们自己起的 / 已经被某个标签收了
             if (EmbedApi.IsBaseline(h)) return false;         // 启动前就在那儿的老窗口（还原、重新显示不算新开）
-            if (!EmbedApi.IsWindowVisible(h)) return false;   // 藏着的多半是我们还没嵌好的
+            // 藏着的多半是我们还没嵌好的 —— 但**我们自己藏起来的那批要认**（防闪就是把它们藏了）
+            if (!EmbedApi.IsWindowVisible(h) && !hiddenByUs.Contains(h)) return false;
             if (EmbedApi.GetParent(h) != IntPtr.Zero) return false;   // 已经是子窗口 → 被谁嵌走了
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return false;
@@ -253,26 +271,47 @@ namespace TabbedExplorer
         /// <summary>真收：把这个窗口接成当前（它所在那）桌面窗口里的一个新标签。</summary>
         private void AdoptWindow(IntPtr h)
         {
-            if (quitting || !Settings.CaptureAll) return;
+            if (quitting || !Settings.CaptureAll) { ReleaseIfAbandoned(h); return; }
             try
             {
-                if (!IsCapturable(h)) return;      // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
+                if (!IsCapturable(h)) { ReleaseIfAbandoned(h); return; }   // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
                 int pid = EmbedApi.ProcessIdOf(h).ToInt32();
                 Diag.Step(string.Format("Hub: 收下这个新开的文件夹窗口 cab=0x{0:X} pid={1}", h.ToInt64(), pid));
 
                 Guid d = VirtualDesktop.WindowDesktopId(h);
                 if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
                 EmbedForm f = EnsureForm(d);
-                if (f == null) return;
+                if (f == null) { ReleaseIfAbandoned(h); return; }
 
                 if (!f.NewAdoptedTab(h, pid))
                 {
                     Diag.Step("Hub: 这个窗口没能收进来（已经收过了 / 失败），保持原样");
+                    ReleaseIfAbandoned(h);
                     return;
                 }
+                hiddenByUs.Remove(h);      // 归标签了，后面由标签负责显示 / 关闭
                 f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: 捕获新窗口失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 我们把它藏过、结果没收成（被别的标签认领了 / 关了 / 收编失败）—— 不能就这么丢着：
+        /// 一个被我们藏起来的窗口在用户眼里就是「窗口没了」的死东西。
+        /// 已经把窗口收进某个标签的（`IsClaimed`）保持藏着，那个标签自己会显示它、关它。
+        /// </summary>
+        private void ReleaseIfAbandoned(IntPtr h)
+        {
+            if (!hiddenByUs.Remove(h)) return;
+            try
+            {
+                if (EmbedApi.IsClaimed(h)) return;                  // 归标签了，标签管
+                if (!NativeMethods.IsWindow(h)) return;             // 已经关了
+                if (EmbedApi.GetParent(h) != IntPtr.Zero) return;    // 已经被嵌走了
+                Diag.Step(string.Format("Hub: 这个窗口没收成，还它本来面目 cab=0x{0:X}", h.ToInt64()));
+                EmbedApi.ShowWindow(h, EmbedApi.SW_SHOW);
+            }
+            catch (Exception ex) { Diag.Log("Hub: 恢复窗口失败 " + ex.Message); }
         }
 
         /// <summary>把动作丢回 UI 线程（钩子 / 线程池的回调都在别的线程上）。</summary>
@@ -445,9 +484,6 @@ namespace TabbedExplorer
 
             MarkDirty();
             RefreshTrayMenu();
-            Notify("捕获方式已换", Settings.Label(m) + (m == Settings.CaptureMode.Migrate
-                ? "：全进程只一个窗口，Win+E 时搬到当前桌面。"
-                : "：每张虚拟桌面各一个窗口、各记一套标签。"), false);
         }
 
         // ==================================================================
@@ -461,10 +497,9 @@ namespace TabbedExplorer
             Settings.SetColor(m);
             Theme.SetMode(m);        // RaiseChanged -> 各窗口自己重刷（含 explorer 的逐窗口主题）
             RefreshTrayMenu();
-            Notify("颜色模式", Settings.Label(m) + (m == Settings.ColorMode.System
-                ? "：跟着系统「应用模式」走。"
-                : "：我们自己画的外壳已切。⚠ 嵌进来的 explorer 是独立进程、按系统主题画，"
-                  + "它那块文件列表仍跟系统（改不了别人的进程开关）。"), false);
+            // 不再弹提示（川：非重要变更不用右下角弹窗）。
+            // ⚠ 仍然要记住的限制：嵌进来的 explorer 是**独立进程**，它那块文件列表按系统主题画，
+            //   我们只能逐窗口 SetWindowTheme 尽力而为。这一条写在设置窗口的说明里。
         }
 
         /// <summary>是否保留标签页。关掉 = 不还原记忆，每次打开都是全新一个「此电脑」。</summary>
@@ -473,9 +508,6 @@ namespace TabbedExplorer
             if (Settings.KeepTabs == on) return;
             Settings.SetKeepTabs(on);
             RefreshTrayMenu();
-            Notify("保留标签页", on
-                ? "开：关掉程序也记住各桌面的标签，下次打开还原。"
-                : "关：下次打开不再还原标签，直接开一个「此电脑」。", false);
         }
 
         /// <summary>标签页宽度（逻辑像素）。立刻重排所有标签条。</summary>
@@ -486,19 +518,24 @@ namespace TabbedExplorer
             Settings.SetTabWidth(v);
             RefreshTrayMenu();
             RetabAll();
-            Notify("标签页宽度", v + (Settings.TabAutoFit ? " 像素（挤不下会自动缩窄）" : " 像素（固定，不缩）"), false);
         }
 
-        /// <summary>自适应宽度：挤不下时是否自动缩窄。</summary>
+        /// <summary>自适应宽度①：文件夹名过长时自动加宽（川 2026-09-22 把这个和「缩窄」拆开了）。</summary>
+        public void SetTabAutoWiden(bool on)
+        {
+            if (Settings.TabAutoWiden == on) return;
+            Settings.SetTabAutoWiden(on);
+            RefreshTrayMenu();
+            RetabAll();
+        }
+
+        /// <summary>自适应宽度②：挤不下时是否自动缩窄。</summary>
         public void SetTabAutoFit(bool on)
         {
             if (Settings.TabAutoFit == on) return;
             Settings.SetTabAutoFit(on);
             RefreshTrayMenu();
             RetabAll();
-            Notify("自适应宽度", on
-                ? "开：标签挤不下时自动缩窄。"
-                : "关：标签固定宽度，挤不下的那些会被右边的设置按钮盖住。", false);
         }
 
         private void RetabAll()
@@ -520,9 +557,6 @@ namespace TabbedExplorer
             Settings.SetFavBar(on);
             RefreshTrayMenu();
             FavBarAll(on);
-            Notify("收藏夹栏", on
-                ? "已显示。内容就是系统那个收藏夹（" + FavBar.LinksDir + "）。"
-                : "已隐藏（Ctrl+Shift+B 再开）。", false);
         }
 
         private void FavBarAll(bool on)
@@ -544,9 +578,6 @@ namespace TabbedExplorer
             if (Settings.CaptureAll == on) return;
             Settings.SetCaptureAll(on);
             RefreshTrayMenu();
-            Notify("捕获所有打开的文件夹", on
-                ? "开：从开始菜单 / 桌面双击打开的文件夹也会收成标签（像浏览器）。"
-                : "关：只接管 Win+E，其他文件夹照旧开原生窗口。", false);
         }
 
         /// <summary>
@@ -560,16 +591,14 @@ namespace TabbedExplorer
         /// </summary>
         public void SetAutoStart(bool on)
         {
-            bool changed = AutoStart.Set(on);
+            bool ok = AutoStart.Set(on);
             RefreshTrayMenu();
-            if (!changed)
+            if (!ok)
             {
+                // 改不动是「出错」，得说一声；成功就不弹了（川：非重要变更不用弹窗）
                 Notify("开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
                 return;
             }
-            Notify("开机自启", on
-                ? "开：开机后自动常驻托盘（按 Win+E 才开窗口）。"
-                : "关：已从启动项里移除。", false);
             Diag.Step("Hub: 开机自启 -> " + (on ? "开" : "关"));
         }
 
@@ -590,12 +619,12 @@ namespace TabbedExplorer
             Diag.Step(string.Format("Hub: 记忆搬家 {0} -> {1}（{2} 个标签）", from, to, dst.Paths.Count));
         }
 
-        /// <summary>「记住当前标签」：立刻把各桌面的标签写盘（托盘菜单和窗口里的设置菜单都走它）。</summary>
+        /// <summary>「记住当前标签」：立刻把各桌面的标签写盘（托盘菜单和设置窗口里都有）。
+        /// 平时是攒 800ms 自动写 + 退出前再写，这个按钮就是「现在立刻写一次」。</summary>
         public void RememberNow()
         {
             try { saveTimer.Stop(); } catch { }
             SaveNow("手动");
-            Notify("已记住", "各虚拟桌面的标签已写进 desktops.txt。", false);
         }
 
         /// <summary>Ctrl+T / Ctrl+W / Ctrl+Tab：派给「前台那个窗口」。

@@ -12,14 +12,13 @@ namespace TabbedExplorer
     /// 这就是当初「托盘右键漏了设置项」的根治办法：加一项只需要在 `Spec` 里加一行。
     ///
     /// 两份菜单的「打勾」画法不一样，原因在渲染那边：
-    ///   - 菜单：用文字前缀 `✓ `（`MenuItem.Checked` 的小方块在深色下经常「勾了但看不见」）
-    ///   - 窗口：就是标准的单选 / 勾选框，不用前缀
+    ///   - 菜单：用 `MenuItem.Checked` + **自绘**（`MenuFx`）—— 勾画在我们自己的勾选列里，
+    ///     既不会像「文字前缀 `✓ `」那样把这一项顶得比同级项突出一块（川报的「没和其它选项一样居左对齐」），
+    ///     也解决了自带的那个小方块在深色下「勾了但看不见」的老毛病。
+    ///   - 窗口：就是标准的单选 / 勾选框，不用前缀。
     /// </summary>
     internal static class SettingsMenu
     {
-        private const string On = "✓ ";
-        private const string Off = "   ";
-
         /// <summary>菜单项规格。Checked 传一个**取值函数**（不是快照），刷新时重算。</summary>
         /// <remarks>
         /// internal 而不是 private：`TraySettings.Bind` 的参数是它，
@@ -103,8 +102,11 @@ namespace TabbedExplorer
             }
             n.Add(Branch("标签页宽度", widths));
 
-            // ⑤ 自适应宽度
-            n.Add(Leaf("自适应宽度（挤不下时自动缩窄）",
+            // ⑤ 自适应宽度（2026-09-22 川要拆成两项：加宽 / 缩窄）
+            n.Add(Leaf("自适应宽度：名称过长时自动加宽",
+                       () => Settings.TabAutoWiden,
+                       () => hub.SetTabAutoWiden(!Settings.TabAutoWiden)));
+            n.Add(Leaf("自适应宽度：挤不下时自动缩窄",
                        () => Settings.TabAutoFit,
                        () => hub.SetTabAutoFit(!Settings.TabAutoFit)));
             n.Add(Sep());
@@ -129,8 +131,15 @@ namespace TabbedExplorer
             n.Add(Sep());
 
             // ⑨ 常用动作 + 说明
-            n.Add(Leaf("记住当前标签", null, () => hub.RememberNow()));
-            n.Add(Leaf("配置文件：程序目录\\data\\settings.json", null, null));
+            // 川 2026-09-22 问「记住当前标签功能是干嘛的」—— 说明这个标签没讲清自己。
+            // 它跟上面「保留标签页」不是一回事：那个是**开关**（开=以后才记），
+            // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有
+            // （改动攒 800ms 落盘 + 退出前再存），所以手动这一下只在「怕它没来得及存」时用。
+            n.Add(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow()));
+            n.Add(Leaf("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）", null, null));
+            // 川 2026-09-22 问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能，
+            // 原因写在这儿（他的说法是「我看你直接删了」，怕以后再问一遍）：
+            n.Add(Leaf("注：嵌进来的是子窗口，没有标题栏/快速访问工具栏 —— 资源管理器左上角那排抓不回来", null, null));
             return n;
         }
 
@@ -152,14 +161,14 @@ namespace TabbedExplorer
                 nodes.Add(nd);
             }
 
-            /// <summary>把带勾选前缀的文字重刷一遍（勾选状态是活的，菜单别缓存）。</summary>
+            /// <summary>把勾选状态重刷一遍（状态是活的，菜单别缓存）。</summary>
             public void Refresh()
             {
                 for (int i = 0; i < items.Count; i++)
                 {
                     Node nd = nodes[i];
                     if (nd.Checked == null) continue;
-                    items[i].Text = TextOf(nd);
+                    items[i].Checked = nd.Checked();
                 }
             }
         }
@@ -179,7 +188,8 @@ namespace TabbedExplorer
             {
                 if (nd.Text == null) { r.Add(new MenuItem("-")); continue; }
 
-                MenuItem mi = new MenuItem(TextOf(nd));
+                MenuItem mi = new MenuItem(nd.Text);
+                if (nd.Checked != null) mi.Checked = nd.Checked();   // 自绘时按这个画勾（见 MenuFx）
                 if (nd.Click != null)
                 {
                     Action a = nd.Click;
@@ -194,12 +204,6 @@ namespace TabbedExplorer
                 r.Add(mi);
             }
             return r.ToArray();
-        }
-
-        private static string TextOf(Node nd)
-        {
-            if (nd.Checked == null) return nd.Text;
-            return (nd.Checked() ? On : Off) + nd.Text;
         }
     }
 }

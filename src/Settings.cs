@@ -11,8 +11,9 @@ namespace TabbedExplorer
     ///   capture    = perdesktop | migrate   标签捕获方式（每桌面一个窗口 / 全进程一个窗口 + Win+E 搬过来）
     ///   keeptabs   = 1 | 0                  是否保留标签页（退出后记住、下次还原）
     ///   theme      = system | light | dark  颜色模式
-    ///   tabwidth   = &lt;逻辑像素&gt;            标签页宽度
-    ///   tabautofit = 1 | 0                  是否自适应宽度（挤不下时自动缩窄）
+    ///   tabwidth   = &lt;逻辑像素&gt;            标签页宽度（开了 tabautowiden 时=单个标签最宽能到多少）
+    ///   tabautowiden = 1 | 0                自适应宽度①：文件夹名过长时自动加宽
+    ///   tabautofit = 1 | 0                  自适应宽度②：挤不下时自动缩窄
     ///   favbar     = 1 | 0                  收藏夹栏显不显示（Ctrl+Shift+B）
     ///   captureall = 1 | 0                  是否把「从开始菜单/桌面打开的文件夹」也收成标签
     ///
@@ -20,6 +21,7 @@ namespace TabbedExplorer
     /// JSON 本体不支持注释，所以说明写在 `_` 开头的键里 —— 那既是**合法 JSON**（任何工具都读得动），
     /// 又能让川打开文件就看见每一项是什么意思。读的是老 `settings.txt` 也没事：
     /// `Load` 会把它读进来、写成 json，再把老文件改名成 `.migrated` 留着（不删）。
+    /// 解析统一走 `Json`（src/Json.cs）—— `desktops.json` / `history.json` / `favorites.json` 共用一套。
     /// </summary>
     internal static class Settings
     {
@@ -46,6 +48,16 @@ namespace TabbedExplorer
         public static bool KeepTabs = true;
         public static ColorMode Color = ColorMode.System;
         public static int TabWidth = 112;
+        /// <summary>
+        /// 自适应宽度（一）：**文件夹名过长时自动加宽** —— 每个标签按自己那行文字的宽度来定，
+        /// 上限就是 `TabWidth`。关了就是所有标签一律 `TabWidth` 宽（名字长了打省略号）。
+        /// </summary>
+        public static bool TabAutoWiden = true;
+        /// <summary>
+        /// 自适应宽度（二）：**挤不下时自动缩窄** —— 全排标签加起来超过可用宽度就等比缩到能放下。
+        /// 关了就不缩（总宽仍然不越过右边那排按钮，多出来的标签要靠横向滚动才看得到）。
+        /// 2026-09-22 川把这一个拆成了两项（原来只有这个「自适应宽度」）。
+        /// </summary>
         public static bool TabAutoFit = true;
         /// <summary>收藏夹栏是否显示（Ctrl+Shift+B）。</summary>
         public static bool FavBar = false;
@@ -76,13 +88,14 @@ namespace TabbedExplorer
                 if (File.Exists(FileName))
                 {
                     string json = File.ReadAllText(FileName, Encoding.UTF8);
-                    Capture    = ParseCapture(JsonGet(json, "capture"));
-                    KeepTabs   = ParseBool(JsonGet(json, "keeptabs"), true);
-                    Color      = ParseColor(JsonGet(json, "theme"));
-                    TabWidth   = ClampWidth(ParseInt(JsonGet(json, "tabwidth"), TabWidth));
-                    TabAutoFit = ParseBool(JsonGet(json, "tabautofit"), true);
-                    FavBar     = ParseBool(JsonGet(json, "favbar"), false);
-                    CaptureAll = ParseBool(JsonGet(json, "captureall"), true);
+                    Capture      = ParseCapture(Json.Get(json, "capture"));
+                    KeepTabs     = Json.GetBool(json, "keeptabs", true);
+                    Color        = ParseColor(Json.Get(json, "theme"));
+                    TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
+                    TabAutoFit   = Json.GetBool(json, "tabautofit", true);
+                    TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
+                    FavBar       = Json.GetBool(json, "favbar", false);
+                    CaptureAll   = Json.GetBool(json, "captureall", true);
                     Diag.Step("设置: " + Describe());
                     return;
                 }
@@ -126,9 +139,10 @@ namespace TabbedExplorer
                     case "keeptabs":   KeepTabs = ParseBool(v, true); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
-                    case "tabautofit": TabAutoFit = ParseBool(v, true); break;
-                    case "favbar":     FavBar = ParseBool(v, false); break;
-                    case "captureall": CaptureAll = ParseBool(v, true); break;
+                    case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
+                    case "tabautowiden": TabAutoWiden = ParseBool(v, true); break;
+                    case "favbar":       FavBar = ParseBool(v, false); break;
+                    case "captureall":   CaptureAll = ParseBool(v, true); break;
                 }
             }
         }
@@ -145,12 +159,15 @@ namespace TabbedExplorer
                 sb.Append("  \"_note\": \"TabbedExplorer 设置。就在程序目录的 data\\\\ 下，拷走整个文件夹就带走了设置和标签记忆。\",\r\n");
                 sb.Append("  \"_capture\": \"perdesktop = 每张虚拟桌面各一个窗口、各记一套标签；migrate = 全进程只一个窗口，Win+E 把它搬到当前桌面\",\r\n");
                 sb.Append("  \"_theme\": \"system = 跟随系统应用模式；light / dark = 强制\",\r\n");
-                sb.Append("  \"_tabwidth\": \"标签页宽度，逻辑像素，64 ~ 240\",\r\n");
+                sb.Append("  \"_tabwidth\": \"标签页宽度，逻辑像素，64 ~ 240；开了 tabautowiden 时它就是「单个标签最宽能到多少」\",\r\n");
+                sb.Append("  \"_tabautowiden\": \"true = 文件夹名太长时这个标签自己加宽（上限 tabwidth）；false = 所有标签一样宽\",\r\n");
+                sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
+                sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append("\r\n");
@@ -165,38 +182,14 @@ namespace TabbedExplorer
             catch (Exception ex) { Diag.Log("设置: 写失败 " + ex.Message); }
         }
 
-        /// <summary>
-        /// 极简 JSON 取值：只认「顶层 `"key": 值`」，值是字符串 / 数字 / true / false。
-        /// 我们没有 NuGet（也不打算引），而设置就这么几个平铺的键，手写一个够用且好查。
-        /// 读不到 / 格式不对一律返回 null，调用方取默认值 —— 手改 JSON 改坏了也不会开不了程序。
-        /// </summary>
-        private static string JsonGet(string text, string key)
-        {
-            if (string.IsNullOrEmpty(text)) return null;
-            int i = text.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
-            if (i < 0) return null;
-            int colon = text.IndexOf(':', i + key.Length + 2);
-            if (colon < 0) return null;
-            int j = colon + 1;
-            while (j < text.Length && char.IsWhiteSpace(text[j])) j++;
-            if (j >= text.Length) return null;
-            if (text[j] == '"')
-            {
-                int end = text.IndexOf('"', j + 1);
-                if (end < 0) return null;
-                return text.Substring(j + 1, end - j - 1);
-            }
-            int k = j;
-            while (k < text.Length && text[k] != ',' && text[k] != '}' &&
-                   text[k] != '\n' && text[k] != '\r') k++;
-            return text.Substring(j, k - j).Trim();
-        }
+        // JSON 取值统一走 `Json`（src/Json.cs）—— 四个数据文件（settings / desktops / history / favorites）
+        // 共用同一套手写解析，不再各写一份（省得格式一处改一处不改）。
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} tabautofit={4} favbar={5} captureall={6}",
+            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7}",
                 Text(Capture), KeepTabs ? 1 : 0, Text(Color), TabWidth,
-                TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0);
+                TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0);
         }
 
         // ==================================================================
@@ -275,6 +268,7 @@ namespace TabbedExplorer
         public static void SetKeepTabs(bool on) { KeepTabs = on; Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
+        public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }
     }

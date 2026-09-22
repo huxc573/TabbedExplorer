@@ -422,7 +422,6 @@ namespace TabbedExplorer
             }
         }
 
-        /// <summary>上层（标签条）告诉我们图标要画多大（设备像素）。</summary>
         /// <summary>
         /// 颜色模式变了：把嵌进来的这个 explorer 窗口（含它整棵 shell 子树）重新上一次主题。
         /// **尽力而为** —— 它是独立进程，它自己的进程级深色开关我们改不了，
@@ -435,6 +434,45 @@ namespace TabbedExplorer
             catch (Exception ex) { Diag.Log("Embed: 重新上色失败 " + ex.Message); }
         }
 
+        /// <summary>
+        /// 把这条标签的 explorer 进程**驻留内存**收一收（非激活标签省内存，川报的优化 3）。
+        ///
+        /// 做什么：`EmptyWorkingSet` —— 把它当前驻留的物理页尽量换到 standby 列表。
+        /// **安全**：进程本身、它开的窗口、里面的状态一点都不动，只是那些页下次被访问时
+        /// 按需再缺页读回，所以被切回去时会有极短的一点「加载感」。
+        /// 正因为有这点代价，调用方只对**已经凉下来的非激活标签**做（见 EmbedForm.TrimInactiveTabs）。
+        ///
+        /// 为什么只有这条路真有用：一个标签 = 一个独立 explorer.exe，
+        /// 闲着的那几十 MB 全在**别人进程**里，我们自己进程怎么省都省不出这些。
+        /// </summary>
+        public void TrimMemory()
+        {
+            if (disposed || ExplorerPid == 0) return;
+            // 不是我们起的进程（收编来的窗口常跟桌面外壳共用一个 explorer.exe）——别动，
+            // 那里面还跑着他桌面/任务栏，动了会让他整台机器都有感觉。
+            if (pidsBefore.Contains(ExplorerPid)) return;
+
+            IntPtr h = IntPtr.Zero;
+            try
+            {
+                h = NativeMethods.OpenProcess(
+                    NativeMethods.PROCESS_QUERY_INFORMATION | NativeMethods.PROCESS_SET_QUOTA,
+                    false, ExplorerPid);
+                if (h == IntPtr.Zero) return;   // 权限不够就安静放弃，不是错
+                if (NativeMethods.EmptyWorkingSet(h))
+                    Diag.Log("Embed: 已收内存 pid=" + ExplorerPid);
+            }
+            catch { }
+            finally
+            {
+                if (h != IntPtr.Zero)
+                {
+                    try { NativeMethods.CloseHandle(h); } catch { }
+                }
+            }
+        }
+
+        /// <summary>上层（标签条）告诉我们图标要画多大（设备像素）。</summary>
         public void SetIconTarget(int px)
         {
             iconTarget = px;

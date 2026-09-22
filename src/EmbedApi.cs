@@ -224,6 +224,99 @@ namespace TabbedExplorer
         [DllImport("user32.dll", EntryPoint = "SendMessageW")]
         public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
 
+        [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessageText(IntPtr h, uint msg, IntPtr w, StringBuilder l);
+
+        private const uint WM_GETTEXT = 0x000D;
+
+        /// <summary>
+        /// 读任意窗口的文本，**跨进程也行**。
+        ///
+        /// 这里必须走 `WM_GETTEXT`（系统消息，参数会被跨进程编组），
+        /// 不能用 `GetWindowText` —— 后者对别的进程只拿得到「标题」那一类，
+        /// 像地址栏 `ToolbarWindow32` 这种把文本存在自己内部的地方会永远返回空。
+        /// </summary>
+        public static string WindowTextOf(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return "";
+            try
+            {
+                StringBuilder sb = new StringBuilder(1024);
+                SendMessageText(h, WM_GETTEXT, new IntPtr(sb.Capacity), sb);
+                return sb.ToString();
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 找到嵌进来那个 explorer 窗口的**地址栏**。
+        ///
+        /// 判据只有一条：`ToolbarWindow32` 而且窗口文本里带「: 」——
+        /// 地址栏那一条是 `地址: &lt;当前地址&gt;`，而同一个 ReBar 里另外两条
+        /// （`导航按钮`、`地址区段工具栏`）都没有冒号，所以「带冒号的 toolbar」就是地址栏，
+        /// 不必写死 `地址: ` 这个**跟着系统语言变**的前缀。
+        ///
+        /// 为什么要找它：这是唯一一条「按我们手上这个 HWND 读、又拿得到当前文件夹」的路
+        /// （试过并且不行的两条：ShellWindows/IWebBrowser2 被 SetParent 之后回报的 HWND
+        /// 变成我们的顶层窗口，一张桌面上的标签全撞成一个 key；AccessibleObjectFromWindow
+        /// 的 OBJID_NATIVEOM 在 CabinetWClass 上直接 E_FAIL）。
+        /// </summary>
+        public static IntPtr FindAddressBand(IntPtr cab)
+        {
+            if (cab == IntPtr.Zero) return IntPtr.Zero;
+            try
+            {
+                // 首选：地址栏固定住的那个 `Breadcrumb Parent`（结构判据，跟系统语言无关）
+                IntPtr crumb = WinFind.ByClass(cab, "Breadcrumb Parent");
+                if (crumb != IntPtr.Zero)
+                {
+                    IntPtr t = WinFind.ByClass(crumb, "ToolbarWindow32");
+                    if (t != IntPtr.Zero && WindowTextOf(t).IndexOf(": ", StringComparison.Ordinal) >= 0) return t;
+                }
+
+                // 兜底：整个窗口里「文本带冒号」的那个 toolbar（地址栏是 `地址: <当前地址>`，
+                // 同一条 rebar 上另外两条 `导航按钮` / `地址区段工具栏` 都没有冒号）
+                foreach (IntPtr h in WinFind.All(cab))
+                {
+                    if (string.Compare(WinFind.ClassOf(h), "ToolbarWindow32",
+                            StringComparison.OrdinalIgnoreCase) != 0) continue;
+                    if (WindowTextOf(h).IndexOf(": ", StringComparison.Ordinal) >= 0) return h;
+                }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// p 是不是 root 的后代（跨进程也能判）。
+        /// 用来防「句柄被回收后瞎认」：地址栏那个 toolbar 是我们缓存下来的，
+        /// 万一 shell 把它换成了别的窗口而句柄号被复用，至少能保证读到的还是自己那棵树里的东西。
+        /// </summary>
+        public static bool IsDescendant(IntPtr root, IntPtr p)
+        {
+            if (root == IntPtr.Zero || p == IntPtr.Zero) return false;
+            try
+            {
+                for (int i = 0; i < 32 && p != IntPtr.Zero; i++)
+                {
+                    if (p == root) return true;
+                    p = GetParent(p);
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>`地址: D:\xxx` → `D:\xxx`。
+        /// 取第一个「: 」之后的全部 —— Windows 的路径/文件名里不可能出现冒号，所以这个切法不会切错。</summary>
+        public static string StripAddressPrefix(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            int i = s.IndexOf(": ", StringComparison.Ordinal);
+            string r = (i >= 0) ? s.Substring(i + 2) : s;
+            return r.Trim();
+        }
+
         // ⚠ 64 位下没有 `GetClassLongPtr` 这个导出，必须点 W/A 后缀那颗。
         [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
         private static extern IntPtr GetClassLongPtr(IntPtr h, int index);

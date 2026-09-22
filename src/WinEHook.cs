@@ -63,8 +63,9 @@ namespace TabbedExplorer
         public event Action PrevTabKey;
 
         /// <summary>
-        /// 我们的主窗口句柄。**只有它是前台时才接管 Ctrl 系快捷键** ——
+        /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管 Ctrl 系快捷键** ——
         /// 否则就成了全局霸占 Ctrl+W（浏览器里关标签、别的编辑器里存盘都会被我吃掉）。
+        /// 每张虚拟桌面一个窗口之后，这里不再拿它当唯一判据，见 OursIsForeground。
         /// </summary>
         public IntPtr MainWindow;
 
@@ -165,18 +166,21 @@ namespace TabbedExplorer
         /// </summary>
         private bool OursIsForeground()
         {
-            IntPtr main = MainWindow;
-            if (main == IntPtr.Zero) return false;
-
             IntPtr fg = NativeMethods.GetForegroundWindow();
             if (fg == IntPtr.Zero) return false;
-            if (fg == main) return true;
 
+            IntPtr main = MainWindow;
+            if (main != IntPtr.Zero && fg == main) return true;
+
+            // 前台窗口属于我们这个进程 ⇒ 一定是我们自己的窗口。
+            // 这条才是主力判据：每张虚拟桌面各有一个窗口，MainWindow 只是「其中一个」。
+            // 另外「焦点在嵌进来的 explorer 子窗口里」也走这条 —— 子窗口当不了前台窗口，
+            // 那时 GetForegroundWindow() 返回的仍是我们的顶层窗口。
             uint pid;
             GetWindowThreadProcessId(fg, out pid);
             if ((int)pid == ourPid) return true;
 
-            return GetAncestor(fg, GA_ROOT) == main;
+            return main != IntPtr.Zero && GetAncestor(fg, GA_ROOT) == main;
         }
 
         public void Dispose()

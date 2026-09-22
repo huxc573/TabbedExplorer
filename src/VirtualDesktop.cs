@@ -146,6 +146,45 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 某个窗口属于哪张虚拟桌面（**跨进程也能问**，公开接口本来就支持）。取不到返回 Guid.Empty。
+        ///
+        /// 用途：每张桌面一个窗口之后，要用它来认领「哪个窗口是这张桌面的」——
+        /// 川要是用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面，靠它还能把窗口跟桌面重新对上。
+        /// </summary>
+        public static Guid WindowDesktopId(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return Guid.Empty;
+            IVirtualDesktopManager m = Manager;
+            if (m == null) return Guid.Empty;
+            lock (gate)
+            {
+                try
+                {
+                    Guid g;
+                    if (m.GetWindowDesktopId(hwnd, out g) == 0) return g;
+                }
+                catch { }
+                return Guid.Empty;
+            }
+        }
+
+        /// <summary>
+        /// 窗口现在在不在当前桌面。**判不出来一律当作「在」** —— 这个判断只用来拦「抢前台会把人拽走」
+        /// 这一种情况，而每张桌面一个窗口之后，窗口根本不会被搬来搬去，能走到这里说明本来就该显示它。
+        /// </summary>
+        public static bool IsOnCurrentDesktop(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return true;
+            IVirtualDesktopManager m = Manager;
+            if (m == null) return true;
+            lock (gate)
+            {
+                bool? on = OnCurrent(m, hwnd);
+                return on == null ? true : on.Value;
+            }
+        }
+
+        /// <summary>
         /// 当前「正在看的」桌面 GUID。优先未公开的权威接口，失败再靠前台窗口反推（带重试）。
         /// 🔴 **必须在抢前台之前调** —— 一旦我们成了前台窗口，反推出来的就是老的那个。
         /// </summary>

@@ -70,6 +70,27 @@ namespace TabbedExplorer
         private IntPtr lastIconHandle = IntPtr.Zero;
         private int iconTarget;
 
+        /// <summary>
+        /// 这个标签**现在**在哪个文件夹 —— 就是地址栏上那个字符串（真目录时就是完整路径）。
+        ///
+        /// 为什么不能只用 `TargetPath`：那只是「我们当初让 explorer 打开的」。川在标签里一路点进去之后
+        /// 它就不对了，而「记忆标签」记的必须是他**最后停在哪儿**。
+        ///
+        /// 怎么读到的（2026-09-22 绕了一圈才找对的那条路）：
+        ///   1. ShellWindows / `IWebBrowser2.LocationURL` 内容是对的，但窗口被我们 SetParent 之后
+        ///      它回报的 HWND 变成**我们的顶层窗口** —— 一张桌面上的所有标签会撞成同一个 key，废；
+        ///   2. `AccessibleObjectFromWindow(OBJID_NATIVEOM)` 在 CabinetWClass 上直接 E_FAIL；
+        ///   3. 地址栏那个 `ToolbarWindow32` 的**窗口文本就是地址本身**
+        ///      （实测 `地址: D:\Dev\Workspaces\WorkBuddy\TabbedExplorer`），
+        ///      而它就在我们手上这个 HWND 的子树里 —— 按窗口读，天然不会串台。
+        /// </summary>
+        public string CurrentPath { get { return currentPath; } }
+        /// <summary>当前文件夹变了（刚嵌好 / 用户在里导航了）。</summary>
+        public event EventHandler PathChanged;
+
+        private IntPtr addressBand;
+        private string currentPath;
+
         private uint origStyle;
         private WRECT origRect;
         private bool embedded;
@@ -269,6 +290,7 @@ namespace TabbedExplorer
                 Diag.Step("Embed: 顶部空白 = " + TopBlank + "px");
                 settle.Start();
                 RefreshIcon(true);          // 接手时先要一颗图标（当前文件夹的）
+                RefreshPath();              // 也先要一次当前路径
 
                 Focus();
                 lastTitle = CurrentDisplayName;
@@ -333,6 +355,35 @@ namespace TabbedExplorer
                 if (old != null) { try { old.Dispose(); } catch { } }   // 此刻它已经没人引用了
             }
             catch (Exception ex) { Diag.Log("Embed: 取标签图标失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 读一次地址栏，变了就通知上层。
+        /// 地址栏那个 toolbar 可能被 shell 在导航时重建，所以句柄失效就重新找一次（找一次很便宜）。
+        /// 读不到 / 读出空值一律**保留上一次的值** —— 别让导航中途的空窗把好路径冲掉。
+        /// </summary>
+        private void RefreshPath()
+        {
+            if (disposed || !embedded || CabWindow == IntPtr.Zero) return;
+            try
+            {
+                if (addressBand == IntPtr.Zero || !NativeMethods.IsWindow(addressBand) ||
+                    !EmbedApi.IsDescendant(CabWindow, addressBand))
+                {
+                    addressBand = EmbedApi.FindAddressBand(CabWindow);
+                    if (addressBand == IntPtr.Zero) return;
+                }
+
+                string s = EmbedApi.StripAddressPrefix(EmbedApi.WindowTextOf(addressBand));
+                if (string.IsNullOrEmpty(s)) return;
+                if (string.Equals(s, currentPath, StringComparison.Ordinal)) return;
+
+                currentPath = s;
+                Diag.Step("Embed: 现在在 " + s);
+                EventHandler e = PathChanged;
+                if (e != null) e(this, EventArgs.Empty);
+            }
+            catch (Exception ex) { Diag.Log("Embed: 读地址栏失败 " + ex.Message); }
         }
 
         private static bool IsBlank(Bitmap b)
@@ -454,6 +505,7 @@ namespace TabbedExplorer
             // 每轮都问一下句柄（很便宜），变了才重新画 —— 这样即使图标比标题晚一步才更新，
             // 下个 500ms 也追得上。
             RefreshIcon(false);
+            RefreshPath();      // 地址栏那个字符串（记忆标签靠它，见 CurrentPath 的注释）
 
             if (string.Equals(t, lastTitle, StringComparison.Ordinal)) return;
             lastTitle = t;
@@ -498,6 +550,8 @@ namespace TabbedExplorer
             }
             embedded = false;
             CabWindow = IntPtr.Zero;
+            addressBand = IntPtr.Zero;
+            currentPath = null;
             KillOwnExplorer();
         }
 

@@ -1,22 +1,23 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Threading;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 「嵌入真 explorer 窗口」模式的窗口。
-    /// 和 MainForm 那套（自绘外壳 + IExplorerBrowser）完全独立，靠 --embed 启动。
+    /// 「嵌入真 explorer 窗口」模式的窗口 —— **每张虚拟桌面一个**。
+    /// 和 MainForm 那套（自绘外壳 + IExplorerBrowser）完全独立。
     ///
     /// 这里我们只负责：顶部一条自绘标题栏 + 一条标签条 + 一个容器。
     /// Ribbon、地址栏、导航窗格、文件列表、状态栏**全部是 explorer 自己的**，
     /// 所以外观和系统资源管理器一模一样。
     ///
-    /// 常驻后台：这个窗口是「Win+E 的落点」，所以**关掉它不等于退出程序** ——
-    /// 点 X、关掉最后一个标签都只是收进托盘，进程留着接 Win+E；
-    /// 真正退出走托盘右键「退出」。
+    /// 托盘图标和键盘钩子**不在这个类里**了 —— 全进程只能有一份，所以搬去了 DesktopHub。
+    /// 这个窗口只管「自己这张桌面的标签」：
+    ///   - 起来（第一次现身）时按 `desktops.txt` 里**本桌面**记的那几个路径把标签摆回来；
+    ///   - 标签有变动就告诉 Hub 攒一下写盘；
+    ///   - 关窗口（X / Ctrl+W 关到最后一个）= 收进托盘，进程不退，标签也还在（真退出才落盘）。
     /// </summary>
     internal sealed class EmbedForm : Form
     {
@@ -47,28 +48,30 @@ namespace TabbedExplorer
         private const int HTBOTTOMLEFT = 16;
         private const int HTBOTTOMRIGHT = 17;
 
+        private readonly DesktopHub hub;
         private readonly TitleBar titleBar;
         private readonly TabStrip tabStrip;
         private readonly Panel content;
         private readonly Label status;
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
+        private bool restored;
+
+        /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
+        internal string DesktopKey { get; set; }
+
+        /// <summary>真退出中（托盘「退出」/`--quit`/系统关机），别再拦关闭。</summary>
+        internal bool Quitting { get; set; }
 
         /// <summary>自己做的窗口边框厚度（只在不最大化时有）。</summary>
         private readonly int ResizeBorder;
         private bool inLayout;
 
-        // ---- 常驻后台 ----
-        private NotifyIcon tray;
-        private WinEHook hook;
-        private RegisteredWaitHandle sigWait;
-        private EventWaitHandle quitEvent;      // `--quit` 的信号（真退出，区别于点 X 的收托盘）
-        private RegisteredWaitHandle quitWait;
-        private bool quitting;          // 真退出中（托盘「退出」/系统关机），别再拦关闭
-        private bool trayTipShown;
-
-        public EmbedForm()
+        public EmbedForm(DesktopHub owner, string desktopKey)
         {
+            hub = owner;
+            DesktopKey = desktopKey;
+
             Text = "此电脑";
             BackColor = Theme.RibbonBack;   // 无边框后，四周那圈就是这个色，当边框用
             Size = new Size(Px(1200), Px(760));
@@ -126,9 +129,8 @@ namespace TabbedExplorer
             Theme.Changed += delegate { ApplyTheme(); };
             DoLayout();
 
-            // 常驻后台模式（--tray，开机自启走这条）：起来不建标签、不显窗口，
-            // 等 Win+E 或双击 exe 才现身。
-            if (!Program.StartHidden) NewTab(ExplorerView.ThisPcPath);
+            // 标签**不在这里开**：要等第一次现身时才知道该还原什么
+            // （见 EnsureFirstTab：按本桌面记着的路径把标签摆回来，没记过才开一个「此电脑」）。
         }
 
         // ==================================================================
@@ -259,6 +261,9 @@ namespace TabbedExplorer
 
         private void ApplyTheme()
         {
+            // 窗口可能已经被销毁（多窗口之后 Theme.Changed 的订阅者不止一个，没法逐条退订），
+            // 对着已释放的控件设颜色会抛 ObjectDisposedException。
+            if (IsDisposed || Disposing) return;
             BackColor = Theme.RibbonBack;
             content.BackColor = Theme.Pane;
             status.BackColor = Theme.StatusBack;
@@ -269,159 +274,34 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 常驻后台：托盘 + Win+E 接管
+        // 现身 / 收托盘
         // ==================================================================
 
-        /// <summary>把窗口句柄建出来（隐藏启动时也要，否则 BeginInvoke / 托盘都不好使）。</summary>
+        /// <summary>把窗口句柄建出来（隐藏启动时也要，否则 BeginInvoke 不好使）。</summary>
         public void ForceHandle()
         {
             IntPtr h = Handle;
             GC.KeepAlive(h);
         }
 
-        private void SetupResident()
-        {
-            // 托盘图标 = **程序自己的图标**（exe 里编进去的那颗）。
-            // 以前借的是 shell32.dll 的「新建文件夹」——那是资源管理器的图标，不是我们的。
-            tray = new NotifyIcon();
-            tray.Icon = ShellIcon.AppIcon(true);
-            tray.Text = "TabbedExplorer（接 Win+E）";
-            tray.Visible = true;
-
-            MenuItem miShow = new MenuItem("打开窗口（Win+E）");
-            miShow.Click += delegate { ShowFromTray(true); };
-            MenuItem miQuit = new MenuItem("退出");
-            miQuit.Click += delegate
-            {
-                Diag.Step("EmbedForm: 托盘「退出」");
-                quitting = true;
-                Close();
-            };
-            tray.ContextMenu = new ContextMenu(new MenuItem[] { miShow, miQuit });
-            tray.DoubleClick += delegate { ShowFromTray(true); };
-
-            // 键盘钩子：Win+E **无条件**接管；Ctrl+T / Ctrl+W / Ctrl+Tab **只在我们窗口是前台时**接管。
-            // 为什么这两个也得走钩子：真正持有键盘焦点的是**嵌进来的 explorer 子进程**，
-            // 按键不会流进我们的窗体 —— `KeyPreview` / `OnPreviewKeyDown` 一条都收不到。
-            // 川報的「Ctrl+T 完全没效果、Ctrl+W 直接把程序关掉」就是这个原因：
-            // Ctrl+T explorer 没这个键所以没反应；Ctrl+W 是 explorer 自带的「关闭窗口」，它把自己关了。
-            // 回调在钩子线程上，必须转到 UI 线程再动界面。
-            hook = new WinEHook();
-            hook.MainWindow = Handle;
-            hook.WinE += delegate { Post(delegate { ShowFromTray(true); }); };
-            hook.NewTabKey += delegate { Post(HotkeyNewTab); };
-            hook.CloseTabKey += delegate { Post(HotkeyCloseTab); };
-            hook.NextTabKey += delegate { Post(delegate { CycleTab(1); }); };
-            hook.PrevTabKey += delegate { Post(delegate { CycleTab(-1); }); };
-            hook.Start();
-
-            // 摸一次虚拟桌面接口，把结果写进日志（只读，不搬窗、不切桌面）。
-            try { VirtualDesktop.WarmUp(); } catch (Exception ex) { Diag.Log("虚拟桌面: 预热异常 " + ex.Message); }
-
-            // 第二个实例被启动（双击 exe）时，它只会 set 一下这个命名事件，由我们现身。
-            if (Program.ShowSignal != null)
-            {
-                try
-                {
-                    sigWait = ThreadPool.RegisterWaitForSingleObject(Program.ShowSignal,
-                        delegate
-                        {
-                            try { BeginInvoke(new Action(delegate { ShowFromTray(true); })); }
-                            catch { }
-                        }, null, -1, false);
-                }
-                catch (Exception ex) { Diag.Log("EmbedForm: 注册唤醒事件失败 " + ex.Message); }
-            }
-
-            // `--quit`：命令行版「退出」，这次是**真退**（会把各标签里的 explorer 都收干净再走）。
-            // 事件挂在字段上、不能 using 掉 —— 注册等待之后句柄要一直活着。
-            try
-            {
-                quitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.QuitSignalName);
-                quitWait = ThreadPool.RegisterWaitForSingleObject(quitEvent,
-                    delegate { Post(delegate { quitting = true; Close(); }); }, null, -1, false);
-            }
-            catch (Exception ex) { Diag.Log("EmbedForm: 注册退出事件失败 " + ex.Message); }
-        }
-
-        /// <summary>把动作丢回 UI 线程（钩子 / 线程池的回调都在别的线程上）。</summary>
-        private void Post(Action a)
-        {
-            try { BeginInvoke(a); } catch { }
-        }
-
-        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。</summary>
-        private void HotkeyNewTab()
-        {
-            Diag.Step("EmbedForm: 热键 Ctrl+T -> 新标签");
-            if (!Visible) Show();
-            NewTab(CurrentPath());
-        }
-
-        /// <summary>Ctrl+W：关当前标签；这是最后一个就收进托盘（不退进程）。</summary>
-        private void HotkeyCloseTab()
-        {
-            int i = activeIndex >= 0 ? activeIndex : hosts.Count - 1;
-            Diag.Step("EmbedForm: 热键 Ctrl+W -> 关标签 idx=" + i);
-            if (i < 0) { HideToTray(); return; }
-            CloseTab(i);
-        }
-
-        /// <summary>Ctrl+Tab / Ctrl+Shift+Tab：在标签之间循环。</summary>
-        private void CycleTab(int delta)
-        {
-            if (hosts.Count < 2) return;
-            int n = hosts.Count;
-            int i = ((activeIndex + delta) % n + n) % n;
-            Diag.Step("EmbedForm: 热键 Ctrl+Tab -> 切到 idx=" + i);
-            Activate(i);
-        }
-
-        /// <summary>路径规范化：比路径时用，别让 `c:\Users\a\` 与 `C:\Users\a` 当成两个。</summary>
-        private static string NormPath(string p)
-        {
-            if (string.IsNullOrEmpty(p)) return "";
-            p = p.Trim();
-            if (p.Length > 3) p = p.TrimEnd('\\');
-            return p.ToLowerInvariant();
-        }
-
-        /// <summary>已经有标签开着这个路径就返回它的下标，否则 -1。</summary>
-        private int IndexOfPath(string path)
-        {
-            string want = NormPath(path);
-            for (int i = 0; i < hosts.Count; i++)
-            {
-                if (NormPath(hosts[i].TargetPath) == want) return i;
-            }
-            return -1;
-        }
-
         /// <summary>
-        /// Win+E / 托盘 / 第二个实例的统一入口：把窗口摆到前台，并开一个「此电脑」标签。
-        /// （和 QTTabBar 一样，Win+E 总是给一个新标签，不会把你正在看的东西顶掉。）
+        /// Win+E / 托盘 / 双击 exe 的统一入口：把窗口摆出来，并按需要开一个新标签。
+        ///
+        /// **不再搬虚拟桌面了**：这个窗口本来就属于它那张桌面（由 Hub 按当前桌面创建/认领），
+        /// 原来那套「先搬桌面再抢前台」连带把「按 Win+E 被拽到别的桌面」这个毛病一起删掉了。
+        /// 这里只留一道保险：万一它确实落在别的桌面上，就**只显示、不抢前台**。
         /// </summary>
-        private void ShowFromTray(bool newTab)
+        public void ShowForUser(bool newTab)
         {
-            Diag.Step("EmbedForm: ShowFromTray newTab=" + newTab);
+            Diag.Step("EmbedForm: ShowForUser newTab=" + newTab + " 桌面=" + DesktopKey);
             try
             {
-                // **先搬桌面再抢前台**：窗口要是属于别的虚拟桌面，SetForegroundWindow 会把川
-                // 直接拽回那个桌面（他报的「切了虚拟桌面又被跳回去」）。
-                // 必须放在抢焦点之前 —— 一抢到我们就成了前台窗口，问出来的桌面就不是他看的那个了。
-                VdOutcome vd = VirtualDesktop.EnsureOnCurrentDesktop(Handle);
-
-                if (vd == VdOutcome.Failed)
+                if (!VirtualDesktop.IsOnCurrentDesktop(Handle))
                 {
-                    // 已知窗口在别的桌面、而且没搬过来 ⇒ **绝不能抢前台**（一抢就把他拽走）。
-                    // 什么都不做 + 告诉他一声，是这里唯一不伤人的选择。
-                    Diag.Step("EmbedForm: 窗口搬不到当前桌面 -> 不显示、不抢前台（不切走）");
-                    if (tray != null)
-                    {
-                        tray.BalloonTipTitle = "打不开：窗口在别的虚拟桌面";
-                        tray.BalloonTipText = "这个窗口属于另一张虚拟桌面，暂时搬不过来。再按一次 Win+E 试试。";
-                        tray.ShowBalloonTip(3000);
-                    }
+                    Diag.Step("EmbedForm: 窗口不在当前桌面 -> 不显示、不抢前台（不切走）");
+                    if (hub != null)
+                        hub.Notify("打不开：窗口在别的虚拟桌面",
+                            "这个窗口属于另一张虚拟桌面。回到那张桌面再按 Win+E。", false);
                     return;
                 }
 
@@ -429,11 +309,9 @@ namespace TabbedExplorer
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
 
-                if (hosts.Count == 0)
-                {
-                    NewTab(ExplorerView.ThisPcPath);
-                }
-                else if (newTab)
+                EnsureFirstTab();
+
+                if (newTab)
                 {
                     // 去重：这个路径已经开着（比如一直按 Win+E），切过去就行，
                     // 别再刷一屏「此电脑」—— 原生 Win10 也是复用已有窗口。
@@ -445,9 +323,48 @@ namespace TabbedExplorer
                     }
                     else NewTab(ExplorerView.ThisPcPath);
                 }
-                else Activate(activeIndex);
+                else if (activeIndex >= 0) Activate(activeIndex);
+
+                MarkDirty();
             }
-            catch (Exception ex) { Diag.Log("EmbedForm: ShowFromTray 失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("EmbedForm: ShowForUser 失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 第一次现身时把**本桌面**记着的标签摆回来；没记过（或都开不了）才开一个「此电脑」。
+        /// 只做一次 —— 之后这个窗口的标签就是活的，关了再按 Win+E 还是原来那些。
+        /// </summary>
+        private void EnsureFirstTab()
+        {
+            if (restored || hosts.Count > 0) return;
+            restored = true;
+
+            DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
+            if (b != null && b.Paths.Count > 0)
+            {
+                int skipped = 0, wantIdx = -1;
+                foreach (string p in b.Paths)
+                {
+                    if (!PathRules.Restorable(p))
+                    {
+                        skipped++;
+                        Diag.Step("记忆: 跳过开不了的项「" + p + "」（可能是个库/虚拟文件夹，没有真实路径）");
+                        continue;
+                    }
+                    if (wantIdx < 0 && !string.IsNullOrEmpty(b.Active) && PathRules.Same(p, b.Active))
+                        wantIdx = hosts.Count;    // 记下的「当时选中那个」是第几个
+                    NewTab(p);
+                }
+                Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个）",
+                    DesktopKey, hosts.Count, skipped));
+                if (hosts.Count > 0)
+                {
+                    if (wantIdx >= 0) Activate(Math.Min(wantIdx, hosts.Count - 1));
+                    return;
+                }
+            }
+
+            NewTab(ExplorerView.ThisPcPath);
         }
 
         /// <summary>
@@ -477,24 +394,108 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 收进托盘。**不是退出** —— 进程留着，Win+E 才有落点。
+        /// 收进托盘。**不是退出** —— 进程留着，Win+E 才有落点，标签也原样留着。
         /// 第一次收起来时弹个气泡说明一下，免得以为程序关了。
         /// </summary>
         private void HideToTray()
         {
             Diag.Step("EmbedForm: 收进托盘（进程常驻，继续接 Win+E）");
             Visible = false;
-            if (tray != null && !trayTipShown)
+            MarkDirty();
+            if (hub != null)
+                hub.Notify("TabbedExplorer 还在后台",
+                    "按 Win+E 随时打开；右键托盘图标可以退出。", true);
+        }
+
+        // ==================================================================
+        // 热键 / 标签
+        // ==================================================================
+
+        /// <summary>Hub 把热键派过来（钩子那边只知道「前台是我们」，具体哪个窗口由它找）。</summary>
+        internal void HandleHotkey(string what)
+        {
+            if (what == "Ctrl+T") { HotkeyNewTab(); return; }
+            if (what == "Ctrl+W") { HotkeyCloseTab(); return; }
+            if (what == "Ctrl+Tab") { CycleTab(1); return; }
+            if (what == "Ctrl+Shift+Tab") { CycleTab(-1); return; }
+        }
+
+        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。</summary>
+        private void HotkeyNewTab()
+        {
+            Diag.Step("EmbedForm: 热键 Ctrl+T -> 新标签");
+            if (!Visible) Show();
+            NewTab(CurrentPath());
+        }
+
+        /// <summary>Ctrl+W：关当前标签；这是最后一个就收进托盘（不退进程）。</summary>
+        private void HotkeyCloseTab()
+        {
+            int i = activeIndex >= 0 ? activeIndex : hosts.Count - 1;
+            Diag.Step("EmbedForm: 热键 Ctrl+W -> 关标签 idx=" + i);
+            if (i < 0) { HideToTray(); return; }
+            CloseTab(i);
+        }
+
+        /// <summary>Ctrl+Tab / Ctrl+Shift+Tab：在标签之间循环。</summary>
+        private void CycleTab(int delta)
+        {
+            if (hosts.Count < 2) return;
+            int n = hosts.Count;
+            int i = ((activeIndex + delta) % n + n) % n;
+            Diag.Step("EmbedForm: 热键 Ctrl+Tab -> 切到 idx=" + i);
+            Activate(i);
+        }
+
+        /// <summary>
+        /// 这个标签**现在**在哪个文件夹：优先地址栏实时值（用户在里导航过就以它为准），
+        /// 还没读到时退回「我们当初让它打开的路径」。返回值已经过 PathRules 归一（`此电脑` → `::{…}`）。
+        /// </summary>
+        private static string LivePath(ExplorerHost h)
+        {
+            if (h == null) return "";
+            string p = h.CurrentPath;
+            if (string.IsNullOrEmpty(p)) p = h.TargetPath;
+            return PathRules.Store(p) ?? "";
+        }
+
+        /// <summary>已经有标签开着这个路径就返回它的下标，否则 -1。</summary>
+        private int IndexOfPath(string path)
+        {
+            string want = PathRules.Norm(path);
+            for (int i = 0; i < hosts.Count; i++)
             {
-                trayTipShown = true;
-                try
-                {
-                    tray.BalloonTipTitle = "TabbedExplorer 还在后台";
-                    tray.BalloonTipText = "按 Win+E 随时打开；右键托盘图标可以退出。";
-                    tray.ShowBalloonTip(4000);
-                }
-                catch { }
+                if (PathRules.Norm(LivePath(hosts[i])) == want) return i;
             }
+            return -1;
+        }
+
+        /// <summary>按顺序记下本窗口所有标签的路径（给 Hub 写记忆用）。</summary>
+        internal List<string> TabPaths()
+        {
+            List<string> r = new List<string>();
+            foreach (ExplorerHost h in hosts)
+            {
+                if (h == null || h.CabWindow == IntPtr.Zero) continue;   // 还没嵌好的先不记
+                string p = LivePath(h);
+                if (!string.IsNullOrEmpty(p)) r.Add(p);
+            }
+            return r;
+        }
+
+        /// <summary>当前选中的那个标签的路径（还原时一并切过去）。</summary>
+        internal string ActiveTabPath
+        {
+            get
+            {
+                if (activeIndex < 0 || activeIndex >= hosts.Count) return null;
+                return LivePath(hosts[activeIndex]);
+            }
+        }
+
+        private void MarkDirty()
+        {
+            if (hub != null) hub.MarkDirty();
         }
 
         // ==================================================================
@@ -512,11 +513,13 @@ namespace TabbedExplorer
             h.Failed += delegate(object s, EventArgs e) { OnHostFailed(h); };
             h.TitleChanged += delegate(object s, EventArgs e) { OnHostTitleChanged(h); };
             h.IconChanged += delegate(object s, EventArgs e) { OnHostIconChanged(h); };
+            h.PathChanged += delegate(object s, EventArgs e) { OnHostPathChanged(h); };
             h.Died += OnHostDied;
 
             SetStatus("正在打开 " + path + " …（新 explorer 窗口约需 3 秒）");
             h.Start(path);
             Activate(hosts.IndexOf(h));
+            MarkDirty();
         }
 
         private void OnHostReady(ExplorerHost h)
@@ -533,6 +536,7 @@ namespace TabbedExplorer
                 h.Focus();
                 SetStatus(tabStrip.Tabs[i].Title);
             }
+            MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
         }
 
         /// <summary>
@@ -560,6 +564,12 @@ namespace TabbedExplorer
             int i = hosts.IndexOf(h);
             if (i < 0) return;
             tabStrip.SetIcon(i, h.TabIcon);
+        }
+
+        /// <summary>这个标签导航到了别的文件夹 —— 记忆里的路径要跟着变（标题多半同时也会变）。</summary>
+        private void OnHostPathChanged(ExplorerHost h)
+        {
+            MarkDirty();
         }
 
         private void OnHostFailed(ExplorerHost h)
@@ -592,6 +602,7 @@ namespace TabbedExplorer
             hosts[idx].Focus();
             Text = tabStrip.Tabs[idx].Title;
             titleBar.Title = Text;
+            MarkDirty();     // 「当时选中那个」也要记
         }
 
         private void CloseTab(int idx)
@@ -626,8 +637,9 @@ namespace TabbedExplorer
         private string CurrentPath()
         {
             if (activeIndex < 0 || activeIndex >= hosts.Count) return ExplorerView.ThisPcPath;
-            string p = hosts[activeIndex].TargetPath;
-            return string.IsNullOrEmpty(p) ? ExplorerView.ThisPcPath : p;
+            string p = LivePath(hosts[activeIndex]);
+            // 库里那种「显示名」不能喂给 explorer（会被当成本目录下的相对路径），退回「此电脑」。
+            return PathRules.Restorable(p) ? p : ExplorerView.ThisPcPath;
         }
 
         private void SetStatus(string s)
@@ -638,7 +650,7 @@ namespace TabbedExplorer
         // ==================================================================
         /// <summary>
         /// 兜底路径：按键只有在我们**自己的控件**（标签条 / 标题栏）持有焦点时才会走到这里。
-        /// 焦点在嵌进来的 explorer 子进程里时根本走不到 —— 那条路全靠 WinEHook（见 SetupResident）。
+        /// 焦点在嵌进来的 explorer 子进程里时根本走不到 —— 那条路全靠 WinEHook + Hub（见 DesktopHub.SetupHook）。
         /// </summary>
         protected override void OnPreviewKeyDown(PreviewKeyDownEventArgs e)
         {
@@ -655,10 +667,10 @@ namespace TabbedExplorer
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // 点 X / Alt+F4 只是收进托盘；只有托盘「退出」或系统关机才真的关。
+            // 点 X / Alt+F4 只是收进托盘；只有托盘「退出」/ `--quit` / 系统关机才真的关。
             bool systemShutdown = e.CloseReason == CloseReason.WindowsShutDown
                                || e.CloseReason == CloseReason.TaskManagerClosing;
-            if (!quitting && !systemShutdown && e.CloseReason == CloseReason.UserClosing)
+            if (!Quitting && !systemShutdown && e.CloseReason == CloseReason.UserClosing)
             {
                 Diag.Step("EmbedForm: 收到关闭请求 reason=" + e.CloseReason + " -> 只收进托盘，不退进程");
                 e.Cancel = true;
@@ -669,6 +681,10 @@ namespace TabbedExplorer
             Diag.Step(string.Format("EmbedForm: OnFormClosing reason={0}，还有 {1} 个标签",
                 e.CloseReason, hosts.Count));
             base.OnFormClosing(e);
+
+            // 真关之前先把记忆落盘（系统关机这条路上 Hub 的 Quit 不一定会走到）。
+            if (hub != null) hub.SaveNow("窗口真关 reason=" + e.CloseReason);
+
             for (int i = hosts.Count - 1; i >= 0; i--)
             {
                 try
@@ -683,24 +699,14 @@ namespace TabbedExplorer
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason);
-            if (sigWait != null) { try { sigWait.Unregister(null); } catch { } sigWait = null; }
-            if (quitWait != null) { try { quitWait.Unregister(null); } catch { } quitWait = null; }
-            if (quitEvent != null) { try { quitEvent.Close(); } catch { } quitEvent = null; }
-            if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
-            if (tray != null)
-            {
-                try { tray.Visible = false; tray.Dispose(); } catch { }
-                tray = null;
-            }
-            base.OnFormClosed(e);
+            Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason + " 桌面=" + DesktopKey);
+            base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             Theme.ApplyTitleBar(Handle);
-            if (tray == null) SetupResident();
         }
 
         protected override void OnShown(EventArgs e)

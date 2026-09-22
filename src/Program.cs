@@ -165,19 +165,11 @@ namespace TabbedExplorer
 
             if (EmbedMode)
             {
-                Diag.Step("EmbedForm 启动 hidden=" + StartHidden);
-                EmbedForm form = new EmbedForm();
-                form.ForceHandle();
-                if (StartHidden)
-                {
-                    // 常驻后台：不显窗口，但消息循环照跑（托盘 + Win+E 钩子活着）。
-                    // 这里必须用 ApplicationContext —— Application.Run(Form) 会强制把窗口显出来。
-                    Application.Run(new ApplicationContext(form));
-                }
-                else
-                {
-                    Application.Run(form);
-                }
+                // 常驻的是 **DesktopHub**（托盘 + Win+E 钩子），窗口按虚拟桌面按需新建：
+                // 起来的时候一个窗口都没有，第一次 Win+E 才给「当前那张桌面」建一个。
+                // 所以 --tray / --open 现在只是「起不起来就开窗」的差别（--open 用来看效果）。
+                Diag.Step("DesktopHub 启动 --tray=" + StartHidden + " --open=" + AutoOpen);
+                Application.Run(new DesktopHub());
             }
             else
             {

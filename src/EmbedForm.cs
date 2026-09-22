@@ -52,7 +52,6 @@ namespace TabbedExplorer
         private readonly TitleBar titleBar;
         private readonly TabStrip tabStrip;
         private readonly Panel content;
-        private readonly Label status;
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
@@ -73,7 +72,7 @@ namespace TabbedExplorer
             DesktopKey = desktopKey;
 
             Text = "此电脑";
-            BackColor = Theme.RibbonBack;   // 无边框后，四周那圈就是这个色，当边框用
+            BackColor = Theme.Chrome;   // 无边框后，四周那圈就是这个色，当边框用（深色下 = 纯黑，跟标签条同色）
             Size = new Size(Px(1200), Px(760));
             MinimumSize = new Size(Px(640), Px(420));
             StartPosition = FormStartPosition.CenterScreen;
@@ -108,22 +107,21 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 点击新建标签");
                 NewTab(CurrentPath());
             };
+            tabStrip.SettingsClicked += delegate
+            {
+                Diag.Step("EmbedForm: 点击设置按钮");
+                ShowSettingsMenu();
+            };
 
             content = new Panel();
-            content.BackColor = Theme.Pane;
-
-            status = new Label();
-            status.Height = Px(22);
-            status.TextAlign = ContentAlignment.MiddleLeft;
-            status.Padding = new Padding(Px(8), 0, 0, 0);
-            status.AutoSize = false;
+            content.BackColor = Theme.Chrome;
 
             // 位置全部手算（DoLayout）：无边框窗口的四周留一圈自己的边框，
             // 顶部还要多一根自绘标题栏 —— 靠 Dock 拼不出这个形状。
+            // 底部**不再有状态栏**（川：最下面的文件夹名去掉，标签上已经显示了）。
             Controls.Add(titleBar);
             Controls.Add(tabStrip);
             Controls.Add(content);
-            Controls.Add(status);
 
             ApplyTheme();
             Theme.Changed += delegate { ApplyTheme(); };
@@ -151,16 +149,15 @@ namespace TabbedExplorer
                 Rectangle r = DisplayRectangle;
                 int hTitle = Px(30);
                 int hTab = Px(TabStrip.StdHeight);
-                int hStatus = Px(22);
 
                 int top = r.Top;
                 titleBar.SetBounds(r.Left, top, r.Width, hTitle);
                 top += hTitle;
                 tabStrip.SetBounds(r.Left, top, r.Width, hTab);
                 top += hTab;
-                status.SetBounds(r.Left, r.Bottom - hStatus, r.Width, hStatus);
 
-                int hContent = r.Bottom - hStatus - top;
+                // 内容直接吃到窗口底（以前底下还压着一条 22px 的状态栏）
+                int hContent = r.Bottom - top;
                 if (hContent < 0) hContent = 0;
                 content.SetBounds(r.Left, top, r.Width, hContent);
             }
@@ -264,11 +261,9 @@ namespace TabbedExplorer
             // 窗口可能已经被销毁（多窗口之后 Theme.Changed 的订阅者不止一个，没法逐条退订），
             // 对着已释放的控件设颜色会抛 ObjectDisposedException。
             if (IsDisposed || Disposing) return;
-            BackColor = Theme.RibbonBack;
-            content.BackColor = Theme.Pane;
-            status.BackColor = Theme.StatusBack;
-            status.ForeColor = Theme.TextDim;
-            titleBar.BackColor = Theme.RibbonBack;
+            BackColor = Theme.Chrome;
+            content.BackColor = Theme.Chrome;
+            titleBar.BackColor = Theme.Chrome;
             titleBar.Invalidate();
             tabStrip.Invalidate();
         }
@@ -293,10 +288,27 @@ namespace TabbedExplorer
         /// </summary>
         public void ShowForUser(bool newTab)
         {
-            Diag.Step("EmbedForm: ShowForUser newTab=" + newTab + " 桌面=" + DesktopKey);
+            Diag.Step("EmbedForm: ShowForUser newTab=" + newTab + " 桌面=" + DesktopKey
+                      + " 模式=" + (hub == null ? "?" : Settings.Text(hub.Capture)));
             try
             {
-                if (!VirtualDesktop.IsOnCurrentDesktop(Handle))
+                bool migrating = (hub != null && hub.Capture == Settings.CaptureMode.Migrate);
+                if (migrating)
+                {
+                    // v1.0.0 那套：全进程就这一个窗口，Win+E 时把它**搬到当前桌面**再显。
+                    // 搬到才算数 —— 搬不过去就只显示、不抢前台，免得反而把人拽走。
+                    VdOutcome o = VirtualDesktop.EnsureOnCurrentDesktop(Handle);
+                    Diag.Step("EmbedForm: 迁移模式，搬窗口结果=" + o);
+                    if (o == VdOutcome.Failed)
+                    {
+                        if (!Visible) Show();
+                        if (hub != null)
+                            hub.Notify("打不开：窗口在别的虚拟桌面",
+                                "没能把这个窗口搬到当前桌面。回到它所在的桌面再试。", false);
+                        return;
+                    }
+                }
+                else if (!VirtualDesktop.IsOnCurrentDesktop(Handle))
                 {
                     Diag.Step("EmbedForm: 窗口不在当前桌面 -> 不显示、不抢前台（不切走）");
                     if (hub != null)
@@ -520,7 +532,7 @@ namespace TabbedExplorer
             h.PathChanged += delegate(object s, EventArgs e) { OnHostPathChanged(h); };
             h.Died += OnHostDied;
 
-            SetStatus("正在打开 " + path + " …（新 explorer 窗口约需 3 秒）");
+            Diag.Step("EmbedForm: 打开 " + path + "（新 explorer 窗口约需 3 秒）");
             h.Start(path);
             Activate(hosts.IndexOf(h));
             MarkDirty();
@@ -538,7 +550,6 @@ namespace TabbedExplorer
                 Text = tabStrip.Tabs[i].Title;
                 titleBar.Title = Text;
                 h.Focus();
-                SetStatus(tabStrip.Tabs[i].Title);
             }
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
         }
@@ -558,7 +569,6 @@ namespace TabbedExplorer
             {
                 Text = t;
                 titleBar.Title = t;
-                SetStatus(t);
             }
         }
 
@@ -581,7 +591,7 @@ namespace TabbedExplorer
             int i = hosts.IndexOf(h);
             if (i < 0) return;
             tabStrip.SetTitle(i, "打开失败");
-            SetStatus(string.IsNullOrEmpty(h.LastError) ? "打开失败" : h.LastError);
+            Diag.Log("EmbedForm: 标签打开失败 " + (h.LastError ?? "（没有错误文本）"));
         }
 
         /// <summary>
@@ -646,9 +656,53 @@ namespace TabbedExplorer
             return PathRules.Restorable(p) ? p : ExplorerView.ThisPcPath;
         }
 
-        private void SetStatus(string s)
+        // ==================================================================
+        // 设置（标签条最右边那枚齿轮）
+        // ==================================================================
+
+        /// <summary>
+        /// 齿轮弹出来的菜单。**第一项就是捕获方式**（川要的）：
+        /// 「按虚拟桌面分别捕获」（v1.1.0 的）/「捕获并迁移到当前桌面」（v1.0.0 的）。
+        /// 风格走 Theme.StyleMenu，跟托盘菜单一致。
+        /// </summary>
+        private void ShowSettingsMenu()
         {
-            status.Text = s ?? "";
+            if (hub == null) return;
+            ContextMenuStrip m = new ContextMenuStrip();
+            m.ShowImageMargin = false;
+
+            // 勾选用**文字前缀**而不是 ToolStripMenuItem.Checked：
+            // 勾选那个小方块是渲染器自己画的位图，深色下经常是「黑勾画在黑底上」看不见。
+            // 前缀就是普通文字，跟着 Theme.Text 走，深色浅色都在。
+            bool perOn = (hub.Capture == Settings.CaptureMode.PerDesktop);
+            ToolStripMenuItem per = new ToolStripMenuItem(
+                (perOn ? "✓ " : "   ") + Settings.Label(Settings.CaptureMode.PerDesktop));
+            ToolStripMenuItem mig = new ToolStripMenuItem(
+                (!perOn ? "✓ " : "   ") + Settings.Label(Settings.CaptureMode.Migrate));
+            per.ToolTipText = "每张虚拟桌面各一个窗口、各记一套标签，互不干扰";
+            mig.ToolTipText = "全进程只一个窗口，Win+E 时把它搬到当前桌面（1.0.0 的老做法）";
+            per.Click += delegate { hub.SetCaptureMode(Settings.CaptureMode.PerDesktop); };
+            mig.Click += delegate { hub.SetCaptureMode(Settings.CaptureMode.Migrate); };
+
+            m.Items.Add(per);
+            m.Items.Add(mig);
+            m.Items.Add(new ToolStripSeparator());
+
+            ToolStripMenuItem rem = new ToolStripMenuItem("记住当前标签");
+            rem.Click += delegate { hub.RememberNow(); };
+            m.Items.Add(rem);
+
+            ToolStripMenuItem about = new ToolStripMenuItem("TabbedExplorer — 接 Win+E 的资源管理器");
+            about.Enabled = false;
+            m.Items.Add(about);
+
+            Theme.StyleMenu(m);
+
+            // 贴在齿轮下边、右对齐（别甩到屏幕角落，也别越出右边界）
+            Size sz = m.GetPreferredSize(Size.Empty);
+            int x = tabStrip.Width - sz.Width;
+            if (x < 0) x = 0;
+            m.Show(tabStrip, new Point(x, tabStrip.Height));
         }
 
         // ==================================================================

@@ -31,6 +31,12 @@ namespace TabbedExplorer
 
         private readonly DesktopMemory memory = new DesktopMemory();
 
+        /// <summary>全局开关（目前只有捕获方式）。</summary>
+        private readonly Settings settings = new Settings();
+
+        /// <summary>迁移模式（v1.0.0）下，全进程唯一那个窗口在登记表里的键。</summary>
+        private const string SingleKey = "single";
+
         /// <summary>钩子回调在别的线程上，动界面之前得先转回 UI 线程 —— 就是它。</summary>
         private readonly Control syncTarget = new Control();
 
@@ -48,6 +54,7 @@ namespace TabbedExplorer
 
         public DesktopHub()
         {
+            settings.Load();
             memory.Load();
 
             saveTimer.Interval = 800;
@@ -83,12 +90,7 @@ namespace TabbedExplorer
             MenuItem miShow = new MenuItem("打开窗口（Win+E）");
             miShow.Click += delegate { OnWinE(); };
             MenuItem miSave = new MenuItem("记住当前标签");
-            miSave.Click += delegate
-            {
-                saveTimer.Stop();
-                SaveNow("托盘手动");
-                Notify("已记住", "各虚拟桌面的标签已写进 desktops.txt。", false);
-            };
+            miSave.Click += delegate { RememberNow(); };
             MenuItem miQuit = new MenuItem("退出");
             miQuit.Click += delegate { Quit("托盘菜单"); };
 
@@ -164,13 +166,33 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 当前桌面的窗口：① 先按「窗口实际挂在哪张桌面」认领（川用 Win+Ctrl+Shift+方向键
-        /// 把窗口挪到别的桌面之后，这样能自愈）；② 再按登记表；③ 都没有就新建一个。
-        /// 新建的窗口天然落在当前桌面 —— 所以永远不需要「搬窗口」。
+        /// 当前桌面的窗口。两种模式两条路：
+        ///
+        /// **按虚拟桌面分别捕获**（perdesktop，默认）：① 先按「窗口实际挂在哪张桌面」认领
+        /// （川用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面之后，这样能自愈）；② 再按登记表；
+        /// ③ 都没有就新建一个。新建的窗口天然落在当前桌面 —— 所以永远不需要「搬窗口」。
+        ///
+        /// **捕获并迁移到当前桌面**（migrate，v1.0.0 那套）：全进程就应该只有一个窗口，
+        /// 不管现在在哪张桌面 —— 直接拿它，搬桌面的事交给 EmbedForm（ShowForUser 里做）。
         /// </summary>
         private EmbedForm EnsureForm(Guid desktop)
         {
             Prune();
+
+            if (settings.Capture == Settings.CaptureMode.Migrate)
+            {
+                EmbedForm only;
+                if (forms.TryGetValue(SingleKey, out only) && only != null && !only.IsDisposed) return only;
+                // 刚从严桌面模式换过来、手上已经有窗口：随便认一个当「唯一那个」，别又多开一个
+                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                {
+                    if (f == null || f.IsDisposed) continue;
+                    return Adopt(f, SingleKey);
+                }
+                Diag.Step("Hub: 迁移模式，建唯一窗口");
+                return NewForm(SingleKey);
+            }
+
             string key = KeyOf(desktop);
 
             if (desktop != Guid.Empty)
@@ -179,7 +201,7 @@ namespace TabbedExplorer
                 {
                     if (f == null || f.IsDisposed) continue;
                     Guid g = VirtualDesktop.WindowDesktopId(f.Handle);
-                    if (g != Guid.Empty && g == desktop) return Claim(f, key);
+                    if (g != Guid.Empty && g == desktop) return Adopt(f, key);
                 }
             }
 
@@ -187,6 +209,11 @@ namespace TabbedExplorer
             if (forms.TryGetValue(key, out hit) && hit != null && !hit.IsDisposed) return hit;
 
             Diag.Step(string.Format("Hub: 给桌面 {0} 建窗口（现有 {1} 个）", key, forms.Count));
+            return NewForm(key);
+        }
+
+        private EmbedForm NewForm(string key)
+        {
             EmbedForm nf = new EmbedForm(this, key);
             forms[key] = nf;
             nf.FormClosed += delegate { OnFormGone(nf); };
@@ -194,16 +221,107 @@ namespace TabbedExplorer
             return nf;
         }
 
-        /// <summary>窗口被挪到别的桌面了：登记改到新桌面，**标签跟着窗口走**（不是留在老桌面）。</summary>
-        private EmbedForm Claim(EmbedForm f, string key)
+        /// <summary>窗口被挪到别的桌面（或换了捕获模式）：登记改到新的键，**标签跟着窗口走**。</summary>
+        private EmbedForm Adopt(EmbedForm f, string key)
         {
             if (string.Equals(f.DesktopKey, key, StringComparison.OrdinalIgnoreCase)) return f;
-            Diag.Step("Hub: 窗口被挪到别的桌面 " + f.DesktopKey + " -> " + key + "（登记改过来）");
+            Diag.Step("Hub: 窗口改登记 " + f.DesktopKey + " -> " + key);
             if (forms.ContainsKey(f.DesktopKey) && forms[f.DesktopKey] == f) forms.Remove(f.DesktopKey);
             f.DesktopKey = key;
             forms[key] = f;
             MarkDirty();
             return f;
+        }
+
+        // ==================================================================
+        // 捕获方式（设置菜单第一项）
+        // ==================================================================
+
+        /// <summary>当前的标签捕获方式（EmbedForm 也要看，决定 Win+E 时搬不搬窗口）。</summary>
+        public Settings.CaptureMode Capture { get { return settings.Capture; } }
+
+        /// <summary>
+        /// 换捕获方式 —— 立刻生效，并且**把记忆搬个家**，免得川切一下发现标签「没了」：
+        ///   - 切到迁移模式：把当前桌面那一套搬进 `single`（`single` 已有内容就不动）；
+        ///     只留前台那个窗口，其余收掉 —— 它们的标签已经各自落进自己桌面的桶里。
+        ///   - 切回分桌面模式：把 `single` 搬进当前桌面那张的桶（那张已有内容就不动），
+        ///     窗口也从 `single` 改登记到当前桌面。
+        /// </summary>
+        public void SetCaptureMode(Settings.CaptureMode m)
+        {
+            if (settings.Capture == m) return;
+            Diag.Step("Hub: 捕获方式 " + Settings.Text(settings.Capture) + " -> " + Settings.Text(m));
+            settings.Capture = m;
+            settings.Save();
+
+            EmbedForm keep = ForegroundForm();
+            if (keep == null || keep.IsDisposed)
+            {
+                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                {
+                    if (f != null && !f.IsDisposed) { keep = f; break; }
+                }
+            }
+
+            Guid cur = VirtualDesktop.CurrentDesktopId();
+            string dk = KeyOf(cur);
+
+            if (m == Settings.CaptureMode.Migrate)
+            {
+                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                {
+                    if (f == null || f.IsDisposed || f == keep) continue;
+                    Diag.Step("Hub: 迁移模式，收掉多余窗口 " + f.DesktopKey);
+                    try { f.Quitting = true; f.Close(); }
+                    catch (Exception ex) { Diag.Log("Hub: 收窗口失败 " + ex.Message); }
+                }
+                forms.Clear();
+
+                if (keep != null && !keep.IsDisposed)
+                {
+                    MoveMemory(keep.DesktopKey, SingleKey);
+                    keep.DesktopKey = SingleKey;
+                    forms[SingleKey] = keep;
+                    hook.MainWindow = keep.Handle;
+                }
+            }
+            else if (keep != null && !keep.IsDisposed)
+            {
+                MoveMemory(SingleKey, dk);
+                forms.Remove(SingleKey);
+                keep.DesktopKey = dk;
+                forms[dk] = keep;
+            }
+
+            MarkDirty();
+            Notify("捕获方式已换", Settings.Label(m) + (m == Settings.CaptureMode.Migrate
+                ? "：全进程只一个窗口，Win+E 时搬到当前桌面。"
+                : "：每张虚拟桌面各一个窗口、各记一套标签。"), false);
+        }
+
+        /// <summary>把 from 桶的内容搬进 to 桶 —— **只在 to 还空着的时候**搬，不覆盖已记过的。</summary>
+        private void MoveMemory(string from, string to)
+        {
+            if (string.IsNullOrEmpty(from) || string.IsNullOrEmpty(to)) return;
+            if (string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) return;
+            DesktopMemory.Bucket toB = memory.Find(to);
+            if (toB != null && toB.Paths.Count > 0) return;
+            DesktopMemory.Bucket fromB = memory.Find(from);
+            if (fromB == null || fromB.Paths.Count == 0) return;
+
+            DesktopMemory.Bucket dst = memory.Ensure(to);
+            dst.Paths.Clear();
+            dst.Paths.AddRange(fromB.Paths);
+            dst.Active = fromB.Active;
+            Diag.Step(string.Format("Hub: 记忆搬家 {0} -> {1}（{2} 个标签）", from, to, dst.Paths.Count));
+        }
+
+        /// <summary>「记住当前标签」：立刻把各桌面的标签写盘（托盘菜单和窗口里的设置菜单都走它）。</summary>
+        public void RememberNow()
+        {
+            try { saveTimer.Stop(); } catch { }
+            SaveNow("手动");
+            Notify("已记住", "各虚拟桌面的标签已写进 desktops.txt。", false);
         }
 
         /// <summary>Ctrl+T / Ctrl+W / Ctrl+Tab：派给「前台那个窗口」。

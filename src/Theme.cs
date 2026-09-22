@@ -20,6 +20,7 @@ namespace TabbedExplorer
         // ---- 外壳 ----
         public static Color TabBar;      // 标签条底
         public static Color TabActive;   // 选中标签底
+        public static Color Chrome;      // 外壳底色：自绘标题栏 / 无边框窗口四周那圈 / 内容容器底
         public static Color RibbonBack;  // 功能区底
         public static Color RibbonGroup; // 命令区底（与标签条区分）
         public static Color Text;
@@ -58,6 +59,9 @@ namespace TabbedExplorer
                 // 取同一个色，两块拼起来才是连续的一整片（川：标签也不够黑，要和查看那一页一样黑）。
                 TabBar = Color.FromArgb(0, 0, 0);
                 TabActive = Color.FromArgb(51, 51, 51);
+                // 外壳底色也是纯黑：和标签条、explorer 自己的功能区连成一整片，
+                // 否则自绘标题栏那一行（原本 43,43,43）会在两条黑之间露出一道灰接缝。
+                Chrome = Color.FromArgb(0, 0, 0);
                 RibbonBack = Color.FromArgb(43, 43, 43);
                 RibbonGroup = Color.FromArgb(51, 51, 51);
                 Text = Color.FromArgb(240, 240, 240);
@@ -78,6 +82,7 @@ namespace TabbedExplorer
             {
                 TabBar = Color.FromArgb(243, 243, 243);
                 TabActive = Color.FromArgb(249, 249, 249);
+                Chrome = Color.FromArgb(243, 243, 243);
                 RibbonBack = Color.FromArgb(243, 243, 243);
                 RibbonGroup = Color.FromArgb(249, 249, 249);
                 Text = Color.FromArgb(30, 30, 30);

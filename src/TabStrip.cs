@@ -46,15 +46,24 @@ namespace TabbedExplorer
         private int hoverIndex = -1;
         private int hoverCloseIndex = -1;
         private bool hoverNew;
+        private bool hoverSettings;
         private int dragFromIndex = -1;
         private int dragOverIndex = -1;
+
+        // 「+」和设置按钮的位置由 EnsureLayout 算出来（+ 得跟着标签跑），
+        // 不能再像以前那样只用 Width 减一下 —— 那样它永远是钉在整条最右边的。
+        private Rectangle newRect;
+        private Rectangle settingsRect;
 
         // 标签宽度：文件夹名一般不长，190 太奢侈（川：一半就够）。
         // 按宽度不够时自动压到 Min，再挤就继续缩（标题会省略号）。
         // 加文件夹图标后往上补了图标占的那一点（6+16+5 = 27），保证**文字可用宽度**不缩水。
         private int MinTabWidth { get { return Px(72); } }
         private int MaxTabWidth { get { return Px(112); } }
-        private int NewButtonWidth { get { return Px(34); } }
+        /// <summary>「+」新建：现在紧跟在最后一个标签右边（浏览器那样），所以窄一点。</summary>
+        private int NewButtonWidth { get { return Px(28); } }
+        /// <summary>最右边那枚固定不动的设置按钮。</summary>
+        private int SettingsButtonWidth { get { return Px(34); } }
         private int CloseAreaWidth { get { return Px(22); } }
         private int CloseBoxSize { get { return Px(16); } }
 
@@ -83,6 +92,8 @@ namespace TabbedExplorer
         public event IndexEventHandler TabClicked;
         public event IndexEventHandler TabCloseClicked;
         public event EventHandler NewTabClicked;
+        /// <summary>最右边那枚设置按钮被点了（菜单由上层弹）。</summary>
+        public event EventHandler SettingsClicked;
         public event IndexEventHandler TabMiddleClicked;
         public event IndexEventHandler OrderChanged;   // 拖拽排序后：原索引
 
@@ -152,11 +163,19 @@ namespace TabbedExplorer
         }
 
         // ------------------------------------------------------------------
+        /// <summary>
+        /// 排一次版：标签从左往右铺，「+」紧跟最后一个标签，设置按钮钉在整条最右边。
+        /// 尺寸只由 Width + 标签数决定，所以鼠标事件里可以随手重算。
+        /// </summary>
         private void EnsureLayout()
         {
             bounds.Clear();
-            int x = Px(2);
-            int avail = Math.Max(Px(60), Width - NewButtonWidth - Px(4));
+
+            // 最右边固定一枚设置按钮 —— 谁都不许压过去（川：最右边固定放一个设置按钮）
+            settingsRect = new Rectangle(Width - SettingsButtonWidth, 0, SettingsButtonWidth, Height);
+
+            // 标签能用的宽度 = 整条 - 设置按钮 - 「+」- 起点/间隔那几px
+            int avail = Math.Max(Px(60), Width - SettingsButtonWidth - NewButtonWidth - Px(8));
             int w = MaxTabWidth;
             if (tabs.Count > 0)
             {
@@ -164,16 +183,60 @@ namespace TabbedExplorer
                 if (need > avail) w = Math.Max(MinTabWidth, avail / tabs.Count);
             }
             // 标签铺满整条高度 —— 上下都不留白
+            int x = Px(2);
             for (int i = 0; i < tabs.Count; i++)
             {
                 bounds.Add(new Rectangle(x, 0, w, Height));
                 x += w;
             }
+
+            // 「+」紧跟在最后一个标签右边（浏览器就是这样）；一个标签都没有时贴左边。
+            // 标签挤到极限时它会顶到设置按钮前面停住，不越界。
+            int nx = (tabs.Count > 0) ? x + Px(4) : Px(4);
+            int limit = settingsRect.Left - NewButtonWidth - Px(2);
+            if (nx > limit) nx = Math.Max(Px(2), limit);
+            newRect = new Rectangle(nx, 0, NewButtonWidth, Height);
         }
 
         private Rectangle NewButtonBounds()
         {
-            return new Rectangle(Width - NewButtonWidth, 0, NewButtonWidth, Height);
+            EnsureLayout();
+            return newRect;
+        }
+
+        private Rectangle SettingsBounds()
+        {
+            EnsureLayout();
+            return settingsRect;
+        }
+
+        /// <summary>
+        /// 自绘一个齿轮（设置按钮用）。
+        /// MDL2 里那颗齿轮（\uE713）靠字体渲染，可标签条用的是普通字体、字形不一定出得来，
+        /// 所以直接画：16 个顶点在高/低半径之间交替 = 8 个齿，中心再挖个洞就是齿轮环。
+        /// 洞用按钮自身的底色填 —— 这样它在黑底和 hover 底上都成立。
+        /// </summary>
+        private static void DrawGear(Graphics g, Rectangle r, Color fg, Color hole, float stroke)
+        {
+            int cx = r.Left + r.Width / 2;
+            int cy = r.Top + r.Height / 2;
+            int R = Math.Max(5, Px(8) - (int)stroke);
+            int ri = (int)(R * 0.72);
+            int rr = (int)(R * 0.42);
+            const int teeth = 8;
+            PointF[] pts = new PointF[teeth * 2];
+            for (int i = 0; i < pts.Length; i++)
+            {
+                double a = Math.PI * i / teeth - Math.PI / 2;
+                double rad = (i % 2 == 0) ? R : ri;
+                pts[i] = new PointF((float)(cx + rad * Math.Cos(a)), (float)(cy + rad * Math.Sin(a)));
+            }
+            using (SolidBrush b = new SolidBrush(fg)) g.FillPolygon(b, pts);
+            if (rr > 0)
+            {
+                using (SolidBrush b = new SolidBrush(hole))
+                    g.FillEllipse(b, cx - rr, cy - rr, rr * 2, rr * 2);
+            }
         }
 
         private Rectangle CloseBounds(Rectangle tab)
@@ -185,6 +248,7 @@ namespace TabbedExplorer
 
         private int HitTest(Point p)
         {
+            EnsureLayout();     // 位置随时可能变（标签增删 / 窗口改宽），先重算一遍
             for (int i = 0; i < bounds.Count; i++)
             {
                 if (bounds[i].Contains(p)) return i;
@@ -285,15 +349,22 @@ namespace TabbedExplorer
             // 底部与容器分隔
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
-            // “+” 新建
-            Rectangle nb = NewButtonBounds();
+            // “+” 新建：紧跟在最后一个标签右边（位置由 EnsureLayout 算）
+            Rectangle nb = newRect;
             if (hoverNew) g.FillRectangle(new SolidBrush(Theme.Hover), nb);
             int mx = nb.Left + nb.Width / 2, my = nb.Top + nb.Height / 2;
             int arm = Math.Max(4, Px(5));
-            Pen p2 = new Pen(Theme.TextDim, stroke * 1.6f);
+            Pen p2 = new Pen(hoverNew ? Theme.Text : Theme.TextDim, stroke * 1.6f);
             g.DrawLine(p2, mx - arm, my, mx + arm, my);
             g.DrawLine(p2, mx, my - arm, mx, my + arm);
             p2.Dispose();
+
+            // 最右边固定：设置按钮（左边一条竖线，跟标签区分开）
+            Rectangle sbr = settingsRect;
+            Color sBack = hoverSettings ? Theme.Hover : Theme.TabBar;
+            if (hoverSettings) g.FillRectangle(new SolidBrush(sBack), sbr);
+            g.DrawLine(new Pen(Theme.Border), sbr.Left, Px(6), sbr.Left, Height - Px(6));
+            DrawGear(g, sbr, hoverSettings ? Theme.Text : Theme.TextDim, sBack, stroke);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -307,6 +378,8 @@ namespace TabbedExplorer
             if (hc != hoverCloseIndex) { hoverCloseIndex = hc; changed = true; }
             bool hn = NewButtonBounds().Contains(e.Location);
             if (hn != hoverNew) { hoverNew = hn; changed = true; }
+            bool hs = SettingsBounds().Contains(e.Location);
+            if (hs != hoverSettings) { hoverSettings = hs; changed = true; }
             if (changed) Invalidate();
 
             if (dragFromIndex >= 0 && idx >= 0 && idx != dragOverIndex)
@@ -319,20 +392,25 @@ namespace TabbedExplorer
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false;
+            hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverSettings = false;
             Invalidate();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            int idx = HitTest(e.Location);
-
+            if (e.Button == MouseButtons.Left && SettingsBounds().Contains(e.Location))
+            {
+                if (SettingsClicked != null) SettingsClicked(this, EventArgs.Empty);
+                return;
+            }
             if (NewButtonBounds().Contains(e.Location))
             {
                 if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
                 return;
             }
+
+            int idx = HitTest(e.Location);
             if (idx < 0) return;
 
             if (e.Button == MouseButtons.Middle)
@@ -367,7 +445,7 @@ namespace TabbedExplorer
         {
             base.OnDoubleClick(e);
             Point p = PointToClient(Cursor.Position);
-            if (HitTest(p) < 0 && !NewButtonBounds().Contains(p))
+            if (HitTest(p) < 0 && !NewButtonBounds().Contains(p) && !SettingsBounds().Contains(p))
             {
                 if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
             }

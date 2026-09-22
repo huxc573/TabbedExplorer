@@ -97,11 +97,13 @@ namespace TabbedExplorer
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            BackColor = Theme.RibbonBack;
+            // 底色跟标签条同一个（深色下都是纯黑）—— 否则标题栏这一行会在两条黑之间
+            // 露出一道灰接缝，看着就是「外壳没连成一片」。
+            BackColor = Theme.Chrome;
             Height = Px(30);
             tips.InitialDelay = 500;
             tips.ReshowDelay = 200;
-            Theme.Changed += delegate { RebuildFonts(); Invalidate(); };
+            Theme.Changed += delegate { BackColor = Theme.Chrome; RebuildFonts(); Invalidate(); };
             RebuildFonts();
         }
 
@@ -182,7 +184,7 @@ namespace TabbedExplorer
         {
             EnsureIcons();
             Graphics g = e.Graphics;
-            g.FillRectangle(new SolidBrush(Theme.RibbonBack), ClientRectangle);
+            g.FillRectangle(new SolidBrush(Theme.Chrome), ClientRectangle);
 
             // ---- 快速访问工具栏 ----
             for (int i = 0; i < QatCount; i++)

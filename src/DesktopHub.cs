@@ -176,6 +176,7 @@ namespace TabbedExplorer
         // ==================================================================
 
         private SettingsForm settingsForm;
+        private FavManagerForm favManager;
 
         /// <summary>打开（或提到前面）设置窗口。齿轮、标签条空白右键、托盘菜单「更多选项」都走这儿。</summary>
         public void OpenSettings()
@@ -200,6 +201,40 @@ namespace TabbedExplorer
                 else settingsForm.Show();
             }
             catch (Exception ex) { Diag.Log("Hub: 打开设置窗口失败 " + ex); }
+        }
+
+        /// <summary>
+        /// 打开（或提到前面）**收藏夹管理器**（川 2026-09-22 要的新窗口：仿浏览器那个收藏夹管理器）。
+        /// 跟设置窗口一样，全进程只开一个 —— 收藏夹栏左端的星标、栏上右键、菜单里都走这一个门。
+        /// </summary>
+        public void OpenFavManager()
+        {
+            try
+            {
+                if (favManager != null && !favManager.IsDisposed)
+                {
+                    Diag.Step("Hub: 收藏夹管理器已经开着 -> 提到前面");
+                    if (favManager.WindowState == FormWindowState.Minimized)
+                        favManager.WindowState = FormWindowState.Normal;
+                    favManager.Activate();
+                    return;
+                }
+                Diag.Step("Hub: 打开收藏夹管理器");
+                favManager = new FavManagerForm(
+                    delegate(bool on) { SetFavBar(on); },
+                    delegate { return Settings.FavBar; });
+                // 管理器里双击一个文件夹 = 在当前窗口开一个新标签
+                favManager.OpenPath += delegate(string p)
+                {
+                    EmbedForm f = ForegroundForm();
+                    if (f != null && !f.IsDisposed) f.OpenPathAsTab(p);
+                };
+                favManager.FormClosed += delegate { favManager = null; };
+                EmbedForm owner = ForegroundForm();
+                if (owner != null && !owner.IsDisposed) favManager.Show(owner);
+                else favManager.Show();
+            }
+            catch (Exception ex) { Diag.Log("Hub: 打开收藏夹管理器失败 " + ex); }
         }
 
         // ==================================================================
@@ -241,35 +276,74 @@ namespace TabbedExplorer
         /// <summary>
         /// ★★ 看见一个新窗口 —— **在 watcher 自己的线程上同步藏**，不绕 UI 线程。
         ///
-        /// 为什么要这么较真：`SW_HIDE` 晚 30ms，屏幕上就是「闪一下」。
-        /// 旧写法把藏这件事 Post 回 UI 线程，而 UI 线程可能正忙（菜单模态循环 / 起 explorer / 算布局）
-        /// —— 实测日志里能看到「用户点开文件夹」到「我们藏起来」中间隔了几百毫秒。
+        /// 第三轮返工（2026-09-22 川第三次报「从桌面/开始菜单开文件夹还闪」）。
+        /// 前两轮做对了两件事：① 藏这件事挪到 watcher 自己的线程上（不等 UI 线程）；② 一起听 CREATE。
+        /// **但两件都白做了**，日志摊开一看就明白：
+        ///   每条都是「事件后 0ms，**当时已可见**」——
+        ///   · 0ms 说明我们反应已经最快（事件一到就动手）；
+        ///   · 「已可见」说明**系统报给我们的时候，那扇窗早画在屏幕上了**。
+        ///   WinEvent 终究是往消息队列投递的，快不过 explorer 自己的 ShowWindow。
         ///
-        /// 这里只做三件便宜事：粗筛（类名/pid/父窗口）→ 登记 → `SW_HIDE`，然后才把重活 Post 回 UI 线程。
-        /// `IsCapturable` 里读的那几个集合（baseline / claims）本身是锁保护的，在哪个线程调都安全。
+        /// 两个根因：
+        ///   ① 播 CREATE 的那条路**被判定拦掉了**：藏这件事原来复用 `IsCapturable`，
+        ///      而它有一句「不可见又没被我们藏过 → 不算数」—— CREATE 时窗口本来就没可见，
+        ///      于是永远被判「不用管」，只能等 SHOW，而 SHOW 已经晚了。
+        ///      ⇒ 现在藏用 `IsHideCandidate`（不要求可见），收仍用 `IsCapturable`（要求可见）。
+        ///   ② 光 `SW_HIDE` 本来就是挡不住的（见 ①）。所以再加一层兜底：`MakeTransparent`
+        ///      （WS_EX_LAYERED + alpha=0）—— 就算 explorer 随后的 ShowWindow 把它显出来，
+        ///      那一帧也是**全透明**的，肉眼什么都看不到。
+        ///
+        /// ⚠ 收编 / 放手时**必须** `ClearTransparent`（`AdoptWindow` / `ReleaseIfAbandoned` 里做了），
+        ///   忘了就是「嵌进来的窗口永远是隐形的」—— 比闪一下严重得多。
         /// </summary>
-        private void OnWindowShown(IntPtr h, int tick)
+        private void OnWindowShown(IntPtr h, int tick, uint evt)
         {
             try
             {
                 if (quitting || h == IntPtr.Zero) return;
                 if (!Settings.CaptureAll) return;
-                if (!IsCapturable(h)) return;
+                if (!IsHideCandidate(h)) return;
 
                 int react = Environment.TickCount - tick;      // 系统报事件 → 我们动手，差了多少毫秒
                 bool wasVisible = EmbedApi.IsWindowVisible(h);
-                if (wasVisible)
-                {
-                    MarkHidden(h);
-                    EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
-                }
-                Diag.Step(string.Format("Hub: 发现新窗口（事件后 {0}ms，当时{1}）先藏起来 cab=0x{2:X}",
-                    react, wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
+                bool isShow = (evt == WinShowWatcher.EVENT_OBJECT_SHOW);
+
+                // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE
+                EmbedApi.MakeTransparent(h);
+                bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
+
+                Diag.Step(string.Format(
+                    "Hub: 新窗口 -> {0}（{1}，事件后 {2}ms，当时{3}）cab=0x{4:X}",
+                    hid ? "藏起来" : "SW_HIDE 没生效但已置为透明",
+                    isShow ? "SHOW" : "CREATE", react,
+                    wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
 
                 // 后面的账（pendingCapture / 起定时器）回 UI 线程做 —— 那两个是 UI 线程的状态
-                Post(delegate { RegisterCandidate(h, react); });
+                if (isShow) Post(delegate { RegisterCandidate(h, react); });
             }
             catch (Exception ex) { Diag.Log("Hub: 处理新窗口事件失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 「值不值得先藏一下」的粗筛 —— 跟 `IsCapturable` **故意不一样：不要求窗口已经可见**。
+        /// 理由见 OnWindowShown 的类注释①：CREATE 那一刻窗口还没显示，
+        /// 加了可见性要求就等于把唯一的早机会扔掉了。只碰锁保护的集合，两个线程都能调。
+        /// </summary>
+        private bool IsHideCandidate(IntPtr h)
+        {
+            string c = EmbedApi.ClassOf(h);
+            if (c != "CabinetWClass" && c != "ExploreWClass") return false;
+            if (EmbedApi.IsClaimed(h)) return false;          // 我们自己起的 / 已经被某个标签收了
+            if (EmbedApi.IsBaseline(h)) return false;         // 启动前就在那儿的老窗口（还原、重新显示不算新开）
+            if (EmbedApi.GetParent(h) != IntPtr.Zero) return false;   // 已经是子窗口 → 被谁嵌走了
+            // 有属主的（对话框 / 弹出窗）不是文件夹框。这一条也是**防漏**：没这一刀的话，
+            // 「创建了但从没显示」的隐藏壳子会被我们永久置成透明（跟孤儿一样赖着）。
+            if (EmbedApi.GetWindow(h, EmbedApi.GW_OWNER) != IntPtr.Zero) return false;
+            int pid = EmbedApi.ProcessIdOf(h).ToInt32();
+            if (pid == 0) return false;
+            if (pid == ourPid) return false;
+            return true;
         }
 
         /// <summary>
@@ -351,6 +425,12 @@ namespace TabbedExplorer
             {
                 if (!IsCapturable(h)) { ReleaseIfAbandoned(h); return; }   // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
                 int pid = EmbedApi.ProcessIdOf(h).ToInt32();
+
+                // ⚠ 交出去之前先把「防闪那层透明」去掉 —— 先确保它是藏的，再去透明。
+                // 顺序反了的话，一个 SW_HIDE 没生效的窗口会在去透明那一瞬间弹出来（比闪一下还难看）。
+                EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                EmbedApi.ClearTransparent(h);
+
                 Diag.Step(string.Format("Hub: 收下这个新开的文件夹窗口 cab=0x{0:X} pid={1}（防闪反应 {2}ms）",
                     h.ToInt64(), pid, react));
 
@@ -378,6 +458,9 @@ namespace TabbedExplorer
         /// </summary>
         private void ReleaseIfAbandoned(IntPtr h)
         {
+            // ⚠ 去透明必须排在**所有 return 前面**：漏了的话，放回去的就是一个隐形窗口
+            // （用户眼里 = 「一扇窗没了，任务栏还留着」）。
+            try { EmbedApi.ClearTransparent(h); } catch { }
             if (!UnmarkHidden(h)) return;
             try
             {
@@ -839,6 +922,7 @@ namespace TabbedExplorer
             if (quitEvent != null) { try { quitEvent.Close(); } catch { } quitEvent = null; }
             if (captureWatch != null) { try { captureWatch.Dispose(); } catch { } captureWatch = null; }
             if (settingsForm != null) { try { settingsForm.Close(); } catch { } settingsForm = null; }
+            if (favManager != null) { try { favManager.Close(); } catch { } favManager = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
             if (tray != null)

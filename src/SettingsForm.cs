@@ -286,7 +286,7 @@ namespace TabbedExplorer
             TabPage keys = NewPage("快捷键");
             int hKeys = BuildHotkeys(keys, pageW);
 
-            tabs = new TabControl();
+            tabs = new TabHost();
             tabs.Font = Font;
             tabs.Appearance = TabAppearance.FlatButtons;
             tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
@@ -302,14 +302,19 @@ namespace TabbedExplorer
             // 高度：内容要多高给多高，但**不许顶出屏幕**（屏幕高度够就全显示，不够就页内滚动）。
             // 「常规」页比「快捷键」页长得多的那种情况下也能看全（川的屏幕不一定放得下 ~800 逻辑像素）。
             int footerH = Px(22) + Px(28) + pad;
-            int avail = Px(40);
-            try { avail = Screen.FromPoint(Cursor.Position).WorkingArea.Height; } catch { }
-            int maxTabsH = Math.Max(Px(240), avail - y - footerH - Px(30));
+            int work = Px(800);
+            try { work = Screen.FromPoint(Cursor.Position).WorkingArea.Height; } catch { }
+            // 整个窗口（含边框）不许顶出工作区 —— 川 2026-09-22 报的「界面显示不全」：
+            // 原来这里是 `Math.Max(Px(240), 剩余高度)`，屏幕一矮就把窗口顶到屏幕外，
+            // 底下那截（提示行 / 关闭按钮）永远看不见。现在反过来：**窗口高度封顶**，放不下的交给页内滚动。
+            int maxClient = Math.Max(Px(360), work - Px(72));
+            int maxTabsH = Math.Max(Px(150), maxClient - y - footerH);
             int wantTabsH = Math.Max(hGeneral, hKeys) + Px(14);
             int tabsH = Math.Min(wantTabsH, maxTabsH);
-            bool scrolls = wantTabsH > tabsH;
-            general.AutoScroll = scrolls;          // 放不下才给滚动条（平时不出现）
-            keys.AutoScroll = scrolls;
+            // 两页**一律**允许滚动 —— 装得下时 WinForms 自己不会画出滚动条，不必再拿一个开关去赌
+            // （川那次就是「没加可滚动」）。
+            general.AutoScroll = true;
+            keys.AutoScroll = true;
             tabs.SetBounds(pad, y, w - pad * 2, tabsH);
             Controls.Add(tabs);
             if (keepPage >= 0 && keepPage < tabs.TabCount) tabs.SelectedIndex = keepPage;
@@ -726,6 +731,40 @@ namespace TabbedExplorer
     /// 「按键捕获框」—— 其实就是个按钮，唯一特别的是**所有键都当普通输入收下来**
     /// （`IsInputKey` 返回 true），否则 Tab / 方向键会被对话框当成「移动焦点」，绑不了。
     /// </summary>
+    /// <summary>
+    /// 自绘 `TabControl` —— 只管一件事：**把 tab 头带自己刷一遍底色**。
+    /// 系统画的 tab 头带（最后一个 tab 右边那一截、最左边那条留白）永远用系统色，
+    /// 深色模式下就是一条白 —— 川 2026-09-22 报的「tab 背景颜色未适配颜色模式」。
+    /// 做法：让系统照常画完（`WM_PAINT`），再往那两条空白上补一刀底色。
+    /// </summary>
+    internal sealed class TabHost : TabControl
+    {
+        private const int WM_PAINT = 0x000F;
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg != WM_PAINT || TabCount == 0 || !IsHandleCreated) return;
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(Handle))
+                {
+                    Rectangle last = GetTabRect(TabCount - 1);
+                    int stripH = Math.Min(Height, last.Bottom);
+                    if (stripH <= 0) return;
+                    if (last.Right < Width)
+                        using (SolidBrush b = new SolidBrush(Theme.TabBar))
+                            g.FillRectangle(b, last.Right, 0, Width - last.Right, stripH);
+                    Rectangle first = GetTabRect(0);
+                    if (first.Left > 0)
+                        using (SolidBrush b = new SolidBrush(Theme.TabBar))
+                            g.FillRectangle(b, 0, 0, first.Left, stripH);
+                }
+            }
+            catch { }
+        }
+    }
+
     internal sealed class KeyBox : Button
     {
         protected override bool IsInputKey(Keys keyData) { return true; }

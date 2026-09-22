@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.IO;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
@@ -10,16 +9,19 @@ namespace TabbedExplorer
     /// <summary>
     /// 收藏夹栏（Ctrl+Shift+B 开关）—— 夹在标签条和内容之间，跟浏览器那条书签栏一个位置。
     ///
-    /// 2026-09-22 川改的两条（原来那版是「直接读系统 %USERPROFILE%\Links」）：
-    ///   1. **内容程序自己记** —— 数据在 `data\favorites.json`，见 `FavStore`。
-    ///      往栏上**拖文件夹 / 文件**就加一项；某一项上右键可以「从收藏夹移除」。
-    ///   2. **最左边一枚固定的收藏夹图标** —— 它是这条栏的「名牌」，不跟着内容横向滚动。
+    /// 2026-09-22 川改的几条：
+    ///   1. **内容程序自己记** —— 数据在 `data\favorites.json`，结构是树（见 `FavStore`）。
+    ///      栏上显示的是「收藏夹栏」那个文件夹的直接孩子；里面**带孩子的节点**（子文件夹）
+    ///      点一下会**往下列一层**（浏览器就是这么干的）。
+    ///   2. **最左边一枚固定的收藏夹图标** —— 这条栏的「名牌」，不跟着内容横向滚动；
+    ///      点它开**收藏夹管理器**（原来点它是开数据目录，川改成了「管理收藏夹」）。
+    ///   3. 项上右键可以**重命名**（改我们自己这份 json 里记的显示名，磁盘上那个文件夹不动）。
     ///
     /// 点击行为：文件夹 → 开成新标签；文件 → 交给系统（默认程序）打开。
     /// </summary>
     internal sealed class FavBar : Control
     {
-        /// <summary>收藏夹栏高度（逻辑像素）。够放一行 16px 图标 + 文字。</summary>
+        /// <summary>收藏夹栏高度（逻辑像素）。够放一行 18px 图标 + 文字。</summary>
         public const int StdHeight = 30;
 
         private static readonly float DpiScale = ReadDpi();
@@ -39,11 +41,12 @@ namespace TabbedExplorer
 
         private sealed class Item
         {
-            public string Path;      // 收藏的那个路径（文件夹或文件）
-            public string Name;
+            public FavNode Node;     // 树里的真节点（改名字直接改它）
             public Bitmap Icon;
             /// <summary>这一项占多宽（EnsureLayout 算，鼠标命中测试要用）。</summary>
             public int LayoutW;
+            public string Name { get { return FavStore.NameOf(Node); } }
+            public bool IsFolder { get { return Node != null && Node.IsFolder; } }
         }
 
         private readonly List<Item> items = new List<Item>();
@@ -77,11 +80,13 @@ namespace TabbedExplorer
         public delegate void PathEventHandler(string path);
         /// <summary>点了某一项 —— 参数是那个**文件夹**路径（新标签页开它）。</summary>
         public event PathEventHandler ItemClicked;
-        /// <summary>点了最左边那枚收藏夹图标（EmbedForm 拿它开数据目录）。</summary>
+        /// <summary>点了最左边那枚收藏夹图标（EmbedForm 拿它开收藏夹管理器）。</summary>
         public event EventHandler LeadClicked;
+        /// <summary>右键选了「管理收藏夹…」。</summary>
+        public event EventHandler ManageRequested;
         /// <summary>上面那一排要重新读了（右键「刷新」）。</summary>
         public event EventHandler Reloaded;
-        /// <summary>在收藏夹栏上右键点了「隐藏收藏夹栏」—— 真正隐藏由 Hub 做（它要同时刷托盘菜单和所有窗口）。</summary>
+        /// <summary>右键选了「隐藏收藏夹栏」—— 真正隐藏由 Hub 做（它要同时刷托盘菜单和所有窗口）。</summary>
         public event EventHandler HideRequested;
 
         public FavBar()
@@ -99,7 +104,14 @@ namespace TabbedExplorer
             Theme.Changed += delegate
             {
                 BackColor = TheBack;
+                leadIcon = null;         // 蓝色星标按主题色画，换主题要重画
+                folderFallback = null;
                 if (!IsDisposed) Invalidate();
+            };
+            // 数据一变（改名 / 增删 / 管理器里拖来拖去）这边就跟着重读
+            FavStore.Changed += delegate
+            {
+                if (!IsDisposed && Visible) Reload();
             };
         }
 
@@ -115,7 +127,7 @@ namespace TabbedExplorer
             if (Visible) Reload();
         }
 
-        /// <summary>按 `FavStore` 里的列表重建（拖进来 / 移除之后都要调一次）。</summary>
+        /// <summary>按 `FavStore` 里的树重建（拖进来 / 移除之后都要调一次）。</summary>
         public void Reload()
         {
             items.Clear();
@@ -123,12 +135,11 @@ namespace TabbedExplorer
             scrollX = 0;
             try
             {
-                foreach (string p in FavStore.Items)
+                foreach (FavNode n in FavStore.BarItems)
                 {
                     Item it = new Item();
-                    it.Path = p;
-                    it.Name = FavStore.NameOf(p);
-                    it.Icon = ShellIcon.PathIcon(p, Px(16));
+                    it.Node = n;
+                    it.Icon = n.IsFolder ? null : ShellIcon.PathIcon(n.Path, Px(18));
                     items.Add(it);
                 }
                 Diag.Step("收藏夹栏: 载入 " + items.Count + " 项");
@@ -148,7 +159,7 @@ namespace TabbedExplorer
             {
                 Size t = TextRenderer.MeasureText(items[i].Name, font, new Size(Px(400), Px(20)),
                     TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-                int w = Px(6) + Px(16) + Px(5) + Math.Min(t.Width, Px(140)) + Px(8);
+                int w = Px(6) + Px(18) + Px(5) + Math.Min(t.Width, Px(140)) + Px(8);
                 items[i].LayoutW = w;
                 contentWidth += w;
             }
@@ -191,15 +202,13 @@ namespace TabbedExplorer
             Graphics g = e.Graphics;
             g.FillRectangle(new SolidBrush(TheBack), ClientRectangle);
 
-            float stroke = Math.Max(1f, DpiScale);
-
             // ---- 左边那枚固定的「收藏夹」图标（川 2026-09-22 要的）----
             Rectangle lead = LeadBounds();
             if (hoverLead) g.FillRectangle(new SolidBrush(Theme.Hover), lead);
             Image li = LeadImage();
             if (li != null)
-                g.DrawImage(li, new Rectangle(lead.Left + (lead.Width - Px(16)) / 2,
-                                              lead.Top + (lead.Height - Px(16)) / 2, Px(16), Px(16)));
+                g.DrawImage(li, new Rectangle(lead.Left + (lead.Width - Px(20)) / 2,
+                                              lead.Top + (lead.Height - Px(20)) / 2, Px(20), Px(20)));
             // 图标右边一条淡竖线，跟收藏项隔开
             using (Pen p = new Pen(Theme.Border))
                 g.DrawLine(p, lead.Right + Px(3), Px(6), lead.Right + Px(3), Height - Px(7));
@@ -223,13 +232,13 @@ namespace TabbedExplorer
                     Bitmap ic = items[i].Icon;
                     if (ic == null)
                     {
-                        if (folderFallback == null) folderFallback = ShellIcon.FolderIcon(Px(16));
+                        if (folderFallback == null) folderFallback = ShellIcon.FolderIcon(Px(18));
                         ic = folderFallback;
                     }
                     if (ic != null)
-                        g.DrawImage(ic, new Rectangle(r.Left + Px(6), r.Top + (r.Height - Px(16)) / 2, Px(16), Px(16)));
+                        g.DrawImage(ic, new Rectangle(r.Left + Px(6), r.Top + (r.Height - Px(18)) / 2, Px(18), Px(18)));
 
-                    int tx = r.Left + Px(6) + Px(16) + Px(5);
+                    int tx = r.Left + Px(6) + Px(18) + Px(5);
                     int tw = r.Right - Px(8) - tx;
                     if (tw <= 0) continue;
                     TextRenderer.DrawText(g, items[i].Name, font,
@@ -244,19 +253,24 @@ namespace TabbedExplorer
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
         }
 
-        /// <summary>「收藏夹」那枚图标（MDL2 的星星）。取不到字形就退成系统那颗星星图标。</summary>
+        /// <summary>
+        /// 「收藏夹」那枚图标（MDL2 的实心星星）。
+        /// 川 2026-09-22：「用已打开收藏夹栏的那个蓝色图标」+「有点小」——
+        /// 于是改成跟标签条上那枚**开了收藏夹栏时一样**的蓝色实心星（E735 + Theme.Accent），
+        /// 尺寸 16 → 20（字形 ink 比字号小，同字号下星星看着比齿轮/历史那几个都小）。
+        /// </summary>
         private static Image LeadImage()
         {
             if (leadIcon != null) return leadIcon;
             try
             {
-                Bitmap b = new Bitmap(Px(16), Px(16));
+                Bitmap b = new Bitmap(Px(20), Px(20));
                 using (Graphics g = Graphics.FromImage(b))
-                using (Font f = new Font("Segoe MDL2 Assets", Px(13), FontStyle.Regular, GraphicsUnit.Pixel))
+                using (Font f = new Font("Segoe MDL2 Assets", Px(20), FontStyle.Regular, GraphicsUnit.Pixel))
                 {
                     g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-                    TextRenderer.DrawText(g, "\uE734", f, new Rectangle(0, 0, Px(16), Px(16)),
-                        Theme.TextDim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextRenderer.DrawText(g, "\uE735", f, new Rectangle(0, 0, Px(20), Px(20)),
+                        Theme.Accent, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                         TextFormatFlags.NoPadding);
                 }
                 leadIcon = b;
@@ -281,7 +295,7 @@ namespace TabbedExplorer
                 else if (hl)
                 {
                     Rectangle r = LeadBounds();
-                    tips.Show("收藏夹\r\n把文件夹或文件拖到这条栏上就能加进来；点这儿打开数据目录",
+                    tips.Show("收藏夹\r\n把文件夹或文件拖到这条栏上就能加进来；点这儿管理收藏夹",
                         this, r.Left, r.Bottom + Px(2), 8000);
                 }
                 else
@@ -289,7 +303,10 @@ namespace TabbedExplorer
                     Rectangle r = BoundsOf(i);
                     int x = r.Left;                       // 提示贴在那项下面、左边对齐
                     if (x + Px(240) > Width) x = Math.Max(0, Width - Px(240));
-                    tips.Show(items[i].Name + "\r\n" + items[i].Path, this, x, r.Bottom + Px(2), 8000);
+                    string body = items[i].IsFolder
+                        ? ("子文件夹，里面有 " + items[i].Node.Kids.Count + " 项")
+                        : items[i].Node.Path;
+                    tips.Show(items[i].Name + "\r\n" + body, this, x, r.Bottom + Px(2), 8000);
                 }
             }
         }
@@ -388,7 +405,14 @@ namespace TabbedExplorer
             }
             if (i < 0) return;
 
-            string p = items[i].Path;
+            // 子文件夹：点一下往下列一层（浏览器收藏夹栏就是这么干的）
+            if (items[i].IsFolder)
+            {
+                ShowSubMenu(i);
+                return;
+            }
+
+            string p = items[i].Node.Path;
             if (FavStore.IsFolder(p))
             {
                 if (ItemClicked != null) ItemClicked(p);      // 文件夹 → 新标签
@@ -403,10 +427,44 @@ namespace TabbedExplorer
             catch (Exception ex) { Toast.Show("打不开", ex.Message); }
         }
 
+        /// <summary>把子文件夹里的东西列出来（支持继续往下嵌套）。</summary>
+        private void ShowSubMenu(int index)
+        {
+            FavNode nd = items[index].Node;
+            PopItem[] kids = ItemsOf(nd);
+            if (kids.Length == 0) { Toast.Show(nd.Display, "这个文件夹里还没有收藏。"); return; }
+            Rectangle r = BoundsOf(index);
+            PopMenu.Show(kids, this, new Point(r.Left, r.Bottom + Px(1)), "收藏夹子文件夹 " + nd.Display);
+        }
+
+        /// <summary>把一个节点的孩子变成菜单项（文件夹继续往下嵌套一层）。</summary>
+        private PopItem[] ItemsOf(FavNode folder)
+        {
+            List<PopItem> r = new List<PopItem>();
+            for (int i = 0; i < folder.Kids.Count; i++)
+            {
+                FavNode k = folder.Kids[i];
+                if (k.IsFolder) r.Add(PopMenu.Sub(k.Display, ItemsOf(k)));
+                else
+                {
+                    string p = k.Path;
+                    r.Add(PopMenu.It(k.Display, delegate
+                    {
+                        if (FavStore.IsFolder(p)) { if (ItemClicked != null) ItemClicked(p); }
+                        else
+                        {
+                            try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
+                            catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                        }
+                    }));
+                }
+            }
+            return r.ToArray();
+        }
+
         /// <summary>
         /// 右键菜单 —— **在 MouseUp 里弹**。写在 MouseDown 里的话，紧接着那条「右键抬起」消息会投到
-        /// 刚弹出来的菜单窗口上（菜单抓着鼠标捕获），菜单把它当成「点在别处」当场关掉
-        /// —— 表现就是「右键菜单一闪、点哪个条目都没反应」（川报的 bug 2 就是这么来的）。
+        /// 刚弹出来的菜单窗口上（菜单抓着鼠标捕获），菜单把它当成「点在别处」当场关掉。
         /// </summary>
         protected override void OnMouseUp(MouseEventArgs e)
         {
@@ -414,51 +472,85 @@ namespace TabbedExplorer
             if (e.Button != MouseButtons.Right) return;
 
             int i = HitTest(e.Location);
-            List<MenuItem> m = new List<MenuItem>();
+            List<PopItem> m = new List<PopItem>();
 
             if (i >= 0)
             {
-                string p = items[i].Path;
-                if (FavStore.IsFolder(p))
+                Item it = items[i];
+                string p = it.Node.Path;
+                if (it.IsFolder)
                 {
-                    m.Add(MenuFx.Item("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(p); }));
+                    FavNode nd = it.Node;
+                    m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(i); }));
+                    m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));
+                    m.Add(PopMenu.Split());
                 }
                 else
                 {
-                    m.Add(MenuFx.Item("用默认程序打开", delegate
+                    if (FavStore.IsFolder(p))
+                        m.Add(PopMenu.It("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(p); }));
+                    else
+                        m.Add(PopMenu.It("用默认程序打开", delegate
+                        {
+                            try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
+                            catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                        }));
+                    m.Add(PopMenu.It("复制完整路径", delegate
                     {
-                        try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
-                        catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                        try { Clipboard.SetText(p); }
+                        catch (Exception ex) { Diag.Log("收藏夹栏: 复制失败 " + ex.Message); }
                     }));
+                    // 川 2026-09-22 要的：栏上的项能改名（改的是**我们自己这份 json 里记的显示名**，
+                    // 磁盘上那个文件夹/文件一个字节都不动）
+                    FavNode nd = it.Node;
+                    m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));
+                    m.Add(PopMenu.Split());
                 }
-                m.Add(MenuFx.Item("复制完整路径", delegate
-                {
-                    try { Clipboard.SetText(p); }
-                    catch (Exception ex) { Diag.Log("收藏夹栏: 复制失败 " + ex.Message); }
-                }));
-                m.Add(MenuFx.Sep());
-                m.Add(MenuFx.Item("从收藏夹移除", delegate
+
+                FavNode node = it.Node;
+                m.Add(PopMenu.It("从收藏夹移除", delegate
                 {
                     // 只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**
-                    if (FavStore.Remove(p)) { Reload(); Diag.Step("收藏夹栏: 移除 " + p); }
+                    FavStore.Edit(delegate(List<FavNode> l) { RemoveFrom(l, node); });
+                    Diag.Step("收藏夹栏: 移除 " + FavStore.NameOf(node));
                 }));
-                m.Add(MenuFx.Sep());
+                m.Add(PopMenu.Split());
             }
 
-            m.Add(MenuFx.Item("刷新收藏夹栏", delegate { Reload(); }));
-            m.Add(MenuFx.Item("打开收藏夹数据目录", delegate
+            m.Add(PopMenu.It("刷新收藏夹栏", delegate { Reload(); }));
+            m.Add(PopMenu.It("管理收藏夹…", delegate
             {
-                try { Process.Start("explorer.exe", "\"" + AppPaths.DataDir + "\""); }
-                catch (Exception ex) { Toast.Show("打不开数据目录", ex.Message); }
+                if (ManageRequested != null) ManageRequested(this, EventArgs.Empty);
             }));
-            m.Add(MenuFx.Sep());
+            m.Add(PopMenu.Split());
             // 快捷键文本跟着设置走（可自定义，别写死）
-            m.Add(MenuFx.Item("隐藏收藏夹栏（" + Hotkeys.Combo("favbar") + "）",
+            m.Add(PopMenu.It("隐藏收藏夹栏（" + Hotkeys.Combo("favbar") + "）",
                 delegate { if (HideRequested != null) HideRequested(this, EventArgs.Empty); }));
 
-            Point at = e.Location;
-            MenuFx.Show(MenuFx.Build(m.ToArray()), this, at,
+            PopMenu.Show(m.ToArray(), this, e.Location,
                 i >= 0 ? ("收藏夹项右键 " + items[i].Name) : "收藏夹栏右键");
+        }
+
+        /// <summary>按节点删除（文件夹连里面的东西一起删，磁盘上不动）。</summary>
+        private static void RemoveFrom(List<FavNode> l, FavNode node)
+        {
+            for (int i = 0; i < l.Count; i++)
+            {
+                if (l[i] == node) { l.RemoveAt(i); return; }
+                if (l[i].IsFolder) RemoveFrom(l[i].Kids, node);
+            }
+        }
+
+        /// <summary>改显示名（点小输入框，改完存盘）。</summary>
+        private void Rename(FavNode node)
+        {
+            string old = FavStore.NameOf(node);
+            string nn = InputBox.Ask(this, "重命名收藏", "显示名", old);
+            if (nn == null) return;
+            nn = nn.Trim();
+            if (nn.Length == 0 || nn == old) return;
+            FavStore.Edit(delegate(List<FavNode> l) { node.Name = nn; });
+            Diag.Step("收藏夹栏: 重命名 " + old + " -> " + nn);
         }
 
         protected override void Dispose(bool disposing)

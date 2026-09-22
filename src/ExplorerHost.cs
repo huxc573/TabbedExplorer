@@ -333,7 +333,7 @@ namespace TabbedExplorer
         /// 立刻把它藏掉。轮询最快也要 25ms，这一位才是「一点不闪」的关键。
         /// 回调在 UI 线程上（WINEVENT_OUTOFCONTEXT 投递到注册它的那个线程的消息队列）。
         /// </summary>
-        private void OnAnyWindowShown(IntPtr h, int tick)
+        private void OnAnyWindowShown(IntPtr h, int tick, uint evt)
         {
             if (disposed || pendingCab != IntPtr.Zero) return;   // 已经盯上了，轮询那边每轮都会藏
 
@@ -369,6 +369,11 @@ namespace TabbedExplorer
                 CabWindow = cab;
                 origStyle = EmbedApi.GetStyle(cab);
                 EmbedApi.GetWindowRect(cab, out origRect);
+
+                // ★ 关键：把「防闪那层透明」（WS_EX_LAYERED + alpha=0，见 `EmbedApi.MakeTransparent`）
+                //   摘掉。Hub 的监听可能赶在我们 `Claim` 之前就把这扇窗置成透明了（竞态），
+                //   不摘的话嵌进来的标签**永远是隐形的** —— 比闪一下严重得多，所以就在这里兜住。
+                EmbedApi.ClearTransparent(cab);
 
                 // 顺序不能反：先改样式，再 SetParent
                 uint child = EmbedApi.ToChildStyle(origStyle);
@@ -698,6 +703,7 @@ namespace TabbedExplorer
                 {
                     EmbedApi.SetStyle(CabWindow, origStyle);
                     EmbedApi.SetParent(CabWindow, IntPtr.Zero);
+                    EmbedApi.ClearTransparent(CabWindow);   // 还它本来面目：别带着防闪那层透明回桌面
                     EmbedApi.SetWindowPos(CabWindow, IntPtr.Zero, origRect.Left, origRect.Top,
                         origRect.Width, origRect.Height,
                         EmbedApi.SWP_NOZORDER | EmbedApi.SWP_NOACTIVATE | EmbedApi.SWP_FRAMECHANGED);

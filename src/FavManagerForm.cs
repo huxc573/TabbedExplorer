@@ -1,0 +1,709 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace TabbedExplorer
+{
+    /// <summary>
+    /// 收藏夹管理器（川 2026-09-22 要的「管理收藏夹」）—— 仿浏览器那个收藏夹管理器：
+    /// 左边是**文件夹树**（可无限嵌套），右边是这个文件夹里的东西，顶上一条搜索框 + 几个动作。
+    ///
+    /// 风格按程序来（自绘行 + Theme 调色板），不用 TreeView / ListView ——
+    /// 那两个在深色下要么灰底要么得跟 uxtheme 斗，自绘反而短。
+    ///
+    /// 行为：
+    ///   · 左树：点一行 = 选中那个文件夹；点左边的三角 = 展开/收起；双击 = 打开这个文件夹（新标签）
+    ///   · 右列：双击 = 打开（文件夹开新标签 / 文件交给系统）；行尾的 ✕ = 从收藏夹移出
+    ///   · 右键：重命名 / 新建文件夹 / 删除 / **设为收藏夹栏**（哪个文件夹喂给横向那条栏）
+    ///   · 从资源管理器**拖文件夹进来** = 加进当前选中的文件夹（这就是嵌套的做法）
+    ///   · 搜索框：输入就跨全树过滤，右边列变成搜索结果（显示它在哪个文件夹里）
+    ///
+    /// ⚠ 这里所有增删改都只动 `data\favorites.json`，**磁盘上的文件夹 / 文件一个字节都不动**。
+    /// </summary>
+    internal sealed class FavManagerForm : Form
+    {
+        /// <summary>双击一个真实文件夹 —— 交给主窗口开成新标签。</summary>
+        public event Action<string> OpenPath;
+
+        private sealed class Row
+        {
+            public FavNode Node;
+            public int Depth;
+            public Rectangle Rect;
+        }
+
+        private static readonly float DpiScale = ReadDpi();
+
+        private static float ReadDpi()
+        {
+            try
+            {
+                uint d = NativeMethods.GetDpiForSystem();
+                if (d >= 96) return d / 96f;
+            }
+            catch { }
+            return 1f;
+        }
+
+        private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
+
+        private const int TopH = 40;         // 顶部动作条
+        private const int LeftW = 250;       // 左树宽度
+        private const int TreeRowH = 26;
+        private const int ListRowH = 30;
+
+        private readonly List<Row> treeRows = new List<Row>();
+        private readonly List<Row> listRows = new List<Row>();
+        private readonly HashSet<FavNode> collapsed = new HashSet<FavNode>();
+
+        private FavNode sel;                 // 右列显示哪个文件夹的孩子
+        private FavNode hoverTree, hoverList;
+        private bool hoverClose;
+        private Row pressed;                 // 双击判定用
+        private string filter = "";
+
+        private readonly TextBox search;
+        private readonly Font font, fontDim;
+        private readonly Action<bool> setFavBar;
+        private readonly Func<bool> getFavBar;
+
+        public FavManagerForm(Action<bool> setFavBar, Func<bool> getFavBar)
+        {
+            this.setFavBar = setFavBar;
+            this.getFavBar = getFavBar;
+
+            Text = "管理收藏夹";
+            FormBorderStyle = FormBorderStyle.Sizable;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(Px(880), Px(560));
+            MinimumSize = new Size(Px(560), Px(360));
+            BackColor = Theme.Chrome;
+            ForeColor = Theme.Text;
+            font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
+            fontDim = new Font("Segoe UI", Px(11), FontStyle.Regular, GraphicsUnit.Pixel);
+            AllowDrop = true;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+
+            // 顶部动作条（真按钮，省得再造一套命中判定）
+            int x = Px(10), y = Px(8);
+            search = new TextBox();
+            search.BorderStyle = BorderStyle.FixedSingle;
+            search.BackColor = Theme.InputBack;
+            search.ForeColor = Theme.Text;
+            search.Font = font;
+            search.SetBounds(x, y + Px(1), Px(220), Px(24));
+            search.TextChanged += delegate { filter = search.Text.Trim(); Rebuild(); Invalidate(); };
+            Controls.Add(search);
+
+            int bx = x + Px(232);
+            bx = AddButton("添加文件夹", bx, y, delegate
+            {
+                FavNode f = NewFolder();
+                if (f != null) { favBarChanged(); }
+            });
+            bx = AddButton("添加收藏夹", bx, y, delegate
+            {
+                string p = InputBox.Ask(this, "添加收藏夹", "文件夹或文件的完整路径", "");
+                if (string.IsNullOrEmpty(p)) return;
+                string name;
+                if (FavStore.Add(p, out name)) Toast.Show("已加入收藏夹", name);
+                else Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在收藏夹里了。"));
+            });
+            bx = AddButton("删除这一项", bx, y, delegate
+            {
+                if (sel == null) return;
+                if (FavStore.BarFolder == sel) { Toast.Show("删不了", "「收藏夹栏」这一层是横向那条栏的根，先换个文件夹当栏。"); return; }
+                FavNode tmp = sel;
+                FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
+                sel = null;
+                favBarChanged();
+            });
+            bx = AddButton("打开 json", bx, y, delegate
+            {
+                try { Process.Start(FavStore.FileName); }
+                catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+            });
+            bx = AddButton("回到收藏夹栏", bx, y, delegate { sel = FavStore.BarFolder; Rebuild(); Invalidate(); });
+
+            Theme.Changed += OnTheme;
+            FavStore.Changed += OnStore;
+            FormClosed += delegate
+            {
+                try { Theme.Changed -= OnTheme; } catch { }
+                try { FavStore.Changed -= OnStore; } catch { }
+            };
+        }
+
+        private void OnTheme(object sender, EventArgs e)
+        {
+            BackColor = Theme.Chrome;
+            ForeColor = Theme.Text;
+            if (search != null) { search.BackColor = Theme.InputBack; search.ForeColor = Theme.Text; }
+            Invalidate(true);
+        }
+
+        private void OnStore()
+        {
+            if (IsDisposed) return;
+            Rebuild();
+            Invalidate();
+        }
+
+        private void favBarChanged()
+        {
+            Rebuild();
+            Invalidate();
+        }
+
+        private int AddButton(string text, int x, int y, Action a)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.FlatStyle = FlatStyle.Flat;
+            b.BackColor = Theme.Hover;
+            b.ForeColor = Theme.Text;
+            b.Font = fontDim;
+            b.FlatAppearance.BorderColor = Theme.Border;
+            b.UseVisualStyleBackColor = false;
+            Size sz = TextRenderer.MeasureText(text, fontDim, new Size(Px(400), Px(24)),
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            int w = sz.Width + Px(18);
+            b.SetBounds(x, y, w, Px(26));
+            b.Click += delegate { try { a(); } catch (Exception ex) { Diag.Log("收藏夹管理器: " + ex.Message); } };
+            Controls.Add(b);
+            return x + w + Px(6);
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Theme.ApplyTitleBar(Handle);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            Theme.ApplyTitleBar(Handle);
+            if (sel == null) sel = FavStore.BarFolder;
+            Rebuild();
+            Invalidate();
+        }
+
+        // ==================================================================
+        // 排版
+        // ==================================================================
+
+        private void Rebuild()
+        {
+            treeRows.Clear();
+            listRows.Clear();
+            if (sel == null) sel = FavStore.BarFolder;
+
+            // 左树：拍平（收起来的文件夹不展开）
+            int y = TopH + Px(6);
+            FavNode[] roots = FavStore.Tree;
+            for (int i = 0; i < roots.Length; i++) Flatten(roots[i], 0, ref y);
+
+            // 右列：某个文件夹的孩子，或者（搜索时）全树的过滤结果
+            y = TopH + Px(6);
+            if (filter.Length > 0)
+            {
+                List<FavNode> hits = new List<FavNode>();
+                for (int i = 0; i < roots.Length; i++) Search(roots[i], hits);
+                for (int i = 0; i < hits.Count; i++)
+                {
+                    Row r = new Row();
+                    r.Node = hits[i];
+                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
+                    listRows.Add(r);
+                    y += ListRowH;
+                }
+            }
+            else
+            {
+                for (int i = 0; i < sel.Kids.Count; i++)
+                {
+                    Row r = new Row();
+                    r.Node = sel.Kids[i];
+                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
+                    listRows.Add(r);
+                    y += ListRowH;
+                }
+            }
+
+            // 选中项如果被删了/移走了，退回收藏夹栏
+            if (sel != null && !InTree(sel)) sel = FavStore.BarFolder;
+        }
+
+        private void Flatten(FavNode n, int depth, ref int y)
+        {
+            if (n == null) return;
+            Row r = new Row();
+            r.Node = n;
+            r.Depth = depth;
+            r.Rect = new Rectangle(Px(8) + depth * Px(14), y, Math.Max(1, LeftW - Px(18) - depth * Px(14)), TreeRowH);
+            treeRows.Add(r);
+            y += TreeRowH;
+            if (n.IsFolder && !collapsed.Contains(n))
+                for (int i = 0; i < n.Kids.Count; i++) Flatten(n.Kids[i], depth + 1, ref y);
+        }
+
+        private void Search(FavNode n, List<FavNode> hits)
+        {
+            if (n == null) return;
+            if (!n.IsFolder)
+            {
+                string nm = n.Display;
+                if (nm.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (n.Path != null && n.Path.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0))
+                    hits.Add(n);
+                return;
+            }
+            for (int i = 0; i < n.Kids.Count; i++) Search(n.Kids[i], hits);
+        }
+
+        private static bool InTree(FavNode n)
+        {
+            FavNode[] roots = FavStore.Tree;
+            for (int i = 0; i < roots.Length; i++) if (Find(roots[i], n) != null) return true;
+            return false;
+        }
+
+        private static FavNode Find(FavNode root, FavNode target)
+        {
+            if (root == target) return root;
+            for (int i = 0; i < root.Kids.Count; i++)
+            {
+                FavNode r = Find(root.Kids[i], target);
+                if (r != null) return r;
+            }
+            return null;
+        }
+
+        // ==================================================================
+        // 画
+        // ==================================================================
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.FillRectangle(new SolidBrush(Theme.Chrome), ClientRectangle);
+
+            // 顶部条 + 两条分隔线
+            using (SolidBrush b = new SolidBrush(Theme.TabBar))
+                g.FillRectangle(b, 0, 0, Width, TopH);
+            using (Pen p = new Pen(Theme.Border))
+            {
+                g.DrawLine(p, 0, TopH, Width, TopH);
+                g.DrawLine(p, LeftW, TopH, LeftW, Height);
+            }
+
+            // 左树 / 右列的标题
+            DrawCaption(g, "收藏夹", Px(12), TopH + Px(4));
+            string right = filter.Length > 0
+                ? ("搜索结果（" + listRows.Count + "）")
+                : (sel != null ? FavStore.NameOf(sel) : "");
+            DrawCaption(g, right, LeftW + Px(12), TopH + Px(4), true);
+
+            for (int i = 0; i < treeRows.Count; i++) DrawTreeRow(g, treeRows[i]);
+            for (int i = 0; i < listRows.Count; i++) DrawListRow(g, listRows[i]);
+
+            if (listRows.Count == 0)
+                TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的收藏" : "这个文件夹里还没有收藏（拖文件夹进来，或点上面的「添加」）",
+                    fontDim, new Rectangle(LeftW + Px(14), TopH + Px(40), Math.Max(1, Width - LeftW - Px(30)), Px(24)),
+                    Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.NoPadding);
+        }
+
+        private void DrawCaption(Graphics g, string text, int x, int y)
+        {
+            DrawCaption(g, text, x, y, false);
+        }
+
+        private void DrawCaption(Graphics g, string text, int x, int y, bool dim)
+        {
+            TextRenderer.DrawText(g, text, fontDim, new Point(x, y), dim ? Theme.TextDim : Theme.Text,
+                TextFormatFlags.NoPadding);
+        }
+
+        private void DrawTreeRow(Graphics g, Row r)
+        {
+            bool isSel = (r.Node == sel);
+            bool hov = (r.Node == hoverTree);
+            if (isSel) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+            else if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+
+            int x = r.Rect.Left + Px(2);
+            // 展开三角
+            if (r.Node.IsFolder && r.Node.Kids.Count > 0)
+            {
+                string gl = collapsed.Contains(r.Node) ? "\uE76C" : "\uE70D";
+                using (Font f = new Font("Segoe MDL2 Assets", Px(10), FontStyle.Regular, GraphicsUnit.Pixel))
+                    TextRenderer.DrawText(g, gl, f, new Rectangle(x, r.Rect.Top, Px(12), r.Rect.Height),
+                        Theme.TextDim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+            x += Px(15);
+
+            // 图标：收藏夹栏那层用蓝色星，普通文件夹用文件夹图标
+            Image ic = null;
+            if (r.Node.Bar) ic = BarStar();
+            else if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(16));
+            else ic = ShellIcon.PathIcon(r.Node.Path, Px(16));
+            if (ic != null) g.DrawImage(ic, new Rectangle(x, r.Rect.Top + (r.Rect.Height - Px(16)) / 2, Px(16), Px(16)));
+            x += Px(20);
+
+            string label = FavStore.NameOf(r.Node);
+            if (r.Node.Bar) label += "（收藏夹栏）";
+            TextRenderer.DrawText(g, label, font,
+                new Rectangle(x, r.Rect.Top, Math.Max(1, r.Rect.Right - x - Px(4)), r.Rect.Height),
+                isSel ? Theme.Text : (r.Node.IsFolder ? Theme.Text : Theme.TextDim),
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        }
+
+        private void DrawListRow(Graphics g, Row r)
+        {
+            bool hov = (r.Node == hoverList);
+            if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+
+            Image ic;
+            if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(18));
+            else ic = ShellIcon.PathIcon(r.Node.Path, Px(18));
+            if (ic != null)
+                g.DrawImage(ic, new Rectangle(r.Rect.Left + Px(4), r.Rect.Top + (r.Rect.Height - Px(18)) / 2, Px(18), Px(18)));
+
+            // 行尾的 ✕
+            Rectangle close = CloseRect(r.Rect);
+            if (hoverClose && hov)
+            {
+                using (Pen p = new Pen(Theme.TextDim, Math.Max(1f, DpiScale)))
+                {
+                    int s = Px(4);
+                    g.DrawLine(p, close.Left + close.Width / 2 - s, close.Top + close.Height / 2 - s,
+                                  close.Left + close.Width / 2 + s, close.Top + close.Height / 2 + s);
+                    g.DrawLine(p, close.Left + close.Width / 2 + s, close.Top + close.Height / 2 - s,
+                                  close.Left + close.Width / 2 - s, close.Top + close.Height / 2 + s);
+                }
+            }
+
+            int x = r.Rect.Left + Px(28);
+            int rightRoom = close.Width + Px(14);
+            string name = FavStore.NameOf(r.Node);
+            string sub = r.Node.IsFolder ? ("子文件夹，里面 " + r.Node.Kids.Count + " 项")
+                                        : (r.Node.Path != null ? r.Node.Path : "");
+
+            int nameW = TextRenderer.MeasureText(name, font, new Size(Px(4096), Px(20)),
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+            nameW = Math.Min(nameW, Math.Max(Px(60), r.Rect.Width - Px(28) - rightRoom - Px(120)));
+            TextRenderer.DrawText(g, name, font, new Rectangle(x, r.Rect.Top, nameW, r.Rect.Height),
+                Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+            int sx = x + nameW + Px(10);
+            int sw = r.Rect.Right - sx - rightRoom;
+            if (sw > Px(20))
+                TextRenderer.DrawText(g, sub, fontDim, new Rectangle(sx, r.Rect.Top, sw, r.Rect.Height),
+                    Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        }
+
+        private Rectangle CloseRect(Rectangle row)
+        {
+            int s = Px(20);
+            return new Rectangle(row.Right - s - Px(6), row.Top + (row.Height - s) / 2, s, s);
+        }
+
+        private static Bitmap barStar;
+        private static Image BarStar()
+        {
+            if (barStar != null) return barStar;
+            int s = Px(16);
+            Bitmap b = new Bitmap(s, s);
+            using (Graphics g = Graphics.FromImage(b))
+            using (Font f = new Font("Segoe MDL2 Assets", Px(16), FontStyle.Regular, GraphicsUnit.Pixel))
+                TextRenderer.DrawText(g, "\uE735", f, new Rectangle(0, 0, s, s), Theme.Accent,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            barStar = b;
+            return barStar;
+        }
+
+        // ==================================================================
+        // 鼠标
+        // ==================================================================
+
+        private Row RowAt(Point p)
+        {
+            for (int i = 0; i < treeRows.Count; i++) if (treeRows[i].Rect.Contains(p)) return treeRows[i];
+            for (int i = 0; i < listRows.Count; i++) if (listRows[i].Rect.Contains(p)) return listRows[i];
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            Row r = RowAt(e.Location);
+            FavNode t = (r != null && r.Depth >= 0 && treeRows.Contains(r)) ? r.Node : null;
+            FavNode l = (r != null && listRows.Contains(r)) ? r.Node : null;
+            bool hc = (l != null) && CloseRect(r.Rect).Contains(e.Location);
+            if (t != hoverTree || l != hoverList || hc != hoverClose)
+            {
+                hoverTree = t; hoverList = l; hoverClose = hc;
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            hoverTree = null; hoverList = null; hoverClose = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            for (int i = 0; i < treeRows.Count; i++)
+            {
+                Row r = treeRows[i];
+                if (!r.Rect.Contains(e.Location)) continue;
+                Rectangle tri = new Rectangle(r.Rect.Left + Px(2), r.Rect.Top, Px(14), r.Rect.Height);
+                if (r.Node.IsFolder && r.Node.Kids.Count > 0 && tri.Contains(e.Location))
+                {
+                    if (!collapsed.Remove(r.Node)) collapsed.Add(r.Node);
+                    Rebuild();
+                    Invalidate();
+                    return;
+                }
+                sel = r.Node.IsFolder ? r.Node : sel;
+                pressed = r;
+                Rebuild();
+                Invalidate();
+                return;
+            }
+            for (int i = 0; i < listRows.Count; i++)
+            {
+                Row r = listRows[i];
+                if (!r.Rect.Contains(e.Location)) continue;
+                pressed = r;
+                if (CloseRect(r.Rect).Contains(e.Location)) { DeleteNode(r.Node); return; }
+                Invalidate();
+                return;
+            }
+        }
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            base.OnMouseDoubleClick(e);
+            if (pressed == null) return;
+            FavNode n = pressed.Node;
+            if (n.IsFolder)
+            {
+                if (!treeRows.Contains(pressed)) { sel = n; Rebuild(); }
+                else { sel = n; Rebuild(); }
+                Invalidate();
+                return;
+            }
+            OpenNode(n);
+        }
+
+        private void OpenNode(FavNode n)
+        {
+            if (n == null || n.Path == null) return;
+            if (FavStore.IsFolder(n.Path))
+            {
+                if (OpenPath != null) OpenPath(n.Path);
+                Diag.Step("收藏夹管理器: 打开 " + n.Path);
+            }
+            else
+            {
+                try { Process.Start(new ProcessStartInfo(n.Path) { UseShellExecute = true }); }
+                catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Right) return;
+            Row r = RowAt(e.Location);
+            if (r == null) return;
+
+            List<PopItem> m = new List<PopItem>();
+            FavNode n = r.Node;
+
+            if (!n.IsFolder)
+            {
+                m.Add(Mi("打开", delegate { OpenNode(n); }));
+                m.Add(Mi("复制完整路径", delegate
+                {
+                    try { Clipboard.SetText(n.Path); } catch { }
+                }));
+                m.Add(PopMenu.Split());
+            }
+            else
+            {
+                m.Add(Mi("在这个文件夹里新建文件夹", delegate { NewFolder(n); }));
+                m.Add(PopMenu.Split());
+            }
+
+            m.Add(Mi("重命名…", delegate
+            {
+                string nn = InputBox.Ask(this, "重命名", "显示名", FavStore.NameOf(n));
+                if (nn == null) return;
+                nn = nn.Trim();
+                if (nn.Length == 0) return;
+                FavStore.Edit(delegate(List<FavNode> l) { n.Name = nn; });
+                Invalidate();
+            }));
+
+            if (n.IsFolder && !n.Bar)
+                m.Add(Mi("设为收藏夹栏", delegate
+                {
+                    FavNode oldBar = FavStore.BarFolder;
+                    FavStore.Edit(delegate(List<FavNode> l)
+                    {
+                        if (oldBar != null) oldBar.Bar = false;
+                        n.Bar = true;
+                    });
+                    Toast.Show("收藏夹栏", "现在横着那条栏显示的是「" + FavStore.NameOf(n) + "」。");
+                    Rebuild();
+                }));
+
+            if (!(n.Bar && n.IsFolder))
+                m.Add(Mi("从收藏夹移出", delegate { DeleteNode(n); }));
+
+            PopMenu.Show(m.ToArray(), this, e.Location, "收藏夹管理器右键 " + FavStore.NameOf(n));
+        }
+
+        private PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
+
+        /// <summary>删一个节点（文件夹连里面的东西一起，**磁盘上不动**）。</summary>
+        private void DeleteNode(FavNode n)
+        {
+            if (n == null) return;
+            if (n.Bar && n.IsFolder) { Toast.Show("删不了", "「收藏夹栏」这一层是横向那条栏的根。"); return; }
+            FavNode tmp = n;
+            FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
+            if (sel == n) sel = FavStore.BarFolder;
+            Rebuild();
+            Invalidate();
+        }
+
+        private static void RemoveNode(List<FavNode> l, FavNode target)
+        {
+            for (int i = 0; i < l.Count; i++)
+            {
+                if (l[i] == target) { l.RemoveAt(i); return; }
+                if (l[i].IsFolder) RemoveNode(l[i].Kids, target);
+            }
+        }
+
+        /// <summary>在 sel（或指定文件夹）里新建一个空文件夹；返回新节点。</summary>
+        private FavNode NewFolder() { return NewFolder(sel); }
+
+        private FavNode NewFolder(FavNode parent)
+        {
+            if (parent == null || !parent.IsFolder) parent = FavStore.BarFolder;
+            string name = InputBox.Ask(this, "新建文件夹", "文件夹名字", "新建文件夹");
+            if (string.IsNullOrEmpty(name)) return null;
+            name = name.Trim();
+            if (name.Length == 0) return null;
+            FavNode n = new FavNode();
+            n.Name = name;
+            FavNode p = parent;
+            FavStore.Edit(delegate(List<FavNode> l) { p.Kids.Add(n); });
+            Rebuild();
+            Invalidate();
+            return n;
+        }
+
+        // ==================================================================
+        // 拖文件夹进来 = 加进光标底下那个文件夹（这就是「嵌套」的做法）
+        // ==================================================================
+
+        protected override void OnDragEnter(DragEventArgs e)
+        {
+            base.OnDragEnter(e);
+            e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        protected override void OnDragOver(DragEventArgs e)
+        {
+            base.OnDragOver(e);
+            e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        private static bool HasFiles(DragEventArgs e)
+        {
+            try { return e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop); }
+            catch { return false; }
+        }
+
+        protected override void OnDragDrop(DragEventArgs e)
+        {
+            base.OnDragDrop(e);
+            try
+            {
+                string[] paths = (string[])e.Data.GetData(DataFormats.FileDrop);
+                if (paths == null || paths.Length == 0) return;
+
+                Point p = PointToClient(new Point(e.X, e.Y));
+                Row r = RowAt(p);
+                FavNode parent = (r != null && r.Node.IsFolder) ? r.Node : sel;
+                if (parent == null) parent = FavStore.BarFolder;
+
+                int added = 0;
+                foreach (string raw in paths)
+                {
+                    string nm;
+                    if (AddInto(parent, raw, out nm)) added++;
+                }
+                Diag.Step("收藏夹管理器: 拖入 " + paths.Length + " 项 -> 加进「" + FavStore.NameOf(parent) + "」" + added + " 项");
+                if (added > 0) Toast.Show("已加入收藏夹", added == 1 ? FavStore.NameOf(parent) : ("共 " + added + " 项"));
+                Rebuild();
+                Invalidate();
+            }
+            catch (Exception ex) { Diag.Log("收藏夹管理器: 拖放失败 " + ex.Message); }
+        }
+
+        /// <summary>把一个路径加进指定文件夹（重复的不再加）。</summary>
+        private static bool AddInto(FavNode folder, string rawPath, out string name)
+        {
+            name = null;
+            string p = rawPath == null ? null : rawPath.Trim().Trim('"');
+            if (string.IsNullOrEmpty(p)) return false;
+            bool isDir = FavStore.IsFolder(p);
+            if (!isDir)
+            {
+                try { if (!System.IO.File.Exists(p)) return false; }
+                catch { return false; }
+            }
+            string full;
+            try { full = System.IO.Path.GetFullPath(p); }
+            catch { return false; }
+            name = FavStore.NameOfPath(full);
+
+            bool added = false;
+            FavStore.Edit(delegate(List<FavNode> l)
+            {
+                for (int i = 0; i < folder.Kids.Count; i++)
+                    if (!folder.Kids[i].IsFolder && PathRules.Same(folder.Kids[i].Path, full)) return;
+                FavNode n = new FavNode();
+                n.Path = full;
+                folder.Kids.Add(n);
+                added = true;
+            });
+            return added;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (font != null) font.Dispose();
+                if (fontDim != null) fontDim.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}

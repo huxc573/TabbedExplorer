@@ -141,56 +141,46 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 拼出「历史记录」那份菜单。
-        /// 用 `MenuItem`（跟托盘/齿轮同一套），不是 `ContextMenuStrip` —— 见 SettingsMenu 里那段坑的说明。
+        /// 拼出「历史记录」那份菜单 —— 走 `PopMenu`。
+        /// 2026-09-22 从老的 `ContextMenu`/`MenuItem` 换过来：那条路上**点条目不触发 Click**
+        /// （川报的「历史记录点开后所有功能都不可用」），原因见 `PopMenu` 类注释。
+        /// `open == null` 的条目就是灰着的标题/说明行。
         /// </summary>
-        public static MenuItem[] BuildMenu(Action<string> open)
+        public static PopItem[] BuildMenu(Action<string> open)
         {
-            List<MenuItem> r = new List<MenuItem>();
+            List<PopItem> r = new List<PopItem>();
             List<string> list = Recent;
 
-            MenuItem top = new MenuItem("历史记录（Ctrl+H）");
-            top.Enabled = false;
-            r.Add(top);
-            r.Add(new MenuItem("-"));
+            r.Add(PopMenu.It("历史记录（" + Hotkeys.Combo("history") + "）", null));
+            r.Add(PopMenu.Split());
 
             if (list.Count == 0)
             {
-                MenuItem none = new MenuItem("（还没有记录）");
-                none.Enabled = false;
-                r.Add(none);
+                r.Add(PopMenu.It("（还没有记录）", null));
             }
             else
             {
                 int n = Math.Min(list.Count, MenuMax);
                 for (int i = 0; i < n; i++)
                 {
-                    string p = list[i];
-                    MenuItem mi = new MenuItem(Elide(p, 72));
-                    if (open != null)
-                    {
-                        string target = p;
-                        mi.Click += delegate { open(target); };
-                    }
-                    r.Add(mi);
+                    string target = list[i];
+                    // ⚠ 这个三元要显式转成 Action：`null` 和匿名方法之间没有隐式转换（CS0173）。
+                    Action act = open == null ? (Action)null : delegate { open(target); };
+                    r.Add(PopMenu.It(Elide(target, 72), act));
                 }
                 if (list.Count > n)
-                {
-                    MenuItem more = new MenuItem("（还有 " + (list.Count - n) + " 条更早的，看 data\\history.json）");
-                    more.Enabled = false;
-                    r.Add(more);
-                }
+                    r.Add(PopMenu.It("（还有 " + (list.Count - n) + " 条更早的，看 data\\history.json）", null));
             }
 
-            r.Add(new MenuItem("-"));
+            r.Add(PopMenu.Split());
             // 直接打开那个 json（系统默认程序），比弹一个「在资源管理器里定位」省事，
             // 也避免我们自己又去起一个 explorer 窗口被自己的捕获逻辑再抓一遍。
-            r.Add(new MenuItem("打开历史记录文件", delegate
+            r.Add(PopMenu.It("打开历史记录文件", delegate
             {
                 try { System.Diagnostics.Process.Start(FileName); }
                 catch (Exception ex) { Toast.Show("打不开历史文件", ex.Message); }
             }));
-            r.Add(new MenuItem("清空历史记录", delegate
+            r.Add(PopMenu.It("清空历史记录", delegate
             {
                 Clear();
             }));

@@ -208,12 +208,16 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 收藏夹 -> " + path);
                 NewTab(path);
             };
-            // 最左边那枚收藏夹图标：点一下开数据目录（川要的「最左加个收藏夹图标」，
-            // 点了有实际去处 —— 别做成一个点了没反应的装饰）
+            // 最左边那枚收藏夹图标：点一下开**收藏夹管理器**
+            // （川 2026-09-22：原来点是开数据目录，改成「管理收藏夹」）
             favBar.LeadClicked += delegate
             {
-                Diag.Step("EmbedForm: 收藏夹图标 -> 打开数据目录");
-                NewTab(AppPaths.DataDir);
+                Diag.Step("EmbedForm: 收藏夹图标 -> 管理收藏夹");
+                if (hub != null) hub.OpenFavManager();
+            };
+            favBar.ManageRequested += delegate
+            {
+                if (hub != null) hub.OpenFavManager();
             };
             // 收藏夹栏上右键「隐藏收藏夹栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
             favBar.HideRequested += delegate
@@ -583,17 +587,50 @@ namespace TabbedExplorer
             }
             if (b != null && b.Paths.Count > 0)
             {
-                int skipped = 0, wantIdx = -1;
-                foreach (string p in b.Paths)
+                int skipped = 0;
+
+                // ---- 先把「记忆里当时选中那个」挑出来，让它**第一个入队** ----
+                // 川 2026-09-22：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
+                // 串行队列（PumpLaunch）是**按入队顺序**起 explorer 的 —— 先建谁谁先出来。
+                // 所以这里先建「该激活的那个」，等其余都建完再把它挪回原来的位置（见 MoveTabSynced）。
+                int activeAt = -1;
+                string activePath = null;
+                for (int i = 0; i < b.Paths.Count; i++)
                 {
+                    if (!PathRules.Restorable(b.Paths[i])) continue;
+                    if (!string.IsNullOrEmpty(b.Active) && PathRules.Same(b.Paths[i], b.Active))
+                    {
+                        activeAt = i;
+                        activePath = b.Paths[i];
+                        break;
+                    }
+                }
+
+                // 它「应该在」第几号位 = 排在它前面、且真能开出来的项有几个（重复项不算）
+                int wantIdx = 0;
+                for (int i = 0; i < activeAt; i++)
+                {
+                    string q = b.Paths[i];
+                    if (!PathRules.Restorable(q)) continue;
+                    if (IndexOfPath(q) >= 0) continue;
+                    wantIdx++;
+                }
+
+                // 建标签的顺序：active 打头，其余照记忆里的顺序
+                List<string> order = new List<string>();
+                if (activePath != null) order.Add(activePath);
+                for (int i = 0; i < b.Paths.Count; i++)
+                    if (i != activeAt) order.Add(b.Paths[i]);
+
+                for (int i = 0; i < order.Count; i++)
+                {
+                    string p = order[i];
                     if (!PathRules.Restorable(p))
                     {
                         skipped++;
                         Diag.Step("记忆: 跳过开不了的项「" + p + "」（可能是个库/虚拟文件夹，没有真实路径）");
                         continue;
                     }
-                    if (wantIdx < 0 && !string.IsNullOrEmpty(b.Active) && PathRules.Same(p, b.Active))
-                        wantIdx = hosts.Count;    // 记下的「当时选中那个」是第几个
                     // 同一个路径已经有标签了就别再开一个。
                     // 记忆文件里偶尔会有重复行（老版本并发开标签时写坏的），去重放在这儿最稳：
                     // 不管文件脏成什么样，界面上都不会冒出两个一模一样的标签。
@@ -605,11 +642,17 @@ namespace TabbedExplorer
                     }
                     NewTab(p);
                 }
-                Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个）",
-                    DesktopKey, hosts.Count, skipped));
+
+                // active 现在是第 0 个（它最先建），挪回它该在的位置
+                if (activePath != null && wantIdx > 0 && hosts.Count > 0)
+                    MoveTabSynced(0, Math.Min(wantIdx, hosts.Count - 1));
+
+                int act = (activePath == null) ? -1 : IndexOfPath(activePath);
+                Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个），优先起的是第 {3} 个",
+                    DesktopKey, hosts.Count, skipped, act));
                 if (hosts.Count > 0)
                 {
-                    if (wantIdx >= 0) Activate(Math.Min(wantIdx, hosts.Count - 1));
+                    Activate(act >= 0 ? act : 0);
                     return;
                 }
             }
@@ -793,6 +836,21 @@ namespace TabbedExplorer
         private void MarkDirty()
         {
             if (hub != null) hub.MarkDirty();
+        }
+
+        /// <summary>
+        /// 把第 from 个标签挪到 to —— **`hosts` 和标签条一起挪**（两边的顺序必须始终一致）。
+        /// 只给「还原记忆」用：先把该激活的那个建出来（抢到串行队列的头名），再挪回它该在的位置。
+        /// </summary>
+        private void MoveTabSynced(int from, int to)
+        {
+            if (from == to) return;
+            if (from < 0 || from >= hosts.Count) return;
+            if (to < 0 || to >= hosts.Count) return;
+            ExplorerHost h = hosts[from];
+            hosts.RemoveAt(from);
+            hosts.Insert(to, h);
+            tabStrip.MoveTab(from, to);
         }
 
         // ==================================================================
@@ -1271,12 +1329,12 @@ namespace TabbedExplorer
         /// 锚点跟齿轮那条同一个算法：按**按钮中心**定位，菜单自己会往回挪（不会跑出屏幕）。
         /// 菜单一律走 `MenuFx`（自绘 + 前后各一行日志）。
         /// </summary>
-        private void ShowPopupAtTool(TabStrip.Tool tool, MenuItem[] items, string what)
+        private void ShowPopupAtTool(TabStrip.Tool tool, PopItem[] items, string what)
         {
             if (items == null || items.Length == 0) return;
             Rectangle b = tabStrip.ToolButtonBounds(tool);
             Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            MenuFx.Show(MenuFx.Build(items), tabStrip, tabStrip.PointToClient(at), what);
+            PopMenu.Show(items, tabStrip, tabStrip.PointToClient(at), what);
         }
 
         /// <summary>Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出）。</summary>
@@ -1302,10 +1360,13 @@ namespace TabbedExplorer
         /// 川 2026-09-22 连着两轮报「右键菜单功能没实现」—— 这里加一行日志是为了以后不用猜：
         /// 「菜单弹出来了但点了没反应」和「点了、动作自己失败了」在日志里是两回事。
         /// </summary>
-        private static MenuItem Mi(string text, Action a) { return MenuFx.Item(text, a); }
+        private static PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
+
+        /// <summary>带勾选的菜单项（「显示收藏夹栏」那种）。</summary>
+        private static PopItem Mi(string text, Action a, bool on) { return PopMenu.It(text, a, on); }
 
         /// <summary>分隔线（菜单项一律走 Mi，分隔线也收在这儿）。</summary>
-        private static MenuItem SepItem() { return MenuFx.Sep(); }
+        private static PopItem SepItem() { return PopMenu.Split(); }
 
         /// <summary>某个 ExplorerHost 现在在 hosts 里排第几（关标签会把索引挪位，按引用找）。</summary>
         private int IndexOfHost(ExplorerHost h)
@@ -1322,7 +1383,7 @@ namespace TabbedExplorer
             string live = LivePath(hosts[idx]);
             string target = PathRules.Restorable(live) ? live : hosts[idx].TargetPath;
 
-            List<MenuItem> m = new List<MenuItem>();
+            List<PopItem> m = new List<PopItem>();
             m.Add(Mi("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
             m.Add(Mi("复制完整路径", delegate { CopyText(target, "完整路径"); }));
             m.Add(SepItem());
@@ -1364,7 +1425,7 @@ namespace TabbedExplorer
 
             Rectangle b = tabStrip.TabBounds(idx);
             Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
+            PopMenu.Show(m.ToArray(), tabStrip, tabStrip.PointToClient(at),
                 "标签右键 idx=" + idx);
         }
 
@@ -1427,7 +1488,7 @@ namespace TabbedExplorer
         private void ShowBlankMenu()
         {
             if (IsDisposed || Disposing) return;
-            List<MenuItem> m = new List<MenuItem>();
+            List<PopItem> m = new List<PopItem>();
             m.Add(Mi("新建标签页(" + Hotkeys.Combo("newtab") + ")",
                 delegate { Defer(delegate { NewTab(ExplorerView.ThisPcPath); }); }));
             m.Add(SepItem());
@@ -1435,14 +1496,12 @@ namespace TabbedExplorer
             m.Add(Mi("恢复关闭的标签页(" + Hotkeys.Combo("reopen") + ")", delegate { Defer(ReopenClosedTab); }));
 
             bool on = favBarOn;
-            // 勾选走 `MenuItem.Checked`（自绘那一列会画勾，见 MenuFx）——
+            // 勾选走 `PopItem.On`（PopMenu 把它落到 `Checked`，菜单自己画勾）——
             // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（川报过）。
-            MenuItem favItem = Mi("显示收藏夹栏(" + Hotkeys.Combo("favbar") + ")", delegate
+            m.Add(Mi("显示收藏夹栏(" + Hotkeys.Combo("favbar") + ")", delegate
             {
                 if (hub != null) hub.SetFavBar(!on);
-            });
-            favItem.Checked = on;
-            m.Add(favItem);
+            }, on));
 
             // 三个关标签的动作（跟标签右键同一套，作用于**当前标签**）
             int cur = activeIndex;
@@ -1458,7 +1517,7 @@ namespace TabbedExplorer
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
             Point at = tabStrip.PointToScreen(blankAt);
-            MenuFx.Show(MenuFx.Build(m.ToArray()), tabStrip, tabStrip.PointToClient(at),
+            PopMenu.Show(m.ToArray(), tabStrip, tabStrip.PointToClient(at),
                 "标签条空白右键");
         }
 
@@ -1471,6 +1530,24 @@ namespace TabbedExplorer
                 Toast.Show("已复制" + what, text);
             }
             catch (Exception ex) { Diag.Log("EmbedForm: 复制失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 外面（收藏夹管理器）让这个窗口把一个路径开成新标签。
+        /// 跟 `OpenFromHistory` 同一条路：已经有一样的标签就切过去，别开两个。
+        /// </summary>
+        internal void OpenPathAsTab(string p)
+        {
+            if (IsDisposed || Disposing || string.IsNullOrEmpty(p)) return;
+            if (!Visible) Show();
+            if (!PathRules.Restorable(p))
+            {
+                Diag.Step("EmbedForm: 这个位置开不了（没有真实路径），跳过：" + p);
+                return;
+            }
+            int dup = IndexOfPath(p);
+            if (dup >= 0) Activate(dup);
+            else NewTab(p);
         }
 
         /// <summary>

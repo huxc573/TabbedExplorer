@@ -112,6 +112,72 @@ namespace TabbedExplorer
                 SetWindowLong32(h, GWL_STYLE, unchecked((int)style));
         }
 
+        // ==================================================================
+        // 扩展样式（防闪用，见 DesktopHub.OnWindowShown 里那段「为什么光 SW_HIDE 不够」）
+        // ==================================================================
+
+        public const int GWL_EXSTYLE = -20;
+        public const uint WS_EX_LAYERED = 0x00080000;
+        public const uint LWA_ALPHA = 0x00000002;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+
+        /// <summary>GW_OWNER —— 取属主窗口。</summary>
+        public const uint GW_OWNER = 4;
+
+        public static uint GetExStyle(IntPtr h)
+        {
+            long v = (IntPtr.Size == 8) ? GetWindowLongPtr64(h, GWL_EXSTYLE).ToInt64()
+                                        : GetWindowLong32(h, GWL_EXSTYLE);
+            return unchecked((uint)v);
+        }
+
+        public static void SetExStyle(IntPtr h, uint ex)
+        {
+            if (IntPtr.Size == 8)
+                SetWindowLongPtr64(h, GWL_EXSTYLE, new IntPtr(unchecked((int)ex)));
+            else
+                SetWindowLong32(h, GWL_EXSTYLE, unchecked((int)ex));
+        }
+
+        /// <summary>
+        /// 让窗口「就算被 Show 出来也是全透明的」：加 `WS_EX_LAYERED` + alpha=0。
+        ///
+        /// ★ 这是防闪的**兜底那一半**。光 `SW_HIDE` 挡不住 —— 日志实测（2026-09-22）每条都是
+        /// 「事件后 0ms，**当时已可见**」：WinEvent 是投递到消息队列的，等我们收到 SHOW，
+        /// explorer 那一帧**已经画在屏幕上了**。加了这层之后，无论它怎么 Show，画面都是透明的。
+        ///
+        /// ⚠ 收编进标签之前 / 放它走之前**必须** `ClearTransparent`，
+        ///   否则嵌进来的窗口会永远是隐形的（这个坑比闪一下严重得多）。
+        /// </summary>
+        public static void MakeTransparent(IntPtr h)
+        {
+            try
+            {
+                uint ex = GetExStyle(h);
+                if ((ex & WS_EX_LAYERED) != 0) return;      // 已经是分层的，别重复设
+                SetExStyle(h, ex | WS_EX_LAYERED);
+                SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            }
+            catch { }
+        }
+
+        /// <summary>把 <see cref="MakeTransparent"/> 加的那层去掉（本来就带 WS_EX_LAYERED 的窗口不动）。</summary>
+        public static void ClearTransparent(IntPtr h)
+        {
+            try
+            {
+                uint ex = GetExStyle(h);
+                if ((ex & WS_EX_LAYERED) == 0) return;
+                SetExStyle(h, ex & ~(uint)WS_EX_LAYERED);
+            }
+            catch { }
+        }
+
         /// <summary>把顶层窗口降级成子窗口：清掉边框类样式、加上 WS_CHILD。
         /// 必须在 SetParent 之前做（MSDN 对 SetParent 的硬要求）。</summary>
         public static uint ToChildStyle(uint style)

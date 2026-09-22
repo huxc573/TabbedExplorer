@@ -137,6 +137,12 @@ namespace TabbedExplorer
         /// 10px 正好是 Win10 原生标题栏里这三个字形的尺寸（96dpi 下量到约 10px）。
         /// </summary>
         private readonly Font wbtnFont;
+        /// <summary>
+        /// 收藏夹那枚星（E734/E735）单独用大一档的字号 ——
+        /// 它是空心/实心五角星，ink 天生比齿轮（自绘）、历史（E81C 圆盘）、恢复（E7A7 弯箭头）小一圈，
+        /// 同一个字号并排会明显看着小（川 2026-09-22：「右上三颗窗控图标已经一样大了，收藏夹图标有点小」）。
+        /// </summary>
+        private readonly Font favGlyphFont;
 
         /// <summary>窗口没激活（失活）时整体降色 —— 底色和文字都跟原生标题栏一个逻辑。</summary>
         public bool Inactive
@@ -200,6 +206,7 @@ namespace TabbedExplorer
             tipTitleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
             glyphFont = new Font("Segoe MDL2 Assets", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             wbtnFont = new Font("Segoe MDL2 Assets", Px(10), FontStyle.Regular, GraphicsUnit.Pixel);
+            favGlyphFont = new Font("Segoe MDL2 Assets", Px(14), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
             tips.InitialDelay = 350;    // 停一下再弹，别鼠标一扫过就满屏提示
@@ -263,13 +270,36 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             tabs.RemoveAt(index);
             if (hoverIndex == index) hoverIndex = -1;
-            scrollX = 0;                 // 标签少了一个，底下那些也可能能露出来了
+            // 不用把 scrollX 归零：下一次 EnsureLayout 会把它夹到新的 maxScroll 上
+            // （归零反而会让川刚滑到的位置白滑 —— 关一个标签不该把视口弹回最左边）。
             Invalidate();
         }
 
         public void SetActive(int index)
         {
             for (int i = 0; i < tabs.Count; i++) tabs[i].Active = (i == index);
+            ScrollActiveIntoView();   // 选中的标签不许停在屏幕外（浏览器都这么做）
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 把当前选中的标签**滚进可视区**。
+        /// 少了这一步就会出现「点了个被挡住的标签，人还在原地、看着像什么都没发生」。
+        /// 只在溢出时动 scrollX，刚好露不完全就贴边，别每次都居中（那样鼠标下会乱跳）。
+        /// </summary>
+        public void ScrollActiveIntoView()
+        {
+            EnsureLayout();
+            if (maxScroll <= 0) return;
+            int i = ActiveIndex;
+            if (i < 0 || i >= bounds.Count) return;
+            int nx = scrollX;
+            if (bounds[i].Left < 0) nx = scrollX + bounds[i].Left;
+            else if (bounds[i].Right > tabsClipRight) nx = scrollX + (bounds[i].Right - tabsClipRight);
+            if (nx < 0) nx = 0;
+            if (nx > maxScroll) nx = maxScroll;
+            if (nx == scrollX) return;
+            scrollX = nx;
             Invalidate();
         }
 
@@ -341,8 +371,13 @@ namespace TabbedExplorer
                     // 图标 + 左右留白 + 右边给关闭按钮留位
                     int need = Px(TextPadLeft) + IconSize + Px(IconGap) + t + CloseAreaWidth + Px(4);
                     w = Math.Max(MaxTabWidth, Math.Min(WidenMaxWidth, need));
-                    // 再夹一次「标签区可用宽度」：一个超长名字也不许把别的标签全挤出去
-                    if (w > avail) w = Math.Max(MinTabWidth, avail);
+                    // ⚠ 2026-09-22 川报「过长依然出现遮挡问题（没收到滚动条范围内）」：
+                    //   原来这里还把 w 再夹一次「标签区可用宽度」（`if (w > avail) w = avail`），
+                    //   于是超长名字的标签被硬切成 avail 宽 —— `total == avail`，
+                    //   `maxScroll` 只剩 Px(4)，**被吃掉的那一截滚也滚不出来**，看着就是「被遮挡」。
+                    //   现在不夹了：名字有多长标签就有多宽（上限 `TabWidenMax`），
+                    //   超出可视区的那部分交给横向滚动露出来 —— 这正是「自动加宽 + 滚动」的分工。
+                    //   想「谁也别挤谁」就把「自动缩窄」打开，那条路是 `TabAutoFit`，别在这儿夹。
                 }
                 if (w < MinTabWidth) w = MinTabWidth;
                 want[i] = w;
@@ -420,6 +455,16 @@ namespace TabbedExplorer
 
         private int scrollX;
         private int maxScroll;
+
+        // ---- 横向滚动条（川 2026-09-22：平时隐藏、鼠标进标签条才显示、能点能拖）----
+        /// <summary>鼠标在不在标签条里 —— 决定这条滚动条显不显示（平时是隐的）。</summary>
+        private bool pointerIn;
+        /// <summary>鼠标压在滚动条轨道上（亮一点）。</summary>
+        private bool barHot;
+        /// <summary>正在拖滑块。</summary>
+        private bool barDrag;
+        /// <summary>按下滑块时，光标离滑块左边缘多远（拖的时候保持这个偏移，手感才不跳）。</summary>
+        private int barGrabDX;
 
         private Rectangle NewButtonBounds()
         {
@@ -659,7 +704,7 @@ namespace TabbedExplorer
             // ---- 标签溢出时的位置指示条（川 2026-09-22 要的「隐藏进度条」）----
             // 就画在标签区**贴底**一条细条上：底 = 标签区宽度，滑块 = 当前能看到的那一段。
             // 它在裁剪区之外（先 Clip 恢复再画），不然滑块永远只能看到左边一截。
-            DrawScrollIndicator(g, tabsClipRight, stroke);
+            DrawScrollBar(g);
 
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
@@ -682,7 +727,8 @@ namespace TabbedExplorer
                 if (i == hoverTool) g.FillRectangle(new SolidBrush(Theme.Hover), b);
                 Color fg = (i == hoverTool) ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim);
                 if (i == (int)Tool.Fav && favBarOn) fg = inactive ? Theme.AccentDim : Theme.Accent;
-                TextRenderer.DrawText(g, GlyphOf((Tool)i), glyphFont, b, fg,
+                Font gf = (i == (int)Tool.Fav) ? favGlyphFont : glyphFont;
+                TextRenderer.DrawText(g, GlyphOf((Tool)i), gf, b, fg,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
 
@@ -716,31 +762,74 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 标签溢出时贴在标签区底部的一条**位置指示条**（川 2026-09-22 要的「隐藏进度条」）。
+        /// 算滚动条的**轨道 / 滑块**矩形（没溢出就返回 false）。
+        /// ⚠ 画和命中判定都走这一份 —— 两处各算一次的话，看到的滑块和点得着的滑块迟早会差几个像素。
         /// 轨道 = 标签区宽度，滑块宽 = 「看得见的那一段 / 全部」的比例，滑块位置 = 滚到哪儿了。
-        /// 没溢出就不画（没超出屏幕的时候画一条进度条只会是干扰）。
         /// </summary>
-        private void DrawScrollIndicator(Graphics g, int areaRight, float stroke)
+        private bool LayoutScrollBar(out Rectangle track, out Rectangle thumb)
         {
-            if (maxScroll <= 0 || tabs.Count < 2) return;
+            track = Rectangle.Empty; thumb = Rectangle.Empty;
+            if (maxScroll <= 0 || tabs.Count < 2) return false;
             int x0 = Px(2);
-            int w = areaRight - x0 - Px(2);
-            if (w < Px(24)) return;
+            int w = tabsClipRight - x0 - Px(2);
+            if (w < Px(24)) return false;
 
-            int h = Math.Max(2, Px(3));
+            int h = Math.Max(3, Px(5));
             int y = Height - h - Math.Max(0, Px(1));
+            track = new Rectangle(x0, y, w, h);
+
             int content = w + maxScroll;
-            if (content <= 0) return;
+            if (content <= 0) return false;
 
             int thumbW = (int)((long)w * w / content);
-            if (thumbW < Px(24)) thumbW = Math.Min(Px(24), w);
+            int minThumb = Math.Min(Px(28), w);
+            if (thumbW < minThumb) thumbW = minThumb;
             int span = Math.Max(1, maxScroll);
             int thumbX = x0 + (int)((long)(w - thumbW) * Math.Min(scrollX, span) / span);
+            thumb = new Rectangle(thumbX, y, thumbW, h);
+            return true;
+        }
 
-            using (SolidBrush b = new SolidBrush(Color.FromArgb(inactive ? 38 : 54, Theme.Text)))
-                g.FillRectangle(b, x0, y, w, h);
-            using (SolidBrush b = new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent))
-                g.FillRectangle(b, thumbX, y, thumbW, h);
+        /// <summary>
+        /// 画标签溢出时那条横向滚动条（川 2026-09-22：**平时隐藏**，鼠标进标签条才显示；
+        /// 参考浏览器那个「细条压在内容底边」的做法）。
+        /// 没溢出 / 鼠标不在条里就不画 —— 没超出屏幕时画一条只会是干扰。
+        /// </summary>
+        private void DrawScrollBar(Graphics g)
+        {
+            Rectangle track, thumb;
+            if (!LayoutScrollBar(out track, out thumb)) return;
+            if (!pointerIn && !barDrag) return;      // 平时是隐的
+
+            bool hot = barHot || barDrag;
+            int alpha = hot ? (inactive ? 90 : 130) : (inactive ? 52 : 80);
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(alpha, Theme.Text)))
+                g.FillRectangle(b, track);
+            using (SolidBrush b = new SolidBrush(hot ? (inactive ? Theme.AccentDim : Theme.Accent)
+                                                     : Color.FromArgb(inactive ? 150 : 210,
+                                                         inactive ? Theme.AccentDim : Theme.Accent)))
+                g.FillRectangle(b, thumb);
+        }
+
+        /// <summary>
+        /// 把滑块挪到「左边缘 = wantLeft」对应的滚动位置。
+        /// ⚠ 滑块宽 ≠ 可视宽（有缩放比），所以要按 **轨道可走距离 ↔ 内容可滚距离** 换算回来。
+        /// </summary>
+        private void ScrollThumbTo(int wantLeft, Rectangle track, Rectangle thumb)
+        {
+            int travel = track.Width - thumb.Width;
+            if (travel <= 0) return;
+            int left = wantLeft - track.Left;
+            if (left < 0) left = 0;
+            if (left > travel) left = travel;
+
+            int span = Math.Max(1, maxScroll);
+            int nx = (int)((long)left * span / travel);
+            if (nx < 0) nx = 0;
+            if (nx > maxScroll) nx = maxScroll;
+            if (nx == scrollX) return;
+            scrollX = nx;
+            Invalidate();
         }
 
         /// <summary>
@@ -797,6 +886,16 @@ namespace TabbedExplorer
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            pointerIn = true;
+
+            // ---- 拖滚动条最优先（滑块就压在标签底下那一条上）----
+            if (barDrag)
+            {
+                Rectangle tr, th;
+                if (LayoutScrollBar(out tr, out th)) ScrollThumbTo(e.Location.X - barGrabDX, tr, th);
+                return;
+            }
+
             int idx = HitTest(e.Location);
             bool changed = false;
 
@@ -809,6 +908,14 @@ namespace TabbedExplorer
             if (ht != hoverTool) { hoverTool = ht; changed = true; }
             int hw = WBtnAt(e.Location);
             if (hw != hoverWBtn) { hoverWBtn = hw; changed = true; }
+
+            bool bh = false;
+            if (maxScroll > 0)
+            {
+                Rectangle bt, bth;
+                if (LayoutScrollBar(out bt, out bth)) bh = bt.Contains(e.Location);
+            }
+            if (bh != barHot) { barHot = bh; changed = true; }
 
             // 空白处按住并真的拖了（超过几个像素才算拖，否则双击空白那一下会被当成拖窗口）
             if (blankDrag && (e.Button & MouseButtons.Left) != 0)
@@ -869,10 +976,18 @@ namespace TabbedExplorer
             }
         }
 
+        /// <summary>鼠标进标签条 —— 溢出的话滚动条从这儿开始显示（平时是隐的）。</summary>
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            if (!pointerIn) { pointerIn = true; Invalidate(); }
+        }
+
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
             hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverTool = -1; hoverWBtn = -1;
+            pointerIn = false; barHot = false; barDrag = false;
             ShowTip(null, null, Rectangle.Empty);
             Invalidate();
         }
@@ -881,6 +996,27 @@ namespace TabbedExplorer
         {
             base.OnMouseDown(e);
             ShowTip(null, null, Rectangle.Empty);
+
+            // ---- 滚动条优先：它压在标签底下那一条上，命中判定必须排在标签前面 ----
+            if (e.Button == MouseButtons.Left && overflow)
+            {
+                Rectangle tr, th;
+                if (LayoutScrollBar(out tr, out th) && tr.Contains(e.Location))
+                {
+                    barDrag = true;
+                    barHot = true;
+                    if (th.Contains(e.Location))
+                        barGrabDX = e.Location.X - th.Left;      // 按在滑块上：保持抓取偏移
+                    else
+                    {
+                        barGrabDX = th.Width / 2;                // 按在轨道上：滑块中心跟到这儿
+                        ScrollThumbTo(e.Location.X - barGrabDX, tr, th);
+                    }
+                    Capture = true;                              // 拖出标签条也要继续跟手
+                    Invalidate();
+                    return;
+                }
+            }
 
             if (e.Button == MouseButtons.Right)
             {
@@ -943,6 +1079,14 @@ namespace TabbedExplorer
         {
             base.OnMouseUp(e);
 
+            if (barDrag)
+            {
+                barDrag = false;
+                Capture = false;
+                Invalidate();
+                return;
+            }
+
             // ⚠ 右键菜单必须在 **MouseUp** 里发（2026-09-22 川报「空白处和标签右键功能均没有实现」）：
             // 在 MouseDown 里叫起菜单时，紧接着那条「右键抬起」消息会投到刚弹出来的菜单窗口上
             // （菜单自己抓着鼠标捕获），菜单把它当成「点在别处」→ 当场关掉。
@@ -994,6 +1138,7 @@ namespace TabbedExplorer
                 if (titleFont != null) titleFont.Dispose();
                 if (tipTitleFont != null) tipTitleFont.Dispose();
                 if (glyphFont != null) glyphFont.Dispose();
+                if (favGlyphFont != null) favGlyphFont.Dispose();
                 if (wbtnFont != null) wbtnFont.Dispose();
             }
             base.Dispose(disposing);

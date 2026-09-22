@@ -38,8 +38,8 @@ namespace TabbedExplorer
     /// </summary>
     internal sealed class WinShowWatcher : IDisposable
     {
-        private const uint EVENT_OBJECT_CREATE = 0x8000;
-        private const uint EVENT_OBJECT_SHOW = 0x8002;
+        internal const uint EVENT_OBJECT_CREATE = 0x8000;
+        internal const uint EVENT_OBJECT_SHOW = 0x8002;
         private const int OBJID_WINDOW = 0;     // idObject = 窗口本身
         private const int CHILDID_SELF = 0;
         private const uint WINEVENT_OUTOFCONTEXT = 0;
@@ -56,10 +56,12 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 某个窗口刚被创建 / 被显示了（在注册它的那个线程上触发）。
-        /// 第二个参数是**系统报这个事件的时刻**（`GetTickCount` 的口径），
-        /// 用来量「从窗口出现在屏幕上，到我们动手」中间隔了多少毫秒 —— 防闪到底快不快，看它就够了。
+        /// 参数：窗口句柄、**系统报这个事件的时刻**（`GetTickCount` 口径，用来量「从窗口出现在
+        /// 屏幕上到我们动手」隔了多少毫秒）、以及**事件类型**（`EVENT_OBJECT_CREATE` / `EVENT_OBJECT_SHOW`）。
+        /// ⚠ 第三个参数是 2026-09-22 加的：Hub 那条防闪路必须**分得清 CREATE 和 SHOW** ——
+        ///   只有 CREATE 那一刻窗口还没画出来，SHOW 到达时它已经在屏幕上了（日志实测）。
         /// </summary>
-        public event Action<IntPtr, int> WindowShown;
+        public event Action<IntPtr, int, uint> WindowShown;
 
         private WinEventDelegate proc;
         private IntPtr hook = IntPtr.Zero;
@@ -114,8 +116,8 @@ namespace TabbedExplorer
         {
             // 只要「窗口自身」的显示/创建，不要菜单项/列表项那种子对象的
             if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-            Action<IntPtr, int> a = WindowShown;
-            if (a != null) a(hwnd, (int)time);
+            Action<IntPtr, int, uint> a = WindowShown;
+            if (a != null) a(hwnd, (int)time, evt);
         }
 
         public void Dispose()

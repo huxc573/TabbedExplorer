@@ -147,6 +147,10 @@ namespace TabbedExplorer
             n.Add(Leaf("显示收藏夹栏（Ctrl+Shift+B）",
                        () => Settings.FavBar,
                        () => hub.SetFavBar(!Settings.FavBar)));
+            // 川 2026-09-22：原来这条是「打开收藏夹栏数据目录」，改成**管理收藏夹** ——
+            // 数据目录在他眼里只是个 json 文件，改不动也看不懂；给他一扇仿浏览器的管理窗更实用
+            // （树 + 搜索 + 重命名 + 嵌套 + 「设为收藏夹栏」）。窗口里那个「打开 json」按钮仍然直达文件。
+            n.Add(Leaf("管理收藏夹…", null, () => hub.OpenFavManager()));
             n.Add(Sep());
 
             // ⑦ 是否连「从开始菜单 / 桌面双击打开的文件夹」也收成标签

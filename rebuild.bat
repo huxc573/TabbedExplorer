@@ -6,9 +6,17 @@ set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
 if not exist "%CSC%" goto nocsc
 
+rem 先走**优雅退出**：它会先把标签记忆落盘、再把各标签里嵌进来的 explorer 收干净。
+rem 直接 taskkill /f 虽然也能腾出 exe，但那些跨进程嵌进来的 explorer 会漏成孤儿窗口。
 echo Stopping any running TabbedExplorer...
-taskkill /f /im TabbedExplorer.exe >nul 2>&1
-ping -n 2 127.0.0.1 >nul
+if exist "%~dp0TabbedExplorer.exe" "%~dp0TabbedExplorer.exe" --quit
+ping -n 3 127.0.0.1 >nul
+tasklist /fi "imagename eq TabbedExplorer.exe" 2>nul | find /i "TabbedExplorer.exe" >nul
+if not errorlevel 1 (
+  echo   优雅退出没收干净，强杀
+  taskkill /f /im TabbedExplorer.exe >nul 2>&1
+  ping -n 2 127.0.0.1 >nul
+)
 
 echo Building TabbedExplorer...
 echo.
@@ -23,8 +31,10 @@ if not "%RC%"=="0" goto failed
 if not exist "TabbedExplorer.exe" goto failed
 
 echo BUILD OK
-echo Starting TabbedExplorer... (tray icon, then press Win+E)
-start "" "%~dp0TabbedExplorer.exe"
+rem --open：编译完直接把窗口摆出来（不带就只驻托盘、什么都不显示，很容易误会「没启动成功」）。
+rem --embed 必须带（不带会走老路 AppContext + IExplorerBrowser，实测硬崩 0x80131506）。
+echo Starting TabbedExplorer... (window opens now, tray icon too)
+start "" "%~dp0TabbedExplorer.exe" --embed --open
 ping -n 3 127.0.0.1 >nul
 exit /b 0
 

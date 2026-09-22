@@ -323,6 +323,18 @@ namespace TabbedExplorer
         }
 
         /// <summary>上层（标签条）告诉我们图标要画多大（设备像素）。</summary>
+        /// <summary>
+        /// 颜色模式变了：把嵌进来的这个 explorer 窗口（含它整棵 shell 子树）重新上一次主题。
+        /// **尽力而为** —— 它是独立进程，它自己的进程级深色开关我们改不了，
+        /// 逐窗口 SetWindowTheme 只能改到外框/导航窗格，文件列表那一层仍按系统主题画。
+        /// </summary>
+        public void Restyle()
+        {
+            if (disposed || !embedded || CabWindow == IntPtr.Zero) return;
+            try { Theme.StyleShellTree(CabWindow); }
+            catch (Exception ex) { Diag.Log("Embed: 重新上色失败 " + ex.Message); }
+        }
+
         public void SetIconTarget(int px)
         {
             iconTarget = px;

@@ -43,10 +43,15 @@ namespace TabbedExplorer
         private readonly List<TabItem> tabs = new List<TabItem>();
         private readonly List<Rectangle> bounds = new List<Rectangle>();
 
+        /// <summary>鼠标停在某个标签上时，显示**完整文件夹名**（标题被省略号截了也看得到）。</summary>
+        private readonly ToolTip tips = new ToolTip();
+
         private int hoverIndex = -1;
         private int hoverCloseIndex = -1;
         private bool hoverNew;
         private bool hoverSettings;
+        /// <summary>当前弹着提示的那个标签（换标签/离开才重弹，不然鼠标一动就闪）。</summary>
+        private int tipIndex = -1;
         private int dragFromIndex = -1;
         private int dragOverIndex = -1;
 
@@ -58,8 +63,13 @@ namespace TabbedExplorer
         // 标签宽度：文件夹名一般不长，190 太奢侈（川：一半就够）。
         // 按宽度不够时自动压到 Min，再挤就继续缩（标题会省略号）。
         // 加文件夹图标后往上补了图标占的那一点（6+16+5 = 27），保证**文字可用宽度**不缩水。
-        private int MinTabWidth { get { return Px(72); } }
-        private int MaxTabWidth { get { return Px(112); } }
+        private int MinTabWidth { get { return Math.Min(Px(72), MaxTabWidth); } }
+        /// <summary>
+        /// 标签宽度。跟着设置走（逻辑像素 ×DPI）—— 川说的「可设置标签页宽度」。
+        /// 自适应开着时它当上限：挤不下就从它往下缩（下限见 MinTabWidth）。
+        /// 自适应关掉时就固定这个宽度（标签靠左排，多出来的被设置按钮盖住）。
+        /// </summary>
+        private int MaxTabWidth { get { return Px(Settings.TabWidth); } }
         /// <summary>「+」新建：现在紧跟在最后一个标签右边（浏览器那样），所以窄一点。</summary>
         private int NewButtonWidth { get { return Px(28); } }
         /// <summary>最右边那枚固定不动的设置按钮。</summary>
@@ -106,6 +116,9 @@ namespace TabbedExplorer
             Font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
+            tips.InitialDelay = 350;    // 停一下再弹，别鼠标一扫过就满屏提示
+            tips.ReshowDelay = 80;
+            tips.AutoPopDelay = 8000;
             Theme.Changed += delegate { BackColor = Theme.TabBar; Invalidate(); };
         }
 
@@ -177,7 +190,8 @@ namespace TabbedExplorer
             // 标签能用的宽度 = 整条 - 设置按钮 - 「+」- 起点/间隔那几px
             int avail = Math.Max(Px(60), Width - SettingsButtonWidth - NewButtonWidth - Px(8));
             int w = MaxTabWidth;
-            if (tabs.Count > 0)
+            // 自适应关掉时就固定宽度，不缩 —— 标签多于放得下的数量时，后面的会被设置按钮盖住。
+            if (tabs.Count > 0 && Settings.TabAutoFit)
             {
                 int need = tabs.Count * MaxTabWidth;
                 if (need > avail) w = Math.Max(MinTabWidth, avail / tabs.Count);
@@ -380,6 +394,19 @@ namespace TabbedExplorer
             if (hn != hoverNew) { hoverNew = hn; changed = true; }
             bool hs = SettingsBounds().Contains(e.Location);
             if (hs != hoverSettings) { hoverSettings = hs; changed = true; }
+
+            // 停在标签上就报完整文件夹名（提示贴着标签下边出来）
+            if (idx != tipIndex)
+            {
+                tipIndex = idx;
+                if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
+                {
+                    Rectangle tb = bounds[idx];
+                    tips.Show(tabs[idx].Title, this, tb.Left, tb.Bottom + Px(2), 8000);
+                }
+                else tips.Hide(this);
+            }
+
             if (changed) Invalidate();
 
             if (dragFromIndex >= 0 && idx >= 0 && idx != dragOverIndex)
@@ -393,12 +420,16 @@ namespace TabbedExplorer
         {
             base.OnMouseLeave(e);
             hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverSettings = false;
+            tipIndex = -1;
+            tips.Hide(this);
             Invalidate();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            tips.Hide(this);
+            tipIndex = -1;
             if (e.Button == MouseButtons.Left && SettingsBounds().Contains(e.Location))
             {
                 if (SettingsClicked != null) SettingsClicked(this, EventArgs.Empty);
@@ -439,6 +470,12 @@ namespace TabbedExplorer
             }
             dragFromIndex = -1; dragOverIndex = -1;
             Invalidate();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && tips != null) tips.Dispose();
+            base.Dispose(disposing);
         }
 
         protected override void OnDoubleClick(EventArgs e)

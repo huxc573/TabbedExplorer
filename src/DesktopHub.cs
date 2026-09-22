@@ -31,8 +31,9 @@ namespace TabbedExplorer
 
         private readonly DesktopMemory memory = new DesktopMemory();
 
-        /// <summary>全局开关（目前只有捕获方式）。</summary>
-        private readonly Settings settings = new Settings();
+        /// <summary>托盘右键菜单里那棵「设置」子树（设置变了只刷文字，不重建菜单）。</summary>
+        private SettingsMenu.TraySettings traySettings;
+        private ContextMenu trayMenu;
 
         /// <summary>迁移模式（v1.0.0）下，全进程唯一那个窗口在登记表里的键。</summary>
         private const string SingleKey = "single";
@@ -54,7 +55,7 @@ namespace TabbedExplorer
 
         public DesktopHub()
         {
-            settings.Load();
+            // 设置已经在 Program.Main 里 Load 过了（颜色模式得赶在 Theme 之前定下来）。
             memory.Load();
 
             saveTimer.Interval = 800;
@@ -87,15 +88,27 @@ namespace TabbedExplorer
             tray.Text = "TabbedExplorer（接 Win+E）";
             tray.Visible = true;
 
-            MenuItem miShow = new MenuItem("打开窗口（Win+E）");
-            miShow.Click += delegate { OnWinE(); };
-            MenuItem miSave = new MenuItem("记住当前标签");
-            miSave.Click += delegate { RememberNow(); };
-            MenuItem miQuit = new MenuItem("退出");
-            miQuit.Click += delegate { Quit("托盘菜单"); };
+            MenuItem miShow = new MenuItem("打开窗口（Win+E）", delegate { OnWinE(); });
+            MenuItem miSave = new MenuItem("记住当前标签", delegate { RememberNow(); });
+            MenuItem miQuit = new MenuItem("退出", delegate { Quit("托盘菜单"); });
 
-            tray.ContextMenu = new ContextMenu(new MenuItem[] { miShow, miSave, miQuit });
+            // 设置子菜单跟齿轮那份**同一份内容**（SettingsMenu 里生成），别各写一遍 ——
+            // 川报的「托盘右键没有设置选项」就是两边各写一遍漏出来的。
+            traySettings = SettingsMenu.BuildTraySettings(this);
+
+            trayMenu = new ContextMenu(new MenuItem[]
+            {
+                miShow, miSave, traySettings.Root, new MenuItem("-"), miQuit
+            });
+            tray.ContextMenu = trayMenu;
             tray.DoubleClick += delegate { OnWinE(); };
+        }
+
+        /// <summary>设置变了：把托盘菜单里带勾选前缀的文字重刷一遍（菜单结构不动）。</summary>
+        private void RefreshTrayMenu()
+        {
+            try { if (traySettings != null) traySettings.Refresh(); }
+            catch (Exception ex) { Diag.Log("Hub: 刷托盘菜单失败 " + ex.Message); }
         }
 
         private void SetupHook()
@@ -179,7 +192,7 @@ namespace TabbedExplorer
         {
             Prune();
 
-            if (settings.Capture == Settings.CaptureMode.Migrate)
+            if (Settings.Capture == Settings.CaptureMode.Migrate)
             {
                 EmbedForm only;
                 if (forms.TryGetValue(SingleKey, out only) && only != null && !only.IsDisposed) return only;
@@ -238,7 +251,7 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>当前的标签捕获方式（EmbedForm 也要看，决定 Win+E 时搬不搬窗口）。</summary>
-        public Settings.CaptureMode Capture { get { return settings.Capture; } }
+        public Settings.CaptureMode Capture { get { return Settings.Capture; } }
 
         /// <summary>
         /// 换捕获方式 —— 立刻生效，并且**把记忆搬个家**，免得川切一下发现标签「没了」：
@@ -249,10 +262,9 @@ namespace TabbedExplorer
         /// </summary>
         public void SetCaptureMode(Settings.CaptureMode m)
         {
-            if (settings.Capture == m) return;
-            Diag.Step("Hub: 捕获方式 " + Settings.Text(settings.Capture) + " -> " + Settings.Text(m));
-            settings.Capture = m;
-            settings.Save();
+            if (Settings.Capture == m) return;
+            Diag.Step("Hub: 捕获方式 " + Settings.Text(Settings.Capture) + " -> " + Settings.Text(m));
+            Settings.SetCapture(m);
 
             EmbedForm keep = ForegroundForm();
             if (keep == null || keep.IsDisposed)
@@ -294,9 +306,70 @@ namespace TabbedExplorer
             }
 
             MarkDirty();
+            RefreshTrayMenu();
             Notify("捕获方式已换", Settings.Label(m) + (m == Settings.CaptureMode.Migrate
                 ? "：全进程只一个窗口，Win+E 时搬到当前桌面。"
                 : "：每张虚拟桌面各一个窗口、各记一套标签。"), false);
+        }
+
+        // ==================================================================
+        // 其余设置（颜色模式 / 保留标签 / 标签宽度 / 自适应）
+        // ==================================================================
+
+        /// <summary>颜色模式：跟随系统 / 浅色 / 深色。改完立刻重算调色板并让各窗口重刷。</summary>
+        public void SetColorMode(Settings.ColorMode m)
+        {
+            if (Settings.Color == m) return;
+            Settings.SetColor(m);
+            Theme.SetMode(m);        // RaiseChanged -> 各窗口自己重刷（含 explorer 的逐窗口主题）
+            RefreshTrayMenu();
+            Notify("颜色模式", Settings.Label(m) + (m == Settings.ColorMode.System
+                ? "：跟着系统「应用模式」走。"
+                : "：我们自己画的外壳已切。⚠ 嵌进来的 explorer 是独立进程、按系统主题画，"
+                  + "它那块文件列表仍跟系统（改不了别人的进程开关）。"), false);
+        }
+
+        /// <summary>是否保留标签页。关掉 = 不还原记忆，每次打开都是全新一个「此电脑」。</summary>
+        public void SetKeepTabs(bool on)
+        {
+            if (Settings.KeepTabs == on) return;
+            Settings.SetKeepTabs(on);
+            RefreshTrayMenu();
+            Notify("保留标签页", on
+                ? "开：关掉程序也记住各桌面的标签，下次打开还原。"
+                : "关：下次打开不再还原标签，直接开一个「此电脑」。", false);
+        }
+
+        /// <summary>标签页宽度（逻辑像素）。立刻重排所有标签条。</summary>
+        public void SetTabWidth(int w)
+        {
+            int v = Settings.ClampWidth(w);
+            if (Settings.TabWidth == v) return;
+            Settings.SetTabWidth(v);
+            RefreshTrayMenu();
+            RetabAll();
+            Notify("标签页宽度", v + (Settings.TabAutoFit ? " 像素（挤不下会自动缩窄）" : " 像素（固定，不缩）"), false);
+        }
+
+        /// <summary>自适应宽度：挤不下时是否自动缩窄。</summary>
+        public void SetTabAutoFit(bool on)
+        {
+            if (Settings.TabAutoFit == on) return;
+            Settings.SetTabAutoFit(on);
+            RefreshTrayMenu();
+            RetabAll();
+            Notify("自适应宽度", on
+                ? "开：标签挤不下时自动缩窄。"
+                : "关：标签固定宽度，挤不下的那些会被右边的设置按钮盖住。", false);
+        }
+
+        private void RetabAll()
+        {
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f == null || f.IsDisposed) continue;
+                f.RefreshTabs();
+            }
         }
 
         /// <summary>把 from 桶的内容搬进 to 桶 —— **只在 to 还空着的时候**搬，不覆盖已记过的。</summary>

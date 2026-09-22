@@ -39,15 +39,46 @@ namespace TabbedExplorer
 
         public static event EventHandler Changed;
 
+        /// <summary>
+        /// 颜色模式（设置里那三个）：System = 读注册表跟随系统；Light / Dark = 强制定死。
+        /// 程序启动时先设它再 Reload；运行时改走 SetMode。
+        /// </summary>
+        public static Settings.ColorMode Mode = Settings.ColorMode.System;
+
         static Theme()
         {
             Reload();
         }
 
-        /// <summary>读注册表决定深浅，并重算调色板。返回是否发生了变化。</summary>
+        /// <summary>模式 + 系统状态 ⇒ 到底用不用深色。</summary>
+        private static bool ReadDark()
+        {
+            if (Mode == Settings.ColorMode.Dark) return true;
+            if (Mode == Settings.ColorMode.Light) return false;
+            return ReadSystemDark();
+        }
+
+        /// <summary>
+        /// 换颜色模式（菜单里点的那三个）。立刻重算调色板并通知所有自绘控件重画，
+        /// 顺便把进程级的 shell 深色开关也重设一遍（浅色必须显式设回 ForceLight，否则停在深色）。
+        ///
+        /// ⚠ 嵌入进来的 explorer 是**独立进程**，它自己按**系统**主题画，我们设不了别人进程的开关。
+        /// 所以强制浅/深只改得动我们自己画的外壳（标题栏/标签条/菜单），文件列表仍跟系统 ——
+        /// 调用方要重做一遍逐窗口的 SetWindowTheme 做尽力而为，并在界面里把这一点说清楚。
+        /// </summary>
+        public static void SetMode(Settings.ColorMode m)
+        {
+            Mode = m;
+            Reload();
+            try { DarkMode.SetEnabled(IsDark); } catch { }
+            Diag.Step("Theme: 颜色模式=" + Settings.Text(m) + " -> dark=" + IsDark);
+            RaiseChanged();
+        }
+
+        /// <summary>读注册表 / 强制模式决定深浅，并重算调色板。返回是否发生了变化。</summary>
         public static bool Reload()
         {
-            bool dark = ReadSystemDark();
+            bool dark = ReadDark();
             bool changed = (dark != IsDark) || !initialized;
             IsDark = dark;
             initialized = true;
@@ -201,7 +232,8 @@ namespace TabbedExplorer
         private static void AllowAndTheme(IntPtr h)
         {
             if (h == IntPtr.Zero) return;
-            DarkMode.AllowWindow(h);
+            // 明确传「要不要深」：强制浅色时必须让它回到浅色主题，否则停在深色。
+            DarkMode.AllowWindow(h, IsDark);
             StyleShellWindow(h);
         }
 

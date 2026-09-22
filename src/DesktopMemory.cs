@@ -82,7 +82,7 @@ namespace TabbedExplorer
     /// 存的是**地址栏上的那个字符串**、不是我们当初传给 explorer 的路径 —— 川在标签里一路点进去
     /// 之后，要记的是他最后停在哪儿。
     ///
-    /// 文件是纯文本 `%APPDATA%\TabbedExplorer\desktops.txt`，一行一个标签：
+    /// 文件是纯文本 `&lt;程序目录&gt;\data\desktops.txt`（绿色便携，见 AppPaths），一行一个标签：
     ///   <code>
     ///   # TabbedExplorer desktops v1
     ///   [090efe42-....]
@@ -103,14 +103,8 @@ namespace TabbedExplorer
 
         private const string Header = "# TabbedExplorer desktops v1";
 
-        public static string Folder
-        {
-            get
-            {
-                return Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TabbedExplorer");
-            }
-        }
+        /// <summary>数据目录：程序目录下的 `data\`（见 AppPaths）—— 拷走整个文件夹就把记忆带走了。</summary>
+        public static string Folder { get { return AppPaths.DataDir; } }
 
         public static string FileName { get { return Path.Combine(Folder, "desktops.txt"); } }
 

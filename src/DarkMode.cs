@@ -106,10 +106,19 @@ namespace TabbedExplorer
         /// <summary>让某个窗口（含 shell 视图的子窗口）接受深色主题。</summary>
         public static void AllowWindow(IntPtr hwnd)
         {
+            AllowWindow(hwnd, true);
+        }
+
+        /// <summary>
+        /// allow=false 时明确关掉这个窗口的深色。
+        /// 强制浅色模式必须走这条（光把进程级开关设回 ForceLight 不够，逐窗口的授权会把它拉住）。
+        /// </summary>
+        public static void AllowWindow(IntPtr hwnd, bool allow)
+        {
             if (hwnd == IntPtr.Zero) return;
             try
             {
-                if (allowDarkModeForWindow != null) allowDarkModeForWindow(hwnd, true);
+                if (allowDarkModeForWindow != null) allowDarkModeForWindow(hwnd, allow);
             }
             catch
             {

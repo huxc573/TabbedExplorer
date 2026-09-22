@@ -92,7 +92,13 @@ namespace TabbedExplorer
                 try { SetProcessDPIAware(); } catch { }
             }
 
-            Theme.Reload();   // 先定下深浅色，后面所有自绘都按它来
+            // 数据全部在**程序目录的 data\** 下（绿色便携，见 AppPaths）；
+            // 第一次跑先把老位置（%APPDATA%）的设置/记忆搬过来，别让川觉得「记忆丢了」。
+            AppPaths.MigrateFromLegacy();
+            Settings.Load();
+
+            Theme.Mode = Settings.Color;   // 跟随系统 / 浅色 / 深色
+            Theme.Reload();                // 先定下深浅色，后面所有自绘都按它来
 
             // 进程级深色必须在**创建任何窗口之前**声明：uxtheme 的 SetPreferredAppMode
             // 是进程级开关，窗口建好之后才设，shell 的文件列表那一层（DirectUIHWND）
@@ -183,9 +189,7 @@ namespace TabbedExplorer
         {
             try
             {
-                string dir = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "TabbedExplorer");
+                string dir = AppPaths.DataDir;
                 System.IO.Directory.CreateDirectory(dir);
                 System.IO.File.AppendAllText(
                     System.IO.Path.Combine(dir, "log.txt"),

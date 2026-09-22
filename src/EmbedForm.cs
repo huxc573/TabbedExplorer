@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
@@ -38,6 +39,7 @@ namespace TabbedExplorer
 
         private const int WM_NCHITTEST = 0x0084;
         private const int WM_GETMINMAXINFO = 0x0024;
+        private const int WM_SETTINGCHANGE = 0x001A;
         private const int HTCLIENT = 1;
         private const int HTLEFT = 10;
         private const int HTRIGHT = 11;
@@ -55,6 +57,10 @@ namespace TabbedExplorer
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
+
+        /// <summary>齿轮菜单 + 它开着没开着的标记（防止点两下弹出两层）。</summary>
+        private ContextMenuStrip gearMenu;
+        private bool gearMenuOpen;
 
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
@@ -110,7 +116,11 @@ namespace TabbedExplorer
             tabStrip.SettingsClicked += delegate
             {
                 Diag.Step("EmbedForm: 点击设置按钮");
-                ShowSettingsMenu();
+                // ⚠ 不能在这里同步弹菜单（卡死的元凶）：鼠标消息还没走完就切鼠标捕获，
+                // 菜单的 modal 过滤器会和控件的捕获打架。排到当前消息处理完之后再弹。
+                if (IsDisposed || Disposing || !IsHandleCreated) return;
+                try { BeginInvoke((MethodInvoker)delegate { ShowSettingsMenu(); }); }
+                catch (Exception ex) { Diag.Log("EmbedForm: 排设置菜单失败 " + ex.Message); }
             };
 
             content = new Panel();
@@ -124,7 +134,7 @@ namespace TabbedExplorer
             Controls.Add(content);
 
             ApplyTheme();
-            Theme.Changed += delegate { ApplyTheme(); };
+            Theme.Changed += delegate { OnThemeChanged(); };
             DoLayout();
 
             // 标签**不在这里开**：要等第一次现身时才知道该还原什么
@@ -220,6 +230,24 @@ namespace TabbedExplorer
 
         protected override void WndProc(ref Message m)
         {
+            // 系统换「应用模式」时会广播 WM_SETTINGCHANGE("ImmersiveColorSet")。
+            // 只有「跟随系统」这一档要管 —— 强制浅/深的时候系统爱怎么变都不关我们事。
+            if (m.Msg == WM_SETTINGCHANGE && m.LParam != IntPtr.Zero)
+            {
+                try
+                {
+                    string s = Marshal.PtrToStringUni(m.LParam);
+                    if (string.Equals(s, "ImmersiveColorSet", StringComparison.OrdinalIgnoreCase)
+                        && Settings.Color == Settings.ColorMode.System)
+                    {
+                        Diag.Step("EmbedForm: 系统颜色变了 -> 重读注册表");
+                        Theme.Reload();
+                        DarkMode.SetEnabled(Theme.IsDark);
+                        Theme.RaiseChanged();     // 各控件的 Theme.Changed 会自己重画
+                    }
+                }
+                catch { }
+            }
             if (m.Msg == WM_GETMINMAXINFO)
             {
                 base.WndProc(ref m);
@@ -265,6 +293,39 @@ namespace TabbedExplorer
             content.BackColor = Theme.Chrome;
             titleBar.BackColor = Theme.Chrome;
             titleBar.Invalidate();
+            tabStrip.Invalidate();
+        }
+
+        /// <summary>
+        /// 颜色模式变了（或系统主题变了）：自己的外壳重画 + 标题栏重设。
+        /// 强制浅/深时（不是「跟随系统」）再去动嵌进来的 explorer ——
+        /// 它是**独立进程**，我们只能逐窗口 SetWindowTheme 尽力而为，
+        /// 文件列表那一层仍按它自己的系统主题画，这条限制要在界面上说清楚。
+        /// </summary>
+        private void OnThemeChanged()
+        {
+            if (IsDisposed || Disposing) return;
+            ApplyTheme();
+            Theme.ApplyTitleBar(Handle);
+            if (Settings.Color == Settings.ColorMode.System) return;
+            foreach (ExplorerHost h in hosts)
+            {
+                if (h != null) h.Restyle();
+            }
+        }
+
+        /// <summary>外面（Hub）改完设置让我重刷外观。</summary>
+        internal void ApplyThemeNow()
+        {
+            if (IsDisposed || Disposing) return;
+            ApplyTheme();
+            Theme.ApplyTitleBar(Handle);
+        }
+
+        /// <summary>标签宽度 / 自适应改了：标签条每次重算布局，invalidate 一下就行。</summary>
+        internal void RefreshTabs()
+        {
+            if (IsDisposed || Disposing) return;
             tabStrip.Invalidate();
         }
 
@@ -352,6 +413,11 @@ namespace TabbedExplorer
             restored = true;
 
             DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
+            if (!Settings.KeepTabs)
+            {
+                Diag.Step("记忆: 「保留标签页」关着 -> 不还原，直接开一个「此电脑」");
+                b = null;
+            }
             if (b != null && b.Paths.Count > 0)
             {
                 int skipped = 0, wantIdx = -1;
@@ -657,52 +723,54 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 设置（标签条最右边那枚齿轮）
+        // 设置（标签条最右边那枚齿轮）—— 内容在 SettingsMenu，跟托盘右键共用同一份
         // ==================================================================
 
         /// <summary>
-        /// 齿轮弹出来的菜单。**第一项就是捕获方式**（川要的）：
-        /// 「按虚拟桌面分别捕获」（v1.1.0 的）/「捕获并迁移到当前桌面」（v1.0.0 的）。
-        /// 风格走 Theme.StyleMenu，跟托盘菜单一致。
+        /// 齿轮弹出来的设置菜单。真正的内容由 `SettingsMenu` 统一生成（托盘右键也是它），
+        /// 这里只负责「什么时候弹、弹在哪儿」。
+        ///
+        /// ⚠ 两个坑都在这段里（川报的「点设置齿轮直接卡死」）：
+        ///   ① **不能在 MouseDown 里同步弹** —— 排到消息处理完之后（调用方 BeginInvoke）；
+        ///   ② 菜单**不挂 owner 控件**，直接给屏幕坐标；挂 owner 会把菜单跟控件的
+        ///      激活/捕获关系缠在一起，最容易卡死或一闪就没。
+        /// 菜单每次重新建（勾选状态是活的），关掉就 dispose。
         /// </summary>
         private void ShowSettingsMenu()
         {
-            if (hub == null) return;
-            ContextMenuStrip m = new ContextMenuStrip();
-            m.ShowImageMargin = false;
+            if (hub == null || gearMenuOpen || IsDisposed || Disposing) return;
+            gearMenuOpen = true;
+            try
+            {
+                Diag.Step("EmbedForm: 建设置菜单");
+                ContextMenuStrip m = SettingsMenu.BuildGear(hub);
+                gearMenu = m;
+                m.Closed += delegate
+                {
+                    gearMenuOpen = false;
+                    gearMenu = null;
+                    try { m.Dispose(); } catch { }
+                    Diag.Step("EmbedForm: 设置菜单已关");
+                };
 
-            // 勾选用**文字前缀**而不是 ToolStripMenuItem.Checked：
-            // 勾选那个小方块是渲染器自己画的位图，深色下经常是「黑勾画在黑底上」看不见。
-            // 前缀就是普通文字，跟着 Theme.Text 走，深色浅色都在。
-            bool perOn = (hub.Capture == Settings.CaptureMode.PerDesktop);
-            ToolStripMenuItem per = new ToolStripMenuItem(
-                (perOn ? "✓ " : "   ") + Settings.Label(Settings.CaptureMode.PerDesktop));
-            ToolStripMenuItem mig = new ToolStripMenuItem(
-                (!perOn ? "✓ " : "   ") + Settings.Label(Settings.CaptureMode.Migrate));
-            per.ToolTipText = "每张虚拟桌面各一个窗口、各记一套标签，互不干扰";
-            mig.ToolTipText = "全进程只一个窗口，Win+E 时把它搬到当前桌面（1.0.0 的老做法）";
-            per.Click += delegate { hub.SetCaptureMode(Settings.CaptureMode.PerDesktop); };
-            mig.Click += delegate { hub.SetCaptureMode(Settings.CaptureMode.Migrate); };
+                Size sz = m.GetPreferredSize(Size.Empty);
+                Point at = tabStrip.PointToScreen(new Point(tabStrip.Width, tabStrip.Height));
+                Rectangle wa = Screen.FromControl(tabStrip).WorkingArea;
+                int x = at.X - sz.Width;                              // 右对齐到齿轮
+                if (x + sz.Width > wa.Right) x = wa.Right - sz.Width;
+                if (x < wa.Left) x = wa.Left;
+                int y = at.Y;                                          // 贴在标签条下边
+                if (y + sz.Height > wa.Bottom) y = Math.Max(wa.Top, at.Y - tabStrip.Height - sz.Height);
 
-            m.Items.Add(per);
-            m.Items.Add(mig);
-            m.Items.Add(new ToolStripSeparator());
-
-            ToolStripMenuItem rem = new ToolStripMenuItem("记住当前标签");
-            rem.Click += delegate { hub.RememberNow(); };
-            m.Items.Add(rem);
-
-            ToolStripMenuItem about = new ToolStripMenuItem("TabbedExplorer — 接 Win+E 的资源管理器");
-            about.Enabled = false;
-            m.Items.Add(about);
-
-            Theme.StyleMenu(m);
-
-            // 贴在齿轮下边、右对齐（别甩到屏幕角落，也别越出右边界）
-            Size sz = m.GetPreferredSize(Size.Empty);
-            int x = tabStrip.Width - sz.Width;
-            if (x < 0) x = 0;
-            m.Show(tabStrip, new Point(x, tabStrip.Height));
+                Diag.Step(string.Format("EmbedForm: 弹菜单 at {0},{1} 尺寸 {2}x{3}", x, y, sz.Width, sz.Height));
+                m.Show(new Point(x, y));
+                Diag.Step("EmbedForm: 弹菜单返回");
+            }
+            catch (Exception ex)
+            {
+                gearMenuOpen = false;
+                Diag.Log("EmbedForm: 设置菜单失败 " + ex);
+            }
         }
 
         // ==================================================================
@@ -758,6 +826,11 @@ namespace TabbedExplorer
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason + " 桌面=" + DesktopKey);
+            if (gearMenu != null)
+            {
+                try { gearMenu.Dispose(); } catch { }
+                gearMenu = null;
+            }
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }
 

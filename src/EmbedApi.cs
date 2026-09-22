@@ -83,9 +83,12 @@ namespace TabbedExplorer
         public const uint WS_MAXIMIZEBOX = 0x00010000;
 
         // ---- SetWindowPos ----
+        public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOZORDER = 0x0004;
         public const uint SWP_NOACTIVATE = 0x0010;
         public const uint SWP_FRAMECHANGED = 0x0020;
+        public const uint SWP_SHOWWINDOW = 0x0040;
 
         public const uint WM_CLOSE = 0x0010;
 
@@ -171,18 +174,78 @@ namespace TabbedExplorer
             GC.KeepAlive(cb);
         }
 
+        // ==================================================================
+        // 「启动时就存在的文件夹窗口」基线（2026-09-22 加）
+        //
+        // 用来回答一个问题：这个文件夹窗口是**新开的**，还是本来就在那儿？
+        //   · 本来就在那儿的（川早就开着、从最小化还原、被别人重新显示）→ **不算新开**，别去动它；
+        //   · 新开的 → 归我们收成标签。
+        //
+        // ⚠ 为什么不能再用「进程是不是启动前就有的」来判（老办法，`pidsBefore`）：
+        //   实测 `explorer.exe /n,/separate` 起来的窗口**也可能落在启动前就存在的 explorer 进程里**。
+        //   那时老办法会把我们自己的窗口判成「别人的」而不认领，
+        //   于是 Hub 那个「谁来都抓」的监听反而把它抓走 —— 日志里就是这么串的：
+        //   自己起的第4个窗口被 `Adopt` 当成「川新开的」收走了（碰巧没错，但结构上就是错的）。
+        //   按**窗口**（而不是进程）记基线，就没有这个歧义。
+        // ==================================================================
+
+        private static readonly HashSet<IntPtr> baselineCabs = new HashSet<IntPtr>();
+
+        /// <summary>把「现在就已经开着的文件夹窗口」记成基线。程序刚起来时调一次。</summary>
+        public static void SnapshotBaseline()
+        {
+            lock (baselineCabs)
+            {
+                baselineCabs.Clear();
+                CollectCabs(baselineCabs);
+            }
+            Diag.Step("基线: 启动时已有 " + baselineCabs.Count + " 个文件夹窗口");
+        }
+
+        public static bool IsBaseline(IntPtr h)
+        {
+            lock (baselineCabs) { return baselineCabs.Contains(h); }
+        }
+
+        // ==================================================================
+        // 「这个文件夹窗口已经归谁了」的登记表（2026-09-22 加）
+        //
+        // 有了「谁来都抓」之后再也不能靠「启动前快照」认自己起的那个窗口了 ——
+        // 两个监听会同时看见同一个新窗口（我们自己起的、和川自己开的），
+        // 也可能两个标签同时看见一个（连点两次新建）。这张表就是仲裁：
+        // 谁先认领谁负责，另一个看见已登记就放手。
+        // ==================================================================
+
+        private static readonly HashSet<IntPtr> claims = new HashSet<IntPtr>();
+
+        public static bool IsClaimed(IntPtr h)
+        {
+            lock (claims) { return claims.Contains(h); }
+        }
+
+        public static void Claim(IntPtr h)
+        {
+            lock (claims) { if (h != IntPtr.Zero) claims.Add(h); }
+        }
+
+        public static void Release(IntPtr h)
+        {
+            lock (claims) { if (h != IntPtr.Zero) claims.Remove(h); }
+        }
+
         /// <summary>
         /// 扫顶层窗口，找出「刚冒出来的」文件夹窗口 —— 也就是**我们刚叫起来的那个**。
         /// 三条刻意的设计：
         ///   · **不看可见性**：我们可能已经把它藏起来了（怕它闪），藏了也得认得出来；
         ///   · **不枚举进程列表**：这个函数 25ms 就要跑一次，`GetProcessesByName` 太贵，
         ///     而窗口只能由进程建出来，直接扫窗口就够了（有窗口 ⇒ 进程必然存在）；
-        ///   · 排掉两种「本来就在那儿的东西」：启动前就存在的窗口（他手开的原生窗口）、
-        ///     启动前就存在的 explorer 进程（不是我们叫起来的）。
-        ///     `allowKnownPid` 是兼底：万一 shell 复用了老进程建窗口，4 秒后放宽这个条件。
+        ///   · 排掉两种「本来就在那儿的东西」：**启动基线**上的窗口（他早就开着的）
+        ///     和**已被认领**的窗口（我们自己另一个标签已经收走的）。
+        ///     `pidsBefore` 参数留着不用了 —— 见上面基线那段，按进程判会串台；
+        ///     `relax` 的含义现在只是「不做地址校验」（见 ExplorerHost.OnPoll）。
         /// </summary>
         public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
-            bool allowKnownPid, out int pidOfFound)
+            bool relax, out int pidOfFound)
         {
             IntPtr found = IntPtr.Zero;
             int foundPid = 0;
@@ -192,9 +255,10 @@ namespace TabbedExplorer
                 string c = ClassOf(h);
                 if (c != "CabinetWClass" && c != "ExploreWClass") return true;
                 if (cabsBefore.Contains(h)) return true;
+                if (IsBaseline(h)) return true;
+                if (IsClaimed(h)) return true;
                 int p = ProcessIdOf(h).ToInt32();
                 if (p == 0) return true;
-                if (!allowKnownPid && pidsBefore.Contains(p)) return true;
                 found = h; foundPid = p;
                 return false;
             };

@@ -95,8 +95,20 @@ namespace TabbedExplorer
         private WRECT origRect;
         private bool embedded;
         private bool disposed;
+        /// <summary>
+        /// 这个标签是**接管**来的（川自己从开始菜单/桌面打开的窗口），不是我们起的。
+        /// 区别只在收尾：接管的窗口关标签时要**把窗口关掉**（不然桌面上留一个孤儿），
+        /// 而且**绝不能 kill 它的 explorer 进程**（多半就是桌面那个 shell 进程）。
+        /// </summary>
+        private bool adopted;
 
         public string LastError { get; private set; }
+
+        /// <summary>
+        /// 这个标签已经自动重试过一次了（防死循环）。
+        /// 用在上层：自己起的窗口 25 秒没等到 —— 多半是被同时开的别的标签抢了 — 允许再来一次。
+        /// </summary>
+        public bool Retried { get; set; }
 
         public ExplorerHost()
         {
@@ -161,9 +173,82 @@ namespace TabbedExplorer
             watcher.Start();
         }
 
-        /// <summary>把 shell 路径转成 explorer.exe 认的命令行形式。</summary>
-        private static string CommandLineTarget(string path)
+        /// <summary>
+        /// 还没开始起之前先把「要去哪儿」记上。
+        /// ⚠ 必须要：起 explorer 现在是**串行排队**的（见 `EmbedForm.PumpLaunch`），
+        /// 排在前面的还没轮到时 `TargetPath` 是空的 —— 而「中途保存记忆」是随时会发生的，
+        /// 那时 `LivePath` 拿不到路径，这个还没起的标签就会**被从记忆里抹掉**。
+        /// </summary>
+        public void PresetTarget(string path)
         {
+            if (string.IsNullOrEmpty(TargetPath)) TargetPath = path;
+        }
+
+        /// <summary>
+        /// 接管一个**别人建出来的**文件夹窗口（川从开始菜单 / 桌面双击打开的）。
+        ///
+        /// 跟自己起那条路的区别：这里不 `Process.Start`（窗口已经有了），
+        /// 所以也不会一闪 —— 它可能已经在屏幕上露了一下，我们**立刻把它藏掉**；
+        /// 之后就完全汇进同一条流水线（`OnPoll` 等文件列表建好 → `AttachWindow` 嵌进来）。
+        ///
+        /// `TargetPath` 这时候还不知道（我们没让它开哪儿）：嵌好之后从地址栏读回来就是。
+        /// </summary>
+        public void Adopt(IntPtr cab, int pid)
+        {
+            if (disposed || embedded || pendingCab != IntPtr.Zero || cab == IntPtr.Zero) return;
+
+            // ⚠⚠ 这一步是**安全底线**，顺序不能动：
+            // 接管的窗口多半属于**桌面那个 shell explorer 进程**。`KillOwnExplorer` 判「该不该杀」
+            // 靠的就是 pidsBefore —— 先把当前所有 explorer pid 快照进来，那个 pid 就绝不会被列进
+            // 「我们自己起的」。少做这一步，关一个标签就会把整个桌面（explorer.exe）杀掉。
+            pidsBefore.Clear();
+            foreach (Process p in Process.GetProcessesByName("explorer"))
+            {
+                try { pidsBefore.Add(p.Id); } catch { }
+                finally { p.Dispose(); }
+            }
+
+            adopted = true;
+            TargetPath = null;
+            startedAt = DateTime.Now;
+            pendingCab = cab;
+            pendingPid = pid;
+            ExplorerPid = pid;
+            cabSeenAt = DateTime.Now;
+            EmbedApi.Claim(cab);
+            Diag.Step(string.Format("Embed: 接管他开的窗口 cab=0x{0:X} pid={1}", cab.ToInt64(), pid));
+            EmbedApi.ShowWindow(cab, SW_HIDE);
+            poll.Interval = 25;
+            poll.Start();
+        }
+
+        /// <summary>
+        /// 这个窗口现在显示的是不是我们要开的那个路径 —— 读它的地址栏来验（跟「标签第二行」同一条路）。
+        ///
+        /// 三条「问不出来就放行」（返回 true）的规矩，都是为了**别把该嵌的窗口误判掉**：
+        ///   · 我们本来就没指定路径（接管别人窗口时）：没法比，放行；
+        ///   · 地址栏还没建出来：还没加载到那一步，放行；
+        ///   · 读到的字符串翻译不成可比的路径（库/虚拟文件夹）：放行。
+        /// 宁可偶尔嵌错（4 秒后会放宽），也不能因为比对不了就永远不开。
+        /// </summary>
+        private static bool CabMatches(IntPtr cab, string wanted)
+        {
+            if (string.IsNullOrEmpty(wanted)) return true;
+            if (!PathRules.Restorable(wanted)) return true;
+            try
+            {
+                IntPtr ab = EmbedApi.FindAddressBand(cab);
+                if (ab == IntPtr.Zero) return true;
+                string got = PathRules.Store(
+                    EmbedApi.StripAddressPrefix(EmbedApi.WindowTextOf(ab)));
+                if (string.IsNullOrEmpty(got)) return true;
+                return PathRules.Same(got, wanted);
+            }
+            catch { return true; }
+        }
+
+        /// <summary>把 shell 路径转成 explorer.exe 认的命令行形式。</summary>
+        private static string CommandLineTarget(string path)        {
             string t = path;
             if (string.IsNullOrEmpty(t) ||
                 string.Equals(t, ExplorerView.ThisPcPath, StringComparison.OrdinalIgnoreCase))
@@ -193,6 +278,15 @@ namespace TabbedExplorer
                 bool relax = (DateTime.Now - startedAt).TotalSeconds > 4;
                 int pid;
                 IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax, out pid);
+                if (cab != IntPtr.Zero && !relax && !CabMatches(cab, TargetPath))
+                {
+                    // 找到了一个窗口，但地址栏显示的不是我们要开的那个 —— 十有八九是
+                    // **同时开了好几个标签**，把别人的窗口扫到自己这儿了（川报的「有时候标签页
+                    // 点开是空的」就是这个：真窗口被别的标签嵌走，这个标签就永远等不到东西）。
+                    // 先别嵌，继续等；4 秒后 relax 打开就不再挑了（宁可就近凑一个，也别永远空着）。
+                    Diag.Step("Embed: 扫到的窗口地址对不上，继续等：" + cab.ToInt64().ToString("X"));
+                    cab = IntPtr.Zero;
+                }
                 if (cab == IntPtr.Zero)
                 {
                     if ((DateTime.Now - startedAt).TotalSeconds > 25)
@@ -210,6 +304,7 @@ namespace TabbedExplorer
                     cab.ToInt64(), pid, relax ? "（已放宽 pid 条件）" : ""));
                 pendingCab = cab;
                 pendingPid = pid;
+                EmbedApi.Claim(cab);       // 登记：Hub 那个「谁来都抓」的监听看见已登记就放手
                 ExplorerPid = pid;         // 还没嵌进来就被关掉时，Close() 靠它收进程
                 cabSeenAt = DateTime.Now;
             }
@@ -245,12 +340,17 @@ namespace TabbedExplorer
             string c = WinFind.ClassOf(h);
             if (c != "CabinetWClass" && c != "ExploreWClass") return;
             if (cabsBefore.Contains(h)) return;
+            // 启动时就在那儿的窗口不算新开（见 EmbedApi 里「基线」那段）；
+            // 已经被别的标签收走的更不能抢。
+            if (EmbedApi.IsBaseline(h)) return;
+            if (EmbedApi.IsClaimed(h)) return;
 
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
-            if (pid == 0 || pidsBefore.Contains(pid)) return;
+            if (pid == 0) return;
 
             Diag.Step(string.Format("Embed: 新窗口刚显示就藏掉 cab=0x{0:X} pid={1}", h.ToInt64(), pid));
             EmbedApi.ShowWindow(h, SW_HIDE);
+            EmbedApi.Claim(h);          // 先登记再往下走：Hub 的监听（如果插在我们前面）一看已登记就不抢了
             pendingCab = h;
             pendingPid = pid;
             ExplorerPid = pid;
@@ -545,6 +645,10 @@ namespace TabbedExplorer
             try { titlePoll.Stop(); } catch { }
             try { settle.Stop(); } catch { }
             try { watcher.Dispose(); } catch { }
+
+            // 登记表要摘掉（不管是已经嵌进来的还是还在等加载的），否则这个 HWND 会被永久占着
+            if (CabWindow != IntPtr.Zero) EmbedApi.Release(CabWindow);
+            if (pendingCab != IntPtr.Zero) EmbedApi.Release(pendingCab);
             pendingCab = IntPtr.Zero;   // 还没嵌进来就被关掉：下面 KillOwnExplorer 用 ExplorerPid 收进程
 
             // 先还原成顶层窗口，再结束进程 —— 避免窗口还挂在我们容器里就被销毁
@@ -559,6 +663,18 @@ namespace TabbedExplorer
                         EmbedApi.SWP_NOZORDER | EmbedApi.SWP_NOACTIVATE | EmbedApi.SWP_FRAMECHANGED);
                 }
                 catch (Exception ex) { Diag.Log("Embed: 还原失败 " + ex.Message); }
+
+                // 接管来的窗口得**主动关掉**：它不是我们的进程，KillOwnExplorer 不会碰它，
+                // 光还原成顶层窗口就会在桌面上多出一个孤零零的资源管理器（关标签却留着窗口，说不通）。
+                if (adopted)
+                {
+                    try
+                    {
+                        Diag.Step("Embed: 关掉接管的窗口 cab=0x" + CabWindow.ToInt64().ToString("X"));
+                        EmbedApi.PostMessageW(CabWindow, EmbedApi.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    catch (Exception ex) { Diag.Log("Embed: 关接管窗口失败 " + ex.Message); }
+                }
             }
             embedded = false;
             CabWindow = IntPtr.Zero;

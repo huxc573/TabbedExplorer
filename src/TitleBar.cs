@@ -79,6 +79,14 @@ namespace TabbedExplorer
         private string title = "";
         private bool maximized;
 
+        /// <summary>窗口没激活：标题和窗口按钮字号降灰 —— 原生标题栏就是这么变的。</summary>
+        public bool Inactive
+        {
+            get { return inactive; }
+            set { if (inactive != value) { inactive = value; Invalidate(); } }
+        }
+        private bool inactive;
+
         private int hoverQat = -1;
         private int pressQat = -1;
         private int hoverBtn = -1;
@@ -103,6 +111,7 @@ namespace TabbedExplorer
             Height = Px(30);
             tips.InitialDelay = 500;
             tips.ReshowDelay = 200;
+            tips.ShowAlways = true;   // 窗口没激活时也要弹（跟标签条那条一个道理）
             Theme.Changed += delegate { BackColor = Theme.Chrome; RebuildFonts(); Invalidate(); };
             RebuildFonts();
         }
@@ -218,7 +227,8 @@ namespace TabbedExplorer
             if (titleRight > titleLeft)
             {
                 Rectangle tr = new Rectangle(titleLeft, 0, titleRight - titleLeft, Height);
-                TextRenderer.DrawText(g, title, textFont, tr, Theme.Text,
+                TextRenderer.DrawText(g, title, textFont, tr,
+                    inactive ? Theme.TextInactive : Theme.Text,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
             }
@@ -237,7 +247,8 @@ namespace TabbedExplorer
                 {
                     g.FillRectangle(new SolidBrush(i == 2 ? Color.FromArgb(232, 17, 35) : Theme.Hover), b);
                 }
-                Color fg = (i == hoverBtn) ? Color.White : Theme.Text;
+                Color fg = (i == hoverBtn) ? Color.White
+                         : (inactive ? Theme.TextInactive : Theme.Text);
                 TextRenderer.DrawText(g, glyph[i], iconFont, b, fg,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }

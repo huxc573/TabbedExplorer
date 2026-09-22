@@ -94,41 +94,54 @@ namespace TabbedExplorer
                        () => hub.SetTabAutoFit(!Settings.TabAutoFit)));
             n.Add(Sep());
 
-            // ⑥ 常用动作 + 关于
+            // ⑥ 收藏夹栏（Ctrl+Shift+B）
+            n.Add(Leaf("显示收藏夹栏（Ctrl+Shift+B）",
+                       () => Settings.FavBar,
+                       () => hub.SetFavBar(!Settings.FavBar)));
+            n.Add(Sep());
+
+            // ⑦ 是否连「从开始菜单 / 桌面双击打开的文件夹」也收成标签
+            n.Add(Leaf("捕获所有打开的文件夹（不只 Win+E）",
+                       () => Settings.CaptureAll,
+                       () => hub.SetCaptureAll(!Settings.CaptureAll)));
+            n.Add(Sep());
+
+            // ⑦ 常用动作 + 关于
             n.Add(Leaf("记住当前标签", null, () => hub.RememberNow()));
-            n.Add(Leaf("配置文件：程序目录\\data\\settings.txt", null, null));
-            return n;
+            n.Add(Leaf("配置文件：程序目录\\data\\settings.json", null, null));            return n;
         }
 
         // ==================================================================
         // 齿轮：ContextMenuStrip
         // ==================================================================
 
-        public static ContextMenuStrip BuildGear(DesktopHub hub)
+        /// <summary>
+        /// 齿轮那份菜单。**跟托盘是同一个类**（`ContextMenu` + `MenuItem`），只是 Shell 拿到的入口不同：
+        ///   托盘由 NotifyIcon 弹，齿轮由 `EmbedForm` 用 `Show(owner, point)` 弹。
+        ///
+        /// ⚠ 这里踩过一次大坑（2026-09-22 川连报三次「点齿轮卡死」）：
+        ///   原来齿轮用的是 `ContextMenuStrip`，而且**不挂 owner** 直接 `Show(屏幕坐标)` ——
+        ///   那个组合弹出来是非模态的、还抢着鼠标捕获，从用户角度就是「界面死了」，
+        ///   日志却照样打出「弹菜单返回」（Show 立刻就返回了），所以查日志看不出问题。
+        ///   换回 `ContextMenu` 之后走的是 WinForms 的模态菜单循环（`Show` 一直阻塞到菜单关掉），
+        ///   跟托盘右键那条**已经在川机器上验证没问题**的路径完全一致。
+        /// </summary>
+        public static ContextMenu BuildGear(DesktopHub hub)
         {
-            ContextMenuStrip m = new ContextMenuStrip();
-            m.ShowImageMargin = false;
-            AddStrip(m.Items, Spec(hub));
-            Theme.StyleMenu(m);
+            ContextMenu m = new ContextMenu();
+            m.MenuItems.AddRange(ToMenus(Spec(hub), null));
             return m;
         }
 
-        private static void AddStrip(ToolStripItemCollection items, List<Node> nodes)
+        /// <summary>齿轮菜单里每一项的文字（给「不能弹菜单」的场景兜底用，比如日志）。</summary>
+        public static string[] GearTexts(DesktopHub hub)
         {
-            foreach (Node nd in nodes)
+            List<string> r = new List<string>();
+            foreach (Node nd in Spec(hub))
             {
-                if (nd.Text == null) { items.Add(new ToolStripSeparator()); continue; }
-
-                ToolStripMenuItem mi = new ToolStripMenuItem(TextOf(nd));
-                if (nd.Click != null)
-                {
-                    Action a = nd.Click;
-                    mi.Click += delegate { a(); };
-                }
-                else mi.Enabled = false;
-                if (nd.Children != null && nd.Children.Count > 0) AddStrip(mi.DropDownItems, nd.Children);
-                items.Add(mi);
+                if (nd.Text != null) r.Add(TextOf(nd));
             }
+            return r.ToArray();
         }
 
         // ==================================================================
@@ -186,7 +199,7 @@ namespace TabbedExplorer
 
                 if (nd.Children != null && nd.Children.Count > 0)
                     mi.MenuItems.AddRange(ToMenus(nd.Children, ts));
-                else if (nd.Checked != null) ts.Bind(mi, nd);   // 只登记「会打勾」的那些
+                else if (nd.Checked != null && ts != null) ts.Bind(mi, nd);   // 只登记「会打勾」的那些
 
                 r.Add(mi);
             }

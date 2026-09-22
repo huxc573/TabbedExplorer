@@ -25,6 +25,10 @@ namespace TabbedExplorer
         public static Color RibbonGroup; // 命令区底（与标签条区分）
         public static Color Text;
         public static Color TextDim;
+        /// <summary>窗口**没激活**时的文字色（原生标题栏失活就降灰，我们的自绘外壳照这个来）。</summary>
+        public static Color TextInactive;
+        /// <summary>失活时的强调线（选中标签顶上那条）。</summary>
+        public static Color AccentDim;
         public static Color Border;
         public static Color Hover;
         public static Color Press;
@@ -97,6 +101,8 @@ namespace TabbedExplorer
                 RibbonGroup = Color.FromArgb(51, 51, 51);
                 Text = Color.FromArgb(240, 240, 240);
                 TextDim = Color.FromArgb(165, 165, 165);
+                TextInactive = Color.FromArgb(130, 130, 130);
+                AccentDim = Color.FromArgb(80, 130, 160);
                 Border = Color.FromArgb(70, 70, 70);
                 Hover = Color.FromArgb(66, 66, 66);
                 Press = Color.FromArgb(82, 82, 82);
@@ -118,6 +124,8 @@ namespace TabbedExplorer
                 RibbonGroup = Color.FromArgb(249, 249, 249);
                 Text = Color.FromArgb(30, 30, 30);
                 TextDim = Color.FromArgb(108, 108, 108);
+                TextInactive = Color.FromArgb(145, 145, 145);
+                AccentDim = Color.FromArgb(150, 185, 215);
                 Border = Color.FromArgb(219, 219, 219);
                 Hover = Color.FromArgb(229, 229, 229);
                 Press = Color.FromArgb(213, 213, 213);

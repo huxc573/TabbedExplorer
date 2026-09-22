@@ -6,17 +6,26 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// Win10 风格标签条：扁平、浅灰底、选中标签白底 + 顶部蓝线，右侧一个“+”新建按钮。
+    /// 标签条 —— 照浏览器那套做（2026-09-22 川定：整个程序就是「仿浏览器设计、增强 Win10 资源管理器」）。
     ///
-    /// 尺寸全部走 DpiScale：以前这里是硬编码（TabHeight=32 之类），150% DPI 下标签条本身
-    /// 是 51px 而标签只画到 28px，下面白着 23px —— 就是「文件和此电脑中间空了太多」那一条。
-    /// 现在标签按整条高度铺满，不再留白。
+    /// 布局（从右往左）：
+    ///   [齿轮] | [收藏夹栏] [恢复关闭] [历史]  ……空白……  [+ 紧跟最后一个标签]
+    /// 齿轮单独用一条竖线隔开（跟 Edge 一样：头像一块、扩展一块）。
+    ///
+    /// 每个标签**两行**：第一行文件夹名（加粗），第二行完整路径。
+    ///
+    /// 尺寸全部走 DpiScale（硬编码在 150% 下会错位）。
     /// </summary>
     internal sealed class TabStrip : Control
     {
+        /// <summary>右侧那排工具按钮（齿轮单独一个，见 EnsureLayout）。</summary>
+        public enum Tool { History, Reopen, Fav, Settings }
+
         public sealed class TabItem
         {
             public string Title = "";
+            /// <summary>第二行：完整路径（「此电脑」这类没有真实路径的显示友好名）。</summary>
+            public string Path = "";
             public bool Active;
             /// <summary>当前文件夹的图标（由上层从 explorer 窗口读出来，导航后会换）。</summary>
             public Image Icon;
@@ -37,48 +46,45 @@ namespace TabbedExplorer
 
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
-        /// <summary>标签条标准高度（逻辑像素）。外面布局也照这个数来。</summary>
-        public const int StdHeight = 34;
+        /// <summary>标签条标准高度（逻辑像素）。**两行**文字，所以比原来一条 34 高一些。</summary>
+        public const int StdHeight = 44;
 
         private readonly List<TabItem> tabs = new List<TabItem>();
         private readonly List<Rectangle> bounds = new List<Rectangle>();
 
-        /// <summary>鼠标停在某个标签上时，显示**完整文件夹名**（标题被省略号截了也看得到）。</summary>
+        /// <summary>
+        /// 悬停提示。⚠ `ShowAlways = true` 是必须的：不开的时候**宿主窗口不是前台就不弹** ——
+        /// 川报的「未激活时移到标签上没显示名字，可关闭按钮会变色」就是这个（鼠标事件收到了，提示被憋掉了）。
+        /// </summary>
         private readonly ToolTip tips = new ToolTip();
 
         private int hoverIndex = -1;
         private int hoverCloseIndex = -1;
         private bool hoverNew;
-        private bool hoverSettings;
-        /// <summary>当前弹着提示的那个标签（换标签/离开才重弹，不然鼠标一动就闪）。</summary>
-        private int tipIndex = -1;
+        private int hoverTool = -1;
+        /// <summary>现在弹着提示的是谁（`"tab:3"` / `"close:0"` / `"tool:2"` …）。换了才重弹，不然鼠标一动就闪。</summary>
+        private string tipKey;
         private int dragFromIndex = -1;
         private int dragOverIndex = -1;
 
-        // 「+」和设置按钮的位置由 EnsureLayout 算出来（+ 得跟着标签跑），
-        // 不能再像以前那样只用 Width 减一下 —— 那样它永远是钉在整条最右边的。
+        // 位置全部由 EnsureLayout 算（标签数 / 窗口宽 / 右侧那排按钮都会变）。
         private Rectangle newRect;
         private Rectangle settingsRect;
+        private static readonly Rectangle[] toolRects = new Rectangle[4];   // 见 Tool 枚举
+        private int dividerX;
+        private int toolsLeft;
 
-        // 标签宽度：文件夹名一般不长，190 太奢侈（川：一半就够）。
-        // 按宽度不够时自动压到 Min，再挤就继续缩（标题会省略号）。
-        // 加文件夹图标后往上补了图标占的那一点（6+16+5 = 27），保证**文字可用宽度**不缩水。
+        // 标签宽度：跟着设置走（逻辑像素 ×DPI）。自适应开着时它当上限。
         private int MinTabWidth { get { return Math.Min(Px(72), MaxTabWidth); } }
-        /// <summary>
-        /// 标签宽度。跟着设置走（逻辑像素 ×DPI）—— 川说的「可设置标签页宽度」。
-        /// 自适应开着时它当上限：挤不下就从它往下缩（下限见 MinTabWidth）。
-        /// 自适应关掉时就固定这个宽度（标签靠左排，多出来的被设置按钮盖住）。
-        /// </summary>
         private int MaxTabWidth { get { return Px(Settings.TabWidth); } }
-        /// <summary>「+」新建：现在紧跟在最后一个标签右边（浏览器那样），所以窄一点。</summary>
         private int NewButtonWidth { get { return Px(28); } }
-        /// <summary>最右边那枚固定不动的设置按钮。</summary>
+        private int ToolButtonWidth { get { return Px(32); } }
         private int SettingsButtonWidth { get { return Px(34); } }
+        /// <summary>齿轮左边那条竖线占的宽度（含两侧留白）。</summary>
+        private int DividerWidth { get { return Px(11); } }
         private int CloseAreaWidth { get { return Px(22); } }
         private int CloseBoxSize { get { return Px(16); } }
 
-        // 标签左边那颗图标：正常由上层从 explorer 窗口读（= 当前文件夹的实时图标）。
-        // 这个通用文件夹只是「还没拿到」时的占位，以及取不到时的兼底。
         private static int IconSize { get { return Px(16); } }
         /// <summary>标签图标的目标尺寸（设备像素）。外面给 ExplorerHost 设尺寸时用这个。</summary>
         public static int TabIconSize { get { return IconSize; } }
@@ -97,15 +103,39 @@ namespace TabbedExplorer
             return folderIcon != null;
         }
 
+        private readonly Font titleFont;      // 第一行：加粗
+        private readonly Font pathFont;       // 第二行：小一号
+        private readonly Font glyphFont;      // 右侧工具按钮的 MDL2 字形
+
+        /// <summary>窗口没激活（失活）时整体文字降灰 —— 跟原生标题栏一个逻辑。</summary>
+        public bool Inactive
+        {
+            get { return inactive; }
+            set { if (inactive != value) { inactive = value; Invalidate(); } }
+        }
+        private bool inactive;
+
+        /// <summary>收藏夹栏现在是开着的（按钮画成实心星）。</summary>
+        public bool FavBarOn
+        {
+            get { return favBarOn; }
+            set { if (favBarOn != value) { favBarOn = value; Invalidate(); } }
+        }
+        private bool favBarOn;
+
         public delegate void IndexEventHandler(object sender, int index);
 
         public event IndexEventHandler TabClicked;
         public event IndexEventHandler TabCloseClicked;
         public event EventHandler NewTabClicked;
-        /// <summary>最右边那枚设置按钮被点了（菜单由上层弹）。</summary>
-        public event EventHandler SettingsClicked;
+        /// <summary>标签上按了右键（要弹「复制 / 关闭 / 复制路径」）。</summary>
+        public event IndexEventHandler TabRightClicked;
+        /// <summary>右侧那排按钮被点了（含齿轮）。</summary>
+        public event Action<Tool> ToolClicked;
         public event IndexEventHandler TabMiddleClicked;
         public event IndexEventHandler OrderChanged;   // 拖拽排序后：原索引
+        /// <summary>标签条**空白区域**（不是标签、不是按钮）上按了右键。</summary>
+        public event Action<Point> BlankRightClicked;
 
         public TabStrip()
         {
@@ -113,12 +143,15 @@ namespace TabbedExplorer
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.Selectable, true);
             Height = Px(StdHeight);
-            Font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
+            titleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
+            pathFont = new Font("Segoe UI", Px(10), FontStyle.Regular, GraphicsUnit.Pixel);
+            glyphFont = new Font("Segoe MDL2 Assets", Px(14), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
             tips.InitialDelay = 350;    // 停一下再弹，别鼠标一扫过就满屏提示
             tips.ReshowDelay = 80;
             tips.AutoPopDelay = 8000;
+            tips.ShowAlways = true;     // 见字段注释：不开的话窗口没激活就不弹
             Theme.Changed += delegate { BackColor = Theme.TabBar; Invalidate(); };
         }
 
@@ -135,6 +168,15 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             if (tabs[index].Title == title) return;
             tabs[index].Title = title;
+            Invalidate();
+        }
+
+        /// <summary>换第二行那个路径（「此电脑」这类没有真实路径的由上层给友好名）。</summary>
+        public void SetPath(int index, string path)
+        {
+            if (index < 0 || index >= tabs.Count) return;
+            if (tabs[index].Path == path) return;
+            tabs[index].Path = path ?? "";
             Invalidate();
         }
 
@@ -177,26 +219,28 @@ namespace TabbedExplorer
 
         // ------------------------------------------------------------------
         /// <summary>
-        /// 排一次版：标签从左往右铺，「+」紧跟最后一个标签，设置按钮钉在整条最右边。
-        /// 尺寸只由 Width + 标签数决定，所以鼠标事件里可以随手重算。
+        /// 排一次版。右侧那一排是**固定**的（齿轮 + 竖线 + 三个功能按钮），
+        /// 标签和「+」只在剩下的宽度里排。尺寸只由 Width + 标签数决定，鼠标事件里可以随手重算。
         /// </summary>
         private void EnsureLayout()
         {
-            bounds.Clear();
-
-            // 最右边固定一枚设置按钮 —— 谁都不许压过去（川：最右边固定放一个设置按钮）
+            // 右侧固定区（从右往左：齿轮 → 竖线 → 收藏夹栏 → 恢复关闭 → 历史）
             settingsRect = new Rectangle(Width - SettingsButtonWidth, 0, SettingsButtonWidth, Height);
+            int divL = settingsRect.Left - DividerWidth;
+            dividerX = divL + DividerWidth / 2;
+            toolRects[(int)Tool.Fav] = new Rectangle(divL - ToolButtonWidth, 0, ToolButtonWidth, Height);
+            toolRects[(int)Tool.Reopen] = new Rectangle(toolRects[(int)Tool.Fav].Left - ToolButtonWidth, 0, ToolButtonWidth, Height);
+            toolRects[(int)Tool.History] = new Rectangle(toolRects[(int)Tool.Reopen].Left - ToolButtonWidth, 0, ToolButtonWidth, Height);
+            toolsLeft = toolRects[(int)Tool.History].Left;
 
-            // 标签能用的宽度 = 整条 - 设置按钮 - 「+」- 起点/间隔那几px
-            int avail = Math.Max(Px(60), Width - SettingsButtonWidth - NewButtonWidth - Px(8));
+            bounds.Clear();
+            int avail = Math.Max(Px(60), toolsLeft - NewButtonWidth - Px(10));
             int w = MaxTabWidth;
-            // 自适应关掉时就固定宽度，不缩 —— 标签多于放得下的数量时，后面的会被设置按钮盖住。
             if (tabs.Count > 0 && Settings.TabAutoFit)
             {
                 int need = tabs.Count * MaxTabWidth;
                 if (need > avail) w = Math.Max(MinTabWidth, avail / tabs.Count);
             }
-            // 标签铺满整条高度 —— 上下都不留白
             int x = Px(2);
             for (int i = 0; i < tabs.Count; i++)
             {
@@ -204,10 +248,8 @@ namespace TabbedExplorer
                 x += w;
             }
 
-            // 「+」紧跟在最后一个标签右边（浏览器就是这样）；一个标签都没有时贴左边。
-            // 标签挤到极限时它会顶到设置按钮前面停住，不越界。
             int nx = (tabs.Count > 0) ? x + Px(4) : Px(4);
-            int limit = settingsRect.Left - NewButtonWidth - Px(2);
+            int limit = toolsLeft - NewButtonWidth - Px(2);
             if (nx > limit) nx = Math.Max(Px(2), limit);
             newRect = new Rectangle(nx, 0, NewButtonWidth, Height);
         }
@@ -218,10 +260,37 @@ namespace TabbedExplorer
             return newRect;
         }
 
-        private Rectangle SettingsBounds()
+        /// <summary>齿轮的位置（EmbedForm 弹设置菜单要拿它当锚点）。</summary>
+        public Rectangle SettingsButtonBounds()
         {
             EnsureLayout();
             return settingsRect;
+        }
+
+        /// <summary>某个工具按钮的位置（历史 / 恢复 / 收藏夹栏 / 齿轮都从这儿取锚点）。</summary>
+        public Rectangle ToolButtonBounds(Tool t)
+        {
+            EnsureLayout();
+            if (t == Tool.Settings) return settingsRect;
+            return toolRects[(int)t];
+        }
+
+        /// <summary>某个标签的位置（标签右键菜单拿它当锚点）。越界给个空矩形，别抛。</summary>
+        public Rectangle TabBounds(int index)
+        {
+            EnsureLayout();
+            if (index < 0 || index >= bounds.Count) return Rectangle.Empty;
+            return bounds[index];
+        }
+
+        /// <summary>鼠标在哪个工具按钮上（-1 = 不在）。</summary>
+        private int ToolAt(Point p)
+        {
+            EnsureLayout();
+            for (int i = 0; i < toolRects.Length; i++)
+                if (i != (int)Tool.Settings && toolRects[i].Contains(p)) return i;
+            if (settingsRect.Contains(p)) return (int)Tool.Settings;
+            return -1;
         }
 
         /// <summary>
@@ -276,6 +345,18 @@ namespace TabbedExplorer
             return CloseBounds(bounds[index]).Contains(p);
         }
 
+        /// <summary>标签第二行要显示什么：真目录就是完整路径，「此电脑」这类给个友好名。</summary>
+        public static string PathLine(string stored)
+        {
+            if (string.IsNullOrEmpty(stored)) return "";
+            if (stored.StartsWith("::", StringComparison.Ordinal))
+            {
+                if (string.Equals(stored, ExplorerView.ThisPcPath, StringComparison.OrdinalIgnoreCase)) return "此电脑";
+                return "系统文件夹";
+            }
+            return stored;
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             EnsureLayout();
@@ -299,7 +380,7 @@ namespace TabbedExplorer
                 {
                     // 选中标签：顶上一条 2px 蓝线，正好压住这一条的上边缘（原生死白就在这）
                     int accentH = Math.Max(2, Px(2));
-                    g.FillRectangle(new SolidBrush(Theme.Accent),
+                    g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),
                                     new Rectangle(tab.Left, tab.Top, tab.Width, accentH));
                 }
                 else if (i > 0)
@@ -328,21 +409,38 @@ namespace TabbedExplorer
                         new Rectangle(tab.Left + Px(TextPadLeft), tab.Top + (tab.Height - isz) / 2, isz, isz));
                 }
 
+                // ---- 两行文字：第一行文件夹名（加粗）/ 第二行完整路径 ----
                 int textLeft = tab.Left + Px(TextPadLeft) + isz + Px(IconGap);
-                Rectangle textRect = new Rectangle(textLeft, tab.Top,
-                                                   textRight - textLeft, tab.Height);
-                if (textRect.Width < 0) textRect.Width = 0;
+                int textW = textRight - textLeft;
+                if (textW < 0) textW = 0;
+                int line1H = Px(16), line2H = Px(13);
+                int blockTop = tab.Top + Math.Max(0, (tab.Height - (line1H + line2H + Px(2))) / 2);
 
-                TextRenderer.DrawText(g, tabs[i].Title, Font, textRect,
-                    tabs[i].Active ? Theme.Text : Theme.TextDim,
+                Color c1 = tabs[i].Active ? (inactive ? Theme.TextInactive : Theme.Text)
+                                          : (inactive ? Theme.TextInactive : Theme.TextDim);
+                Color c2 = inactive ? Theme.TextInactive : Theme.TextDim;
+                if (!tabs[i].Active && i != hoverIndex) c2 = inactive ? Theme.TextInactive : Theme.TextDim;
+
+                TextRenderer.DrawText(g, tabs[i].Title, titleFont,
+                    new Rectangle(textLeft, blockTop, textW, line1H), c1,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+                string pl = tabs[i].Path;
+                if (!string.IsNullOrEmpty(pl))
+                {
+                    TextRenderer.DrawText(g, pl, pathFont,
+                        new Rectangle(textLeft, blockTop + line1H + Px(2), textW, line2H),
+                        c2,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.PathEllipsis | TextFormatFlags.NoPadding);
+                }
 
                 if (showClose && roomForClose)
                 {
                     bool hc = i == hoverCloseIndex;
                     if (hc) g.FillRectangle(new SolidBrush(Color.FromArgb(232, 17, 35)), close);
-                    Color penColor = hc ? Color.White : Theme.TextDim;
+                    Color penColor = hc ? Color.White : (inactive ? Theme.TextInactive : Theme.TextDim);
                     Pen pen = new Pen(penColor, stroke * 1.4f);
                     int inset = Math.Max(3, Px(4));
                     int s2 = close.Width - inset * 2;
@@ -368,17 +466,70 @@ namespace TabbedExplorer
             if (hoverNew) g.FillRectangle(new SolidBrush(Theme.Hover), nb);
             int mx = nb.Left + nb.Width / 2, my = nb.Top + nb.Height / 2;
             int arm = Math.Max(4, Px(5));
-            Pen p2 = new Pen(hoverNew ? Theme.Text : Theme.TextDim, stroke * 1.6f);
+            Pen p2 = new Pen(hoverNew ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim), stroke * 1.6f);
             g.DrawLine(p2, mx - arm, my, mx + arm, my);
             g.DrawLine(p2, mx, my - arm, mx, my + arm);
             p2.Dispose();
 
-            // 最右边固定：设置按钮（左边一条竖线，跟标签区分开）
+            // ---- 右侧固定区：三个功能按钮 | 齿轮 ----
+            for (int i = 0; i < toolRects.Length; i++)
+            {
+                if (i == (int)Tool.Settings) continue;
+                Rectangle b = toolRects[i];
+                if (b.Right <= 0) continue;
+                if (i == hoverTool) g.FillRectangle(new SolidBrush(Theme.Hover), b);
+                Color fg = (i == hoverTool) ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim);
+                if (i == (int)Tool.Fav && favBarOn) fg = inactive ? Theme.AccentDim : Theme.Accent;
+                TextRenderer.DrawText(g, GlyphOf((Tool)i), glyphFont, b, fg,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+
+            // 齿轮左边那条竖线（跟 Edge 一样把齿轮单独隔开）
+            g.DrawLine(new Pen(Theme.Border), dividerX, Px(9), dividerX, Height - Px(9));
+
             Rectangle sbr = settingsRect;
-            Color sBack = hoverSettings ? Theme.Hover : Theme.TabBar;
-            if (hoverSettings) g.FillRectangle(new SolidBrush(sBack), sbr);
-            g.DrawLine(new Pen(Theme.Border), sbr.Left, Px(6), sbr.Left, Height - Px(6));
-            DrawGear(g, sbr, hoverSettings ? Theme.Text : Theme.TextDim, sBack, stroke);
+            Color sBack = hoverTool == (int)Tool.Settings ? Theme.Hover : Theme.TabBar;
+            if (hoverTool == (int)Tool.Settings) g.FillRectangle(new SolidBrush(sBack), sbr);
+            DrawGear(g, sbr, hoverTool == (int)Tool.Settings ? Theme.Text
+                             : (inactive ? Theme.TextInactive : Theme.TextDim), sBack, stroke);
+        }
+
+        /// <summary>
+        /// 三个功能按钮的图标。用的是 `Segoe MDL2 Assets` 的码位 ——
+        /// 这几个都拿 PIL 渲染对照图**看过实物**才写的（E81C 带逆时针箭头的钟 = 历史、
+        /// E7A7 回弯箭头 = 恢复、E734/E735 空心/实心星 = 收藏夹栏开没开），别凭记忆改。
+        /// </summary>
+        private string GlyphOf(Tool t)
+        {
+            switch (t)
+            {
+                case Tool.History: return "\uE81C";
+                case Tool.Reopen: return "\uE7A7";
+                case Tool.Fav: return favBarOn ? "\uE735" : "\uE734";
+            }
+            return "";
+        }
+
+        private string TipOf(Tool t)
+        {
+            switch (t)
+            {
+                case Tool.History: return "历史记录(Ctrl+H)";
+                case Tool.Reopen: return "恢复关闭的标签页(Ctrl+Shift+T)";
+                case Tool.Fav: return (favBarOn ? "隐藏" : "显示") + "收藏夹栏(Ctrl+Shift+B)";
+                case Tool.Settings: return "设置";
+            }
+            return "";
+        }
+
+        /// <summary>弹提示。同一个目标只弹一次（换了才重弹，否则鼠标一动就闪）。</summary>
+        private void ShowTip(string key, string text, Rectangle anchor)
+        {
+            if (string.Equals(key, tipKey, StringComparison.Ordinal)) return;
+            tipKey = key;
+            if (key == null) { tips.Hide(this); return; }
+            if (anchor.Right > Width) anchor.X = Math.Max(0, Width - anchor.Width - Px(40));
+            tips.Show(text, this, anchor.Left, anchor.Bottom + Px(2), 8000);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -392,20 +543,43 @@ namespace TabbedExplorer
             if (hc != hoverCloseIndex) { hoverCloseIndex = hc; changed = true; }
             bool hn = NewButtonBounds().Contains(e.Location);
             if (hn != hoverNew) { hoverNew = hn; changed = true; }
-            bool hs = SettingsBounds().Contains(e.Location);
-            if (hs != hoverSettings) { hoverSettings = hs; changed = true; }
+            int ht = ToolAt(e.Location);
+            if (ht != hoverTool) { hoverTool = ht; changed = true; }
 
-            // 停在标签上就报完整文件夹名（提示贴着标签下边出来）
-            if (idx != tipIndex)
+            // ---- 悬停提示：一个「目标 key」驱动，标签 / 关闭 / 各按钮都走这一条 ----
+            string key = null, text = null;
+            Rectangle anchor = Rectangle.Empty;
+            if (ht >= 0)
             {
-                tipIndex = idx;
-                if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
-                {
-                    Rectangle tb = bounds[idx];
-                    tips.Show(tabs[idx].Title, this, tb.Left, tb.Bottom + Px(2), 8000);
-                }
-                else tips.Hide(this);
+                key = "tool:" + ht;
+                text = TipOf((Tool)ht);
+                anchor = ht == (int)Tool.Settings ? settingsRect : toolRects[ht];
             }
+            else if (hn)
+            {
+                key = "new";
+                text = "新建标签页(Ctrl+T)";
+                anchor = newRect;
+            }
+            else if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
+            {
+                anchor = bounds[idx];
+                if (hc == idx)
+                {
+                    key = "close:" + idx;
+                    text = "关闭标签页(Ctrl+W)";
+                    anchor = CloseBounds(anchor);
+                }
+                else
+                {
+                    key = "tab:" + idx;
+                    string p = tabs[idx].Path;
+                    // 标签上名字被省略号截了也能看全；顺带把完整路径也带上
+                    text = string.IsNullOrEmpty(p) ? tabs[idx].Title
+                         : tabs[idx].Title + "\r\n" + p;
+                }
+            }
+            ShowTip(key, text, anchor);
 
             if (changed) Invalidate();
 
@@ -419,22 +593,42 @@ namespace TabbedExplorer
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverSettings = false;
-            tipIndex = -1;
-            tips.Hide(this);
+            hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverTool = -1;
+            ShowTip(null, null, Rectangle.Empty);
             Invalidate();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            tips.Hide(this);
-            tipIndex = -1;
-            if (e.Button == MouseButtons.Left && SettingsBounds().Contains(e.Location))
+            ShowTip(null, null, Rectangle.Empty);
+
+            if (e.Button == MouseButtons.Right)
             {
-                if (SettingsClicked != null) SettingsClicked(this, EventArgs.Empty);
+                int ri = HitTest(e.Location);
+                if (ri >= 0)
+                {
+                    if (TabRightClicked != null) TabRightClicked(this, ri);
+                }
+                else if (ToolAt(e.Location) < 0 && !NewButtonBounds().Contains(e.Location))
+                {
+                    // 空白区域（不是标签、不是按钮）
+                    if (BlankRightClicked != null) BlankRightClicked(e.Location);
+                }
                 return;
             }
+
+            if (e.Button == MouseButtons.Left)
+            {
+                int t = ToolAt(e.Location);
+                if (t >= 0)
+                {
+                    dragFromIndex = -1;
+                    if (ToolClicked != null) ToolClicked((Tool)t);
+                    return;
+                }
+            }
+
             if (NewButtonBounds().Contains(e.Location))
             {
                 if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
@@ -474,7 +668,13 @@ namespace TabbedExplorer
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && tips != null) tips.Dispose();
+            if (disposing)
+            {
+                if (tips != null) tips.Dispose();
+                if (titleFont != null) titleFont.Dispose();
+                if (pathFont != null) pathFont.Dispose();
+                if (glyphFont != null) glyphFont.Dispose();
+            }
             base.Dispose(disposing);
         }
 
@@ -482,7 +682,7 @@ namespace TabbedExplorer
         {
             base.OnDoubleClick(e);
             Point p = PointToClient(Cursor.Position);
-            if (HitTest(p) < 0 && !NewButtonBounds().Contains(p) && !SettingsBounds().Contains(p))
+            if (HitTest(p) < 0 && !NewButtonBounds().Contains(p) && ToolAt(p) < 0)
             {
                 if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
             }

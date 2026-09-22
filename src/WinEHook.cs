@@ -41,6 +41,8 @@ namespace TabbedExplorer
         private const int VK_E = 0x45;
         private const int VK_T = 0x54;
         private const int VK_W = 0x57;
+        private const int VK_H = 0x48;
+        private const int VK_B = 0x42;
         private const int VK_LWIN = 0x5B;
         private const int VK_RWIN = 0x5C;
         private const uint GA_ROOT = 2;
@@ -61,6 +63,12 @@ namespace TabbedExplorer
         /// <summary>吞到 Ctrl+Tab / Ctrl+Shift+Tab（下一个 / 上一个标签）。</summary>
         public event Action NextTabKey;
         public event Action PrevTabKey;
+        /// <summary>吞到 Ctrl+H（历史记录）。</summary>
+        public event Action HistoryKey;
+        /// <summary>吞到 Ctrl+Shift+T（恢复刚关掉的标签页）。</summary>
+        public event Action ReopenTabKey;
+        /// <summary>吞到 Ctrl+Shift+B（显示/隐藏收藏夹栏）。</summary>
+        public event Action FavBarKey;
 
         /// <summary>
         /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管 Ctrl 系快捷键** ——
@@ -146,6 +154,11 @@ namespace TabbedExplorer
             if (vk == VK_T && !shift) { Raise(NewTabKey); return true; }
             if (vk == VK_W && !shift) { Raise(CloseTabKey); return true; }
             if (vk == VK_TAB) { Raise(shift ? PrevTabKey : NextTabKey); return true; }
+            // ---- 2026-09-22 新加的三个，都跟浏览器对齐 ----
+            if (vk == VK_T && shift) { Raise(ReopenTabKey); return true; }   // Ctrl+Shift+T 恢复关闭的标签
+            if (vk == VK_H && !shift) { Raise(HistoryKey); return true; }    // Ctrl+H 历史记录
+            // ⚠ 收藏夹栏必须是 **Ctrl+Shift+B**：Ctrl+B 在资源管理器里是「导航窗格」，别抢
+            if (vk == VK_B && shift) { Raise(FavBarKey); return true; }
             return false;
         }
 

@@ -38,6 +38,7 @@ namespace TabbedExplorer
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
         private const int WM_NCHITTEST = 0x0084;
+        private const int WM_NCACTIVATE = 0x0086;
         private const int WM_GETMINMAXINFO = 0x0024;
         private const int WM_SETTINGCHANGE = 0x001A;
         private const int HTCLIENT = 1;
@@ -59,8 +60,32 @@ namespace TabbedExplorer
         private bool restored;
 
         /// <summary>齿轮菜单 + 它开着没开着的标记（防止点两下弹出两层）。</summary>
-        private ContextMenuStrip gearMenu;
+        private ContextMenu gearMenu;
         private bool gearMenuOpen;
+
+        /// <summary>刚关掉的标签路径（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
+        private readonly List<string> closedTabs = new List<string>();
+        private const int ClosedKeep = 20;
+
+        /// <summary>收藏夹栏（Ctrl+Shift+B 开关）。</summary>
+        private readonly FavBar favBar;
+        private bool favBarOn;
+
+        /// <summary>标签条空白处右键时鼠标在哪儿 —— 菜单要弹在那个点上。</summary>
+        private Point blankAt;
+
+        /// <summary>「收进托盘」那条提示只弹一次（原来靠 Hub 的 once 参数，现在提示归我们自己管）。</summary>
+        private bool trayTipShown;
+
+        // ---- 起 explorer 的串行队列（见 PumpLaunch）----
+        private sealed class Launch
+        {
+            public ExplorerHost Host;
+            public string Path;
+        }
+        private readonly Queue<Launch> launchQueue = new Queue<Launch>();
+        /// <summary>现在正在起（还没 Ready / Failed）的那个 —— 一次只允许有一个。</summary>
+        private ExplorerHost launching;
 
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
@@ -113,15 +138,57 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 点击新建标签");
                 NewTab(CurrentPath());
             };
-            tabStrip.SettingsClicked += delegate
+            // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 收藏夹栏
+            tabStrip.ToolClicked += delegate(TabStrip.Tool t)
             {
-                Diag.Step("EmbedForm: 点击设置按钮");
-                // ⚠ 不能在这里同步弹菜单（卡死的元凶）：鼠标消息还没走完就切鼠标捕获，
-                // 菜单的 modal 过滤器会和控件的捕获打架。排到当前消息处理完之后再弹。
-                if (IsDisposed || Disposing || !IsHandleCreated) return;
-                try { BeginInvoke((MethodInvoker)delegate { ShowSettingsMenu(); }); }
-                catch (Exception ex) { Diag.Log("EmbedForm: 排设置菜单失败 " + ex.Message); }
+                switch (t)
+                {
+                    case TabStrip.Tool.Settings:
+                        Diag.Step("EmbedForm: 点击设置按钮");
+                        Defer(ShowSettingsMenu);
+                        break;
+                    case TabStrip.Tool.History:
+                        Diag.Step("EmbedForm: 点击历史按钮");
+                        Defer(ShowHistoryMenu);
+                        break;
+                    case TabStrip.Tool.Reopen:
+                        Diag.Step("EmbedForm: 点击恢复关闭按钮");
+                        ReopenClosedTab();
+                        break;
+                    case TabStrip.Tool.Fav:
+                        Diag.Step("EmbedForm: 点击收藏夹栏按钮");
+                        if (hub != null) hub.SetFavBar(!favBarOn);
+                        break;
+                }
             };
+            // 标签右键（复制名称 / 复制完整路径 / 关闭）
+            tabStrip.TabRightClicked += delegate(object s, int i)
+            {
+                int idx = i;
+                Diag.Step("EmbedForm: 标签右键 idx=" + idx);
+                Defer(delegate { ShowTabMenu(idx); });
+            };
+            // 标签条空白处右键（把三个功能也放一份在这儿）
+            tabStrip.BlankRightClicked += delegate(Point p)
+            {
+                Diag.Step("EmbedForm: 标签条空白处右键 " + p.X + "," + p.Y);
+                blankAt = p;
+                Defer(ShowBlankMenu);
+            };
+
+            favBar = new FavBar();
+            favBar.ItemClicked += delegate(string path)
+            {
+                Diag.Step("EmbedForm: 收藏夹 -> " + path);
+                NewTab(path);
+            };
+            // 收藏夹栏上右键「隐藏收藏夹栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
+            favBar.HideRequested += delegate
+            {
+                Diag.Step("EmbedForm: 收藏夹栏右键 -> 隐藏");
+                if (hub != null) hub.SetFavBar(false);
+            };
+            favBar.Visible = false;
 
             content = new Panel();
             content.BackColor = Theme.Chrome;
@@ -131,6 +198,7 @@ namespace TabbedExplorer
             // 底部**不再有状态栏**（川：最下面的文件夹名去掉，标签上已经显示了）。
             Controls.Add(titleBar);
             Controls.Add(tabStrip);
+            Controls.Add(favBar);
             Controls.Add(content);
 
             ApplyTheme();
@@ -165,6 +233,18 @@ namespace TabbedExplorer
                 top += hTitle;
                 tabStrip.SetBounds(r.Left, top, r.Width, hTab);
                 top += hTab;
+
+                // 收藏夹栏（Ctrl+Shift+B 开）：夹在标签条和内容之间，跟浏览器一样
+                if (favBar != null)
+                {
+                    if (favBarOn)
+                    {
+                        int hFav = Px(FavBar.StdHeight);
+                        favBar.SetBounds(r.Left, top, r.Width, hFav);
+                        top += hFav;
+                    }
+                    favBar.Visible = favBarOn;
+                }
 
                 // 内容直接吃到窗口底（以前底下还压着一条 22px 的状态栏）
                 int hContent = r.Bottom - top;
@@ -281,6 +361,12 @@ namespace TabbedExplorer
                 }
                 return;
             }
+            if (m.Msg == WM_NCACTIVATE)
+            {
+                // 激活 / 失活：把「未激活」状态发给自绘的标题栏和标签条。
+                // wParam 非 0 = 正在激活（-1 那种「不要重画」也算激活）。
+                SetInactive(m.WParam == IntPtr.Zero);
+            }
             base.WndProc(ref m);
         }
 
@@ -363,18 +449,16 @@ namespace TabbedExplorer
                     if (o == VdOutcome.Failed)
                     {
                         if (!Visible) Show();
-                        if (hub != null)
-                            hub.Notify("打不开：窗口在别的虚拟桌面",
-                                "没能把这个窗口搬到当前桌面。回到它所在的桌面再试。", false);
+                        Toast.Show("打不开：窗口在别的虚拟桌面",
+                            "没能把这个窗口搬到当前桌面。回到它所在的桌面再试。");
                         return;
                     }
                 }
                 else if (!VirtualDesktop.IsOnCurrentDesktop(Handle))
                 {
                     Diag.Step("EmbedForm: 窗口不在当前桌面 -> 不显示、不抢前台（不切走）");
-                    if (hub != null)
-                        hub.Notify("打不开：窗口在别的虚拟桌面",
-                            "这个窗口属于另一张虚拟桌面。回到那张桌面再按 Win+E。", false);
+                    Toast.Show("打不开：窗口在别的虚拟桌面",
+                        "这个窗口属于另一张虚拟桌面。回到那张桌面再按 Win+E。");
                     return;
                 }
 
@@ -401,6 +485,29 @@ namespace TabbedExplorer
                 MarkDirty();
             }
             catch (Exception ex) { Diag.Log("EmbedForm: ShowForUser 失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 「川自己打开的文件夹窗口被收进来了」—— 需要现身把它露出来。
+        ///
+        /// 跟 `ShowForUser` 的区别（**别混用**）：
+        ///   · 不 `EnsureFirstTab`（标签刚收进来就是第一个，不能再自作主张开一个「此电脑」）；
+        ///   · 不判虚拟桌面（那个窗口本来就开在川眼前，他在哪张桌面我们就在哪张）；
+        ///   · 不 `newTab`（收进来的那个就是要看的那个）。
+        /// 但**要**抢一下前台：他刚双击文件夹，本该有一扇窗弹到最前面；
+        /// 我们把那扇窗藏了收进标签，就得由我们把窗口顶上来，不然他眼前像是「什么都没发生」。
+        /// </summary>
+        internal void ShowForCapture()
+        {
+            if (IsDisposed || Disposing) return;
+            try
+            {
+                if (!Visible) Show();
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                ActivateToFront();
+                MarkDirty();
+            }
+            catch (Exception ex) { Diag.Log("EmbedForm: ShowForCapture 失败 " + ex.Message); }
         }
 
         /// <summary>
@@ -431,6 +538,15 @@ namespace TabbedExplorer
                     }
                     if (wantIdx < 0 && !string.IsNullOrEmpty(b.Active) && PathRules.Same(p, b.Active))
                         wantIdx = hosts.Count;    // 记下的「当时选中那个」是第几个
+                    // 同一个路径已经有标签了就别再开一个。
+                    // 记忆文件里偶尔会有重复行（老版本并发开标签时写坏的），去重放在这儿最稳：
+                    // 不管文件脏成什么样，界面上都不会冒出两个一模一样的标签。
+                    if (IndexOfPath(p) >= 0)
+                    {
+                        skipped++;
+                        Diag.Step("记忆: 「" + p + "」已经有标签了，跳过重复项");
+                        continue;
+                    }
                     NewTab(p);
                 }
                 Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个）",
@@ -480,9 +596,11 @@ namespace TabbedExplorer
             Diag.Step("EmbedForm: 收进托盘（进程常驻，继续接 Win+E）");
             Visible = false;
             MarkDirty();
-            if (hub != null)
-                hub.Notify("TabbedExplorer 还在后台",
-                    "按 Win+E 随时打开；右键托盘图标可以退出。", true);
+            if (!trayTipShown)
+            {
+                trayTipShown = true;
+                Toast.Show("TabbedExplorer 还在后台", "按 Win+E 随时打开；右键托盘图标可以退出。");
+            }
         }
 
         // ==================================================================
@@ -496,6 +614,26 @@ namespace TabbedExplorer
             if (what == "Ctrl+W") { HotkeyCloseTab(); return; }
             if (what == "Ctrl+Tab") { CycleTab(1); return; }
             if (what == "Ctrl+Shift+Tab") { CycleTab(-1); return; }
+            // ---- 2026-09-22 新加的三个（都跟浏览器对齐）----
+            if (what == "Ctrl+H")
+            {
+                Diag.Step("EmbedForm: 热键 Ctrl+H -> 历史记录");
+                if (!Visible) Show();
+                Defer(ShowHistoryMenu);
+                return;
+            }
+            if (what == "Ctrl+Shift+T")
+            {
+                Diag.Step("EmbedForm: 热键 Ctrl+Shift+T -> 恢复关闭的标签");
+                ReopenClosedTab();
+                return;
+            }
+            if (what == "Ctrl+Shift+B")
+            {
+                Diag.Step("EmbedForm: 热键 Ctrl+Shift+B -> 收藏夹栏开关");
+                if (hub != null) hub.SetFavBar(!favBarOn);
+                return;
+            }
         }
 
         /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。</summary>
@@ -583,6 +721,80 @@ namespace TabbedExplorer
         // ==================================================================
         private void NewTab(string path)
         {
+            ExplorerHost h = AddHost();
+            int i = hosts.IndexOf(h);
+            // 第二行先摆上要去的路径 —— explorer 要 3 秒才起得来，这 3 秒里也别让第二行空着
+            tabStrip.SetPath(i, TabStrip.PathLine(PathRules.Store(path)));
+            h.PresetTarget(path);     // 排队期间也得知道要去哪儿（否则中途保存记忆会把它丢掉）
+            Diag.Step("EmbedForm: 排入队列 " + path);
+            launchQueue.Enqueue(new Launch { Host = h, Path = path });
+            PumpLaunch();
+            Activate(i);
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// 起 explorer —— **一次只起一个**，排成队依次来。
+        ///
+        /// 这是「有时候标签页点开是空的」的**根治**（2026-09-22）：
+        /// 原来还原 6 个标签就是**一口气起 6 个 explorer**，6 个窗口几乎同时冒出来，
+        /// 而每个标签都只能靠「扫一个刚出现的新窗口」来认自己那个 —— 于是互相认错，
+        /// 或者谁都认不到、空等 25 秒超时（日志里就是这么演的）。
+        /// 串起来之后，任何时刻只有一个标签在找窗口，**一一对应**是确定的，不用再猜。
+        ///
+        /// 代价是「还原 6 个标签」要 6 次 × 大约一两秒。可以接受：标签是**立刻**就出来的
+        /// （显示「打开中…」+ 目标路径），内容各填各的 —— 浏览器也是这个样子。
+        /// </summary>
+        private void PumpLaunch()
+        {
+            if (launching != null || IsDisposed || Disposing) return;
+            while (launchQueue.Count > 0)
+            {
+                Launch j = launchQueue.Dequeue();
+                if (j.Host == null || !hosts.Contains(j.Host)) continue;   // 排队期间被关掉了
+                launching = j.Host;
+                Diag.Step("EmbedForm: 起 explorer（串行）" + j.Path);
+                j.Host.Start(j.Path);
+                return;
+            }
+        }
+
+        /// <summary>一个标签起完了（成了 / 失败了）—— 轮到队列里的下一个。</summary>
+        private void LaunchDone(ExplorerHost h)
+        {
+            if (launching != h) return;
+            launching = null;
+            PumpLaunch();
+        }
+
+        /// <summary>
+        /// 开一个「接管别人窗口」的标签 —— 川从开始菜单 / 桌面双击打开的那个文件夹（Bug 1）。
+        /// 跟 `NewTab` 唯一的区别：**不起新 explorer**，直接把已经存在的那个窗口收进来。
+        /// 所以它**不进队列**（队列的意义是「别同时起两个进程」，这条不进程）。
+        /// </summary>
+        internal bool NewAdoptedTab(IntPtr cab, int pid)
+        {
+            if (IsDisposed || Disposing || cab == IntPtr.Zero) return false;
+            foreach (ExplorerHost e in hosts)
+            {
+                if (e != null && e.CabWindow == cab) return false;   // 已经收过了
+            }
+            ExplorerHost h = AddHost();
+            int i = hosts.IndexOf(h);
+            tabStrip.SetPath(i, "（收进来的窗口）");
+            h.Adopt(cab, pid);
+            Activate(i);
+            MarkDirty();
+            return true;
+        }
+
+        /// <summary>
+        /// 建一个标签 + 一个空的 shell 容器，把事件全接好。**怎么把它开起来由调用方决定**：
+        /// 自己起一个（`NewTab` → `Start`）还是接管现成的（`NewAdoptedTab` → `Adopt`）。
+        /// 两条路后面完全一样：等 explorer 加载完 → Ready → 嵌进来。
+        /// </summary>
+        private ExplorerHost AddHost()
+        {
             ExplorerHost h = new ExplorerHost();
             h.Host.Dock = DockStyle.Fill;
             h.Host.Visible = false;
@@ -597,11 +809,7 @@ namespace TabbedExplorer
             h.IconChanged += delegate(object s, EventArgs e) { OnHostIconChanged(h); };
             h.PathChanged += delegate(object s, EventArgs e) { OnHostPathChanged(h); };
             h.Died += OnHostDied;
-
-            Diag.Step("EmbedForm: 打开 " + path + "（新 explorer 窗口约需 3 秒）");
-            h.Start(path);
-            Activate(hosts.IndexOf(h));
-            MarkDirty();
+            return h;
         }
 
         private void OnHostReady(ExplorerHost h)
@@ -610,6 +818,8 @@ namespace TabbedExplorer
             if (i < 0) return;                       // 已经关掉了
             tabStrip.SetTitle(i, h.CurrentDisplayName);
             tabStrip.SetIcon(i, h.TabIcon);
+            tabStrip.SetPath(i, TabStrip.PathLine(LivePath(h)));
+            History.Add(LivePath(h));                // 真打开了才算「去过」
             if (i == activeIndex)
             {
                 h.Host.Visible = true;
@@ -618,6 +828,7 @@ namespace TabbedExplorer
                 h.Focus();
             }
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
+            LaunchDone(h);   // 这一个起完了，队列里的下一个可以动了
         }
 
         /// <summary>
@@ -646,9 +857,19 @@ namespace TabbedExplorer
             tabStrip.SetIcon(i, h.TabIcon);
         }
 
-        /// <summary>这个标签导航到了别的文件夹 —— 记忆里的路径要跟着变（标题多半同时也会变）。</summary>
+        /// <summary>
+        /// 这个标签导航到了别的文件夹 —— 标题、第二行路径、记忆里的路径都要跟着变。
+        /// （`TitleChanged` 和 `PathChanged` 是两条独立事件，导航时不一定同时到，所以两边都刷一遍。）
+        /// </summary>
         private void OnHostPathChanged(ExplorerHost h)
         {
+            int i = hosts.IndexOf(h);
+            if (i >= 0)
+            {
+                string p = LivePath(h);
+                tabStrip.SetPath(i, TabStrip.PathLine(p));
+                History.Add(p);
+            }
             MarkDirty();
         }
 
@@ -656,8 +877,26 @@ namespace TabbedExplorer
         {
             int i = hosts.IndexOf(h);
             if (i < 0) return;
+            string want = h.TargetPath;
+            string why = h.LastError ?? "（没有错误文本）";
             tabStrip.SetTitle(i, "打开失败");
-            Diag.Log("EmbedForm: 标签打开失败 " + (h.LastError ?? "（没有错误文本）"));
+            tabStrip.SetPath(i, why);
+            Diag.Log("EmbedForm: 标签打开失败 " + why);
+
+            LaunchDone(h);   // 先让队列往前走（这一个已经结束了）
+
+            // 干等 25 秒 —— 多半是那个窗口被别人抢了 / explorer 这次没给新建窗口。
+            // 自动再来一次，别把一个黑标签留在那儿等川自己发现。
+            // 只重试一次（Retried 标记），重试还不行就老实报错。重试也走队列，别破坏串行。
+            if (!h.Retried && !string.IsNullOrEmpty(want) && PathRules.Restorable(want))
+            {
+                h.Retried = true;
+                Diag.Step("EmbedForm: 自动重试一次「" + want + "」");
+                tabStrip.SetTitle(i, "重试中…");
+                tabStrip.SetPath(i, TabStrip.PathLine(PathRules.Store(want)));
+                launchQueue.Enqueue(new Launch { Host = h, Path = want });
+                PumpLaunch();
+            }
         }
 
         /// <summary>
@@ -689,6 +928,18 @@ namespace TabbedExplorer
         {
             if (idx < 0 || idx >= hosts.Count) return;
             ExplorerHost h = hosts[idx];
+
+            // 记进「刚关掉的」栈 —— Ctrl+Shift+T 要按「后进先出」往回捞：
+            // 点一下恢复最近关的那个、再点一下恢复上上个（川的要求）。
+            string gone = LivePath(h);
+            if (PathRules.Restorable(gone))
+            {
+                closedTabs.RemoveAll(delegate(string s) { return PathRules.Same(s, gone); });
+                closedTabs.Add(gone);
+                while (closedTabs.Count > ClosedKeep) closedTabs.RemoveAt(0);
+                Diag.Step("EmbedForm: 记下关掉的标签「" + gone + "」（栈里 " + closedTabs.Count + " 个）");
+            }
+
             hosts.RemoveAt(idx);
             activeIndex = -1;                        // 索引全变了，重新算
             Diag.Step(string.Format("EmbedForm: CloseTab idx={0}，剩 {1} 个", idx, hosts.Count));
@@ -700,6 +951,14 @@ namespace TabbedExplorer
                 h.Dispose();
             }
             catch (Exception ex) { Diag.Log("EmbedForm: 关标签失败 " + ex.Message); }
+
+            // 关掉的正好是「正在起」的那个：队列得往前走，不然后面排着的全卡住
+            if (launching == h)
+            {
+                launching = null;
+                Diag.Step("EmbedForm: 正在起的那个被关了，队列继续");
+                PumpLaunch();
+            }
 
             tabStrip.RemoveTab(idx);
 
@@ -730,47 +989,216 @@ namespace TabbedExplorer
         /// 齿轮弹出来的设置菜单。真正的内容由 `SettingsMenu` 统一生成（托盘右键也是它），
         /// 这里只负责「什么时候弹、弹在哪儿」。
         ///
-        /// ⚠ 两个坑都在这段里（川报的「点设置齿轮直接卡死」）：
-        ///   ① **不能在 MouseDown 里同步弹** —— 排到消息处理完之后（调用方 BeginInvoke）；
-        ///   ② 菜单**不挂 owner 控件**，直接给屏幕坐标；挂 owner 会把菜单跟控件的
-        ///      激活/捕获关系缠在一起，最容易卡死或一闪就没。
-        /// 菜单每次重新建（勾选状态是活的），关掉就 dispose。
+        /// ⚠ 卡死的两个坑都在这段里，2026-09-22 连踩三次才收干净：
+        ///   ① **不能在 MouseDown 里同步弹** —— 鼠标消息没走完就切鼠标捕获，菜单的模态循环
+        ///      跟控件的捕获互相等。所以调用方一律走 `BeginInvoke`（见构造函数里的订阅）。
+        ///   ② 菜单类型必须是 **`ContextMenu`**（跟托盘同一个类），**不能**用 `ContextMenuStrip`
+        ///      再「不挂 owner 直接给屏幕坐标」—— 那个组合弹出来是非模态的、还抢着鼠标捕获，
+        ///      从用户角度就是界面上什么都不响应（而日志里 `Show` 早就返回了，看着一切正常）。
+        /// `ContextMenu.Show(owner, point)` 走 WinForms 的模态菜单循环：**一直阻塞到菜单关掉**，
+        /// 所以「弹菜单返回」这行日志出现时菜单一定已经关了，卡没卡一眼可辨。
         /// </summary>
         private void ShowSettingsMenu()
         {
             if (hub == null || gearMenuOpen || IsDisposed || Disposing) return;
             gearMenuOpen = true;
+            ContextMenu m = null;
             try
             {
                 Diag.Step("EmbedForm: 建设置菜单");
-                ContextMenuStrip m = SettingsMenu.BuildGear(hub);
+                m = SettingsMenu.BuildGear(hub);
                 gearMenu = m;
-                m.Closed += delegate
-                {
-                    gearMenuOpen = false;
-                    gearMenu = null;
-                    try { m.Dispose(); } catch { }
-                    Diag.Step("EmbedForm: 设置菜单已关");
-                };
 
-                Size sz = m.GetPreferredSize(Size.Empty);
-                Point at = tabStrip.PointToScreen(new Point(tabStrip.Width, tabStrip.Height));
-                Rectangle wa = Screen.FromControl(tabStrip).WorkingArea;
-                int x = at.X - sz.Width;                              // 右对齐到齿轮
-                if (x + sz.Width > wa.Right) x = wa.Right - sz.Width;
-                if (x < wa.Left) x = wa.Left;
-                int y = at.Y;                                          // 贴在标签条下边
-                if (y + sz.Height > wa.Bottom) y = Math.Max(wa.Top, at.Y - tabStrip.Height - sz.Height);
-
-                Diag.Step(string.Format("EmbedForm: 弹菜单 at {0},{1} 尺寸 {2}x{3}", x, y, sz.Width, sz.Height));
-                m.Show(new Point(x, y));
-                Diag.Step("EmbedForm: 弹菜单返回");
+                // 菜单宽度量不出来（Menu 没有 GetPreferredSize），所以把锚点放在齿轮**中心**：
+                // 菜单从那儿往右铺，超出屏幕时 TrackPopupMenu 自己会挪回来。
+                Rectangle sb = tabStrip.SettingsButtonBounds();
+                Point at = tabStrip.PointToScreen(new Point(sb.Left + sb.Width / 2, sb.Bottom));
+                Point local = tabStrip.PointToClient(at);
+                Diag.Step(string.Format("EmbedForm: 弹菜单（模态）锚点 {0},{1}", at.X, at.Y));
+                m.Show(tabStrip, local);
+                Diag.Step("EmbedForm: 菜单已关");
             }
             catch (Exception ex)
             {
-                gearMenuOpen = false;
                 Diag.Log("EmbedForm: 设置菜单失败 " + ex);
             }
+            finally
+            {
+                gearMenuOpen = false;
+                gearMenu = null;
+                if (m != null) { try { m.Dispose(); } catch { } }
+            }
+        }
+
+        // ==================================================================
+        // 历史 / 恢复关闭 / 右键菜单 / 收藏夹栏（2026-09-22 川点名的三个新功能）
+        // ==================================================================
+
+        /// <summary>
+        /// 把一件事推到「当前这轮消息处理完之后」再干。
+        ///
+        /// 为什么一律这么走（就是齿轮卡死那个坑的根）：弹菜单、关标签这种动作如果在控件的
+        /// `MouseDown` 里同步做，鼠标消息还没走完就切了鼠标捕获，菜单的模态循环跟控件的捕获互相等
+        /// —— 界面就死了。跳出一个消息循环再动手，两个循环永远不会叠在一起。
+        /// </summary>
+        private void Defer(Action a)
+        {
+            if (a == null || IsDisposed || Disposing) return;
+            try { BeginInvoke(a); }
+            catch (Exception ex) { Diag.Log("EmbedForm: Defer 失败 " + ex.Message); }
+        }
+
+        /// <summary>Ctrl+H / 历史按钮：列出去过的文件夹，挑一个开成新标签。</summary>
+        private void ShowHistoryMenu()
+        {
+            if (IsDisposed || Disposing) return;
+            ShowPopupAtTool(TabStrip.Tool.History, History.BuildMenu(delegate(string p)
+            {
+                Diag.Step("EmbedForm: 历史 -> " + p);
+                Defer(delegate
+                {
+                    if (!Visible) Show();
+                    int dup = IndexOfPath(p);
+                    if (dup >= 0) Activate(dup);
+                    else NewTab(p);
+                });
+            }));
+        }
+
+        /// <summary>
+        /// 在某个工具按钮正下方弹一份菜单。
+        /// 锚点跟齿轮那条同一个算法：按**按钮中心**定位，菜单自己会往回挪（不会跑出屏幕）。
+        /// </summary>
+        private void ShowPopupAtTool(TabStrip.Tool tool, MenuItem[] items)
+        {
+            if (items == null || items.Length == 0) return;
+            Rectangle b = tabStrip.ToolButtonBounds(tool);
+            Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
+            ContextMenu m = new ContextMenu(items);
+            try { m.Show(tabStrip, tabStrip.PointToClient(at)); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 弹菜单失败 " + ex); }
+            finally { try { m.Dispose(); } catch { } }
+        }
+
+        /// <summary>Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出）。</summary>
+        private void ReopenClosedTab()
+        {
+            if (closedTabs.Count == 0)
+            {
+                Diag.Step("EmbedForm: 恢复关闭的标签，但栈是空的");
+                Toast.Show("没有可恢复的标签页", "这次运行里还没关过标签。");
+                return;
+            }
+            string p = closedTabs[closedTabs.Count - 1];
+            closedTabs.RemoveAt(closedTabs.Count - 1);
+            Diag.Step("EmbedForm: 恢复关闭的标签「" + p + "」（栈里还剩 " + closedTabs.Count + "）");
+            if (!Visible) Show();
+            int dup = IndexOfPath(p);
+            if (dup >= 0) Activate(dup);   // 已经开着（历史/收藏夹又开过）就切过去，别开两个一样的
+            else NewTab(p);
+        }
+
+        /// <summary>标签上右键：复制文件夹名 / 复制完整路径 / 关闭（川点名的三条）。</summary>
+        private void ShowTabMenu(int idx)
+        {
+            if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
+            string title = tabStrip.Tabs[idx].Title;
+            string live = LivePath(hosts[idx]);
+            string target = PathRules.Restorable(live) ? live : hosts[idx].TargetPath;
+
+            List<MenuItem> m = new List<MenuItem>();
+            m.Add(new MenuItem("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
+            m.Add(new MenuItem("复制完整路径", delegate { CopyText(target, "完整路径"); }));
+            m.Add(new MenuItem("-"));
+            m.Add(new MenuItem("在新标签页打开", delegate
+            {
+                if (!PathRules.Restorable(target))
+                {
+                    Toast.Show("开不了", "这个位置没有真实路径（库/虚拟文件夹）。");
+                    return;
+                }
+                string p = target;
+                Defer(delegate { NewTab(p); });
+            }));
+            m.Add(new MenuItem("重新打开刚关闭的标签页(Ctrl+Shift+T)",
+                delegate { Defer(ReopenClosedTab); }));
+            m.Add(new MenuItem("-"));
+            m.Add(new MenuItem("关闭标签页(Ctrl+W)", delegate { Defer(delegate { CloseTab(idx); }); }));
+
+            Rectangle b = tabStrip.TabBounds(idx);
+            Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
+            ContextMenu cm = new ContextMenu(m.ToArray());
+            try { cm.Show(tabStrip, tabStrip.PointToClient(at)); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 标签右键菜单失败 " + ex); }
+            finally { try { cm.Dispose(); } catch { } }
+        }
+
+        /// <summary>
+        /// 标签条空白处右键 —— 那三个新功能也在这儿放一份（川要的），
+        /// 顺带把「新建标签页」写出来（这块空白本来双击就是新建，写明白更好）。
+        /// </summary>
+        private void ShowBlankMenu()
+        {
+            if (IsDisposed || Disposing) return;
+            List<MenuItem> m = new List<MenuItem>();
+            m.Add(new MenuItem("新建标签页(Ctrl+T)", delegate { Defer(delegate { NewTab(CurrentPath()); }); }));
+            m.Add(new MenuItem("-"));
+            m.Add(new MenuItem("历史记录(Ctrl+H)", delegate { Defer(ShowHistoryMenu); }));
+            m.Add(new MenuItem("恢复关闭的标签页(Ctrl+Shift+T)", delegate { Defer(ReopenClosedTab); }));
+
+            bool on = favBarOn;
+            m.Add(new MenuItem((on ? "✓ " : "   ") + "显示收藏夹栏(Ctrl+Shift+B)", delegate
+            {
+                if (hub != null) hub.SetFavBar(!on);
+            }));
+
+            m.Add(new MenuItem("-"));
+            m.Add(new MenuItem("设置", delegate { Defer(ShowSettingsMenu); }));
+
+            ContextMenu cm = new ContextMenu(m.ToArray());
+            Point at = tabStrip.PointToScreen(blankAt);
+            try { cm.Show(tabStrip, tabStrip.PointToClient(at)); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 空白右键菜单失败 " + ex); }
+            finally { try { cm.Dispose(); } catch { } }
+        }
+
+        private void CopyText(string text, string what)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            try
+            {
+                Clipboard.SetText(text);
+                Toast.Show("已复制" + what, text);
+            }
+            catch (Exception ex) { Diag.Log("EmbedForm: 复制失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 收藏夹栏开关。**所有入口都汇到这一条**（Ctrl+Shift+B、按钮、设置菜单、空白右键、栏上右键），
+        /// 免得像当初「托盘没有设置项」那样漏一边。由 Hub 调（它要同时刷所有窗口 + 托盘菜单）。
+        /// </summary>
+        internal void SetFavBarOn(bool on)
+        {
+            if (IsDisposed || Disposing) return;
+            favBarOn = on;
+            tabStrip.FavBarOn = on;
+            if (on) favBar.Reload();
+            Diag.Step("EmbedForm: 收藏夹栏 -> " + (on ? "显示" : "隐藏"));
+            DoLayout();
+        }
+
+        internal bool FavBarOn { get { return favBarOn; } }
+
+        /// <summary>
+        /// 激活 / 失活（Bug 6：未激活时窗口颜色要跟 Windows 原本的逻辑一致）。
+        /// 原生标题栏失活会把标题字变灰、强调色变暗，我们照做：
+        /// 收到 `WM_NCACTIVATE` 就切自绘标题栏和标签条的 Inactive，它们自己重画。
+        /// </summary>
+        private void SetInactive(bool inactive)
+        {
+            if (titleBar != null) titleBar.Inactive = inactive;
+            if (tabStrip != null) tabStrip.Inactive = inactive;
+            if (favBar != null) favBar.Invalidate();
         }
 
         // ==================================================================
@@ -780,8 +1208,26 @@ namespace TabbedExplorer
         /// </summary>
         protected override void OnPreviewKeyDown(PreviewKeyDownEventArgs e)
         {
-            if (e.Control && e.KeyCode == Keys.T) { HotkeyNewTab(); e.IsInputKey = true; return; }
+            if (e.Control && e.KeyCode == Keys.T)
+            {
+                // Ctrl+Shift+T（恢复关闭的标签）跟 Ctrl+T 只差一个 Shift，先判带 Shift 的那个
+                if (e.Shift) ReopenClosedTab(); else HotkeyNewTab();
+                e.IsInputKey = true;
+                return;
+            }
             if (e.Control && e.KeyCode == Keys.W) { HotkeyCloseTab(); e.IsInputKey = true; return; }
+            if (e.Control && e.KeyCode == Keys.H)
+            {
+                Defer(ShowHistoryMenu);
+                e.IsInputKey = true;
+                return;
+            }
+            if (e.Control && e.Shift && e.KeyCode == Keys.B)
+            {
+                if (hub != null) hub.SetFavBar(!favBarOn);
+                e.IsInputKey = true;
+                return;
+            }
             if (e.Control && e.KeyCode == Keys.Tab)
             {
                 CycleTab(e.Shift ? -1 : 1);

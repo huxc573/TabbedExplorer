@@ -149,6 +149,33 @@ namespace TabbedExplorer
 
         private static Bitmap folderCache;
 
+        /// <summary>
+        /// 取「某个具体东西长什么样」的图标 —— 收藏夹栏那一排用。
+        /// 跟 `FolderIcon` 的区别是**这次要碰磁盘**（不带 `SHGFI_USEFILEATTRIBUTES`）：
+        ///   - `.lnk` 快捷方式 → shell 会把目标解析掉，给的就是它指向那个文件夹/程序的图标；
+        ///   - 普通目录 → 自定义图标（有 desktop.ini 的）也能拿到；
+        ///   - 认不出来的路径 → 退回通用文件夹图标。
+        /// 目标大于 16 就取 32px 那颗再缩（跟 FolderIcon 同一个理由：16px 放大是块状的）。
+        /// </summary>
+        public static Bitmap PathIcon(string path, int target)
+        {
+            if (string.IsNullOrEmpty(path)) return FolderIcon(target);
+            try
+            {
+                uint sizeFlag = target > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON;
+                SHFILEINFO fi = new SHFILEINFO();
+                IntPtr r = SHGetFileInfo(path, 0, ref fi,
+                    (uint)Marshal.SizeOf(typeof(SHFILEINFO)), SHGFI_ICON | sizeFlag);
+                if (r != IntPtr.Zero && fi.hIcon != IntPtr.Zero)
+                {
+                    try { return RenderIcon(fi.hIcon, target, false); }
+                    finally { DestroyIcon(fi.hIcon); }
+                }
+            }
+            catch (Exception ex) { Diag.Log("ShellIcon: 取路径图标失败 " + path + " " + ex.Message); }
+            return FolderIcon(target);
+        }
+
         /// <summary>把一个 HICON 画成 target×target 的 32bppArgb 位图（保留 alpha）。</summary>
         private static Bitmap RenderIcon(IntPtr hIcon, int target, bool gray)
         {

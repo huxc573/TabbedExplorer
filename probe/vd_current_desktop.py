@@ -5,7 +5,7 @@
 
 为什么要它：公开 API 根本没有「当前桌面是哪张」这个查询，只能从前台窗口反推；
 而 `GetWindowDesktopId(fg)` 实测会**间歇性失败**（TabbedExplorer 16:10:26 / 16:10:36 / 16:11:21
-三次「取不到当前桌面，不搬」→ 随后抢前台把川从别的桌面拽走）。
+三次「取不到当前桌面，不搬」→ 随后抢前台把用户从别的桌面拽走）。
 这条未公开路径是那个问题的**权威解**，但它是未公开接口，必须先证明它在活体上能跑。
 
 **只读**：只调 GetCurrentDesktop / GetId / GetWindowDesktopId / IsWindowOnCurrentVirtualDesktop，

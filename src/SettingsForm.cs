@@ -16,6 +16,15 @@ namespace TabbedExplorer
     {
         public const string Name = "TabbedExplorer";
 
+        /// <summary>作者（署名）。git 提交身份、LICENSE 里的版权人、这个常量是同一个名字。</summary>
+        public const string Author = "huxc573";
+
+        /// <summary>
+        /// 开源地址 —— 设置窗口里显示成可点的一行，点了交给系统默认浏览器。
+        /// ⚠ 改地址只改这一处（README 顶部也写着同一个地址，一起改）。
+        /// </summary>
+        public const string RepoUrl = "https://github.com/huxc573/TabbedExplorer";
+
         public const string Blurb =
             "给Win10资源管理器加标签页 —— 像浏览器一样用资源管理器。\n"
           + "标签里那套文件列表 / 右键菜单 / 拖放 / 缩略图都是Windows原版的，不是仿制界面。\n"
@@ -51,8 +60,8 @@ namespace TabbedExplorer
     }
 
     /// <summary>
-    /// 独立的设置窗口（川 2026-09-22 要的）—— 齿轮按钮、标签条空白右键、托盘「更多选项…」开的都是它。
-    /// 托盘图标右键那份菜单**保持原样**（川明确要求）。
+    /// 独立的设置窗口（用户要的）—— 齿轮按钮、标签条空白右键、托盘「更多选项…」开的都是它。
+    /// 托盘图标右键那份菜单**保持原样**（用户明确要求）。
     ///
     /// 窗口内容**不另写一份**：设置项全部由 `SettingsMenu.Spec(hub)` 生成 —— 托盘那份菜单用的也是同一份规格，
     /// 所以以后加设置项不会漏一边（当初「托盘右键没有设置选项」就是两边各写一遍漏出来的）。
@@ -63,7 +72,7 @@ namespace TabbedExplorer
     ///   · `Checked == null` 且没有动作 → 一行说明文字
     /// 顶部放**程序名 / 版本 / 简介**。
     ///
-    /// 2026-09-22 第二批（川）：
+    ///第二批（用户）：
     ///   · 分成两个 Tab —— **常规**（原来那些设置项）+ **快捷键**（程序自有热键可自己改键）；
     ///   · 标题栏那条白杠：`DWM` 的深色属性以前只在 `OnShown` 里设一次，
     ///     而窗口第一次合成时早就把白框画出来了（切出去再切回来才重取）——
@@ -139,7 +148,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 深色标题栏（川 2026-09-22 报的「打开时那一条是白的，切出去切回来才对」）
+        // 深色标题栏（用户报的「打开时那一条是白的，切出去切回来才对」）
         // ==================================================================
         protected override void OnHandleCreated(EventArgs e)
         {
@@ -264,12 +273,27 @@ namespace TabbedExplorer
             name.SetBounds(tx, y + Px(2), w - tx - pad, Px(30));
             Controls.Add(name);
 
-            Label ver = TextLabel("版本 " + AppInfo.Version, Px(12), false);
+            // 版本 + 作者一行
+            Label ver = TextLabel("版本 " + AppInfo.Version + " · 作者 " + AppInfo.Author, Px(12), false);
             ver.ForeColor = Theme.TextDim;
             ver.SetBounds(tx, y + Px(34), w - tx - pad, Px(18));
             Controls.Add(ver);
 
-            y += Math.Max(iconSize, Px(56)) + Px(12);
+            // 开源地址：可点，点了开浏览器（用户：「设置界面增加作者和开源地址，地址可点击打开」）
+            LinkLabel repo = new LinkLabel();
+            repo.Text = AppInfo.RepoUrl;
+            repo.Font = ver.Font;
+            repo.AutoSize = false;
+            repo.BackColor = BackColor;
+            repo.LinkColor = Theme.Accent;
+            repo.ActiveLinkColor = Theme.Accent;
+            repo.VisitedLinkColor = Theme.Accent;
+            repo.LinkBehavior = LinkBehavior.HoverUnderline;
+            repo.SetBounds(tx, y + Px(53), w - tx - pad, Px(18));
+            repo.LinkClicked += delegate { OpenRepo(); };
+            Controls.Add(repo);
+
+            y += Math.Max(iconSize, Px(76)) + Px(10);
 
             // ---- 简介 ----
             Label blurb = TextLabel(AppInfo.Blurb, Px(12), false);
@@ -304,11 +328,11 @@ namespace TabbedExplorer
             tabs.Controls.Add(keys);
 
             // 高度：内容要多高给多高，但**不许顶出屏幕**（屏幕高度够就全显示，不够就页内滚动）。
-            // 「常规」页比「快捷键」页长得多的那种情况下也能看全（川的屏幕不一定放得下 ~800 逻辑像素）。
+            // 「常规」页比「快捷键」页长得多的那种情况下也能看全（用户的屏幕不一定放得下 ~800 逻辑像素）。
             int footerH = Px(22) + Px(28) + pad;
             int work = Px(800);
             try { work = Screen.FromPoint(Cursor.Position).WorkingArea.Height; } catch { }
-            // 整个窗口（含边框）不许顶出工作区 —— 川 2026-09-22 报的「界面显示不全」：
+            // 整个窗口（含边框）不许顶出工作区 —— 用户报的「界面显示不全」：
             // 原来这里是 `Math.Max(Px(240), 剩余高度)`，屏幕一矮就把窗口顶到屏幕外，
             // 底下那截（提示行 / 关闭按钮）永远看不见。现在反过来：**窗口高度封顶**，放不下的交给页内滚动。
             int maxClient = Math.Max(Px(360), work - Px(72));
@@ -316,14 +340,14 @@ namespace TabbedExplorer
             int wantTabsH = Math.Max(hGeneral, hKeys) + Px(14);
             int tabsH = Math.Min(wantTabsH, maxTabsH);
             // 两页**一律**允许滚动 —— 装得下时 WinForms 自己不会画出滚动条，不必再拿一个开关去赌
-            // （川那次就是「没加可滚动」）。
+            // （用户那次就是「没加可滚动」）。
             general.AutoScroll = true;
             keys.AutoScroll = true;
             tabs.SetBounds(pad, y, w - pad * 2, tabsH);
             Controls.Add(tabs);
 
             // 页内那条滚动条是**系统画的**（`TabPage.AutoScroll`），永远按浅色画 ——
-            // 深色模式下就是页面右边竖着的一条白（川 2026-09-22 截图里那个）。
+            // 深色模式下就是页面右边竖着的一条白（用户截图里那个）。
             // 唯一能让它跟着我们颜色模式走的地方是 uxtheme 的子应用名，见 `Theme.StyleScrollBar`。
             StylePageNative(general);
             StylePageNative(keys);
@@ -346,6 +370,23 @@ namespace TabbedExplorer
             ClientSize = new Size(w, y);
 
             SyncAll();
+        }
+
+        /// <summary>
+        /// 点「开源地址」→ 交给系统默认浏览器打开。
+        /// ⚠ 必须 `UseShellExecute = true`：不然 `Process.Start` 会把 "https://…" 当成
+        /// **可执行文件路径**去开，直接抛 Win32Exception（同书签栏双击 URL 那条路）。
+        /// </summary>
+        private void OpenRepo()
+        {
+            try
+            {
+                Diag.Step("设置窗口: 打开开源地址 " + AppInfo.RepoUrl);
+                System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo(AppInfo.RepoUrl) { UseShellExecute = true });
+                SetNotice("已在浏览器里打开：" + AppInfo.RepoUrl);
+            }
+            catch (Exception ex) { SetNotice("打不开浏览器：" + ex.Message); }
         }
 
         private TabPage NewPage(string text)
@@ -590,7 +631,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 「快捷键」页（川 2026-09-22 新增）
+        // 「快捷键」页（用户新增）
         // ==================================================================
         private int BuildHotkeys(TabPage page, int w)
         {
@@ -774,7 +815,7 @@ namespace TabbedExplorer
     /// <summary>
     /// 自绘 `TabControl` —— 只管一件事：**把 tab 头带自己刷一遍底色**。
     /// 系统画的 tab 头带（最后一个 tab 右边那一截、最左边那条留白）永远用系统色，
-    /// 深色模式下就是一条白 —— 川 2026-09-22 报的「tab 背景颜色未适配颜色模式」。
+    /// 深色模式下就是一条白 —— 用户报的「tab 背景颜色未适配颜色模式」。
     /// 做法：让系统照常画完（`WM_PAINT`），再往那两条空白上补一刀底色。
     /// </summary>
     internal sealed class TabHost : TabControl

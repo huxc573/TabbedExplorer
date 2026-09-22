@@ -1,0 +1,13 @@
+# 行尾统一：库（blob）里一律 LF，workspace 也 LF —— 这台机器上 git 全局是
+# core.autocrlf=true（PortableGit 自带的 etc/gitconfig），换台机器口径就会变，
+# 所以在这儿显式钉死，别指望每个人本机的配置一样。
+* text=auto eol=lf
+
+# .bat / .cmd 必须 CRLF：cmd.exe 读 LF 的批处理在标签跳转上会出怪问题
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别做行尾转换、也别当文本 diff
+*.ico binary
+*.png binary
+*.exe binary

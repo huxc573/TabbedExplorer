@@ -92,7 +92,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 预热好的备用窗口（已经嵌好、藏在容器里不显示）。
-        /// 川 2026-09-22 报「新建标签页反应慢」—— 慢的就是「起 explorer 进程 + 等它加载」这两步，
+        /// 用户报「新建标签页反应慢」—— 慢的就是「起 explorer 进程 + 等它加载」这两步，
         /// 它们跟用户按没按 + 号毫无关系，所以提前做掉。
         /// </summary>
         private ExplorerHost reserve;
@@ -132,7 +132,7 @@ namespace TabbedExplorer
             Icon = ShellIcon.AppIcon(false);   // 任务栏 / Alt+Tab 用程序自己的图标
 
             // 无边框 + **标签条顶在最上面**。
-            // 原来上面还有一条自绘标题栏（模仿资源管理器的快速访问工具栏），2026-09-22 删掉了：
+            // 原来上面还有一条自绘标题栏（模仿资源管理器的快速访问工具栏），删掉了：
             // 那条里的按钮是「我们自己画的图标 + 把快捷键派给 explorer」，实测点了没反应；
             // 而真正的命令本来就在嵌进来的 explorer 自己的功能区里（文件/主页/共享/查看），一模就响。
             // 删掉之后窗口多出 30 像素给内容，窗口按钮并在标签条最右边。
@@ -156,7 +156,7 @@ namespace TabbedExplorer
             tabStrip.NewTabClicked += delegate
             {
                 Diag.Step("EmbedForm: 点击新建标签");
-                // 新建标签页 = 开一个「此电脑」，**不是**复制当前标签（川报的 bug 4）
+                // 新建标签页 = 开一个「此电脑」，**不是**复制当前标签（用户报的 bug 4）
                 NewTab(ExplorerView.ThisPcPath);
             };
             // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 书签栏
@@ -196,7 +196,7 @@ namespace TabbedExplorer
                 blankAt = p;
                 Defer(ShowBlankMenu);
             };
-            // 标签条上滚轮 = 切换前后标签页（川 2026-09-22）
+            // 标签条上滚轮 = 切换前后标签页（用户）
             tabStrip.TabWheel += delegate(int delta)
             {
                 CycleTab(delta > 0 ? -1 : 1);
@@ -209,7 +209,7 @@ namespace TabbedExplorer
                 NewTab(path);
             };
             // 最左边那枚书签图标：点一下开**书签管理器**
-            // （川 2026-09-22：原来点是开数据目录，改成「管理书签」）
+            // （用户：原来点是开数据目录，改成「管理书签」）
             favBar.LeadClicked += delegate
             {
                 Diag.Step("EmbedForm: 书签图标 -> 管理书签");
@@ -219,7 +219,7 @@ namespace TabbedExplorer
             {
                 if (hub != null) hub.OpenFavManager();
             };
-            // 书签栏文件夹上右键「全部打开（N 书签）」（川 2026-09-22）
+            // 书签栏文件夹上右键「全部打开（N 书签）」（用户）
             favBar.OpenAllRequested += delegate(FavNode f) { OpenAllFromFavBar(f); };
             // 书签栏上右键「隐藏书签栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
             favBar.HideRequested += delegate
@@ -234,7 +234,7 @@ namespace TabbedExplorer
 
             // 位置全部手算（DoLayout）：无边框窗口的四周留一圈自己的边框，
             // 顶部就是标签条（原来上面的自绘标题栏已经删掉了）。
-            // 底部**不再有状态栏**（川：最下面的文件夹名去掉，标签上已经显示了）。
+            // 底部**不再有状态栏**（用户：最下面的文件夹名去掉，标签上已经显示了）。
             Controls.Add(tabStrip);
             Controls.Add(favBar);
             Controls.Add(content);
@@ -251,7 +251,7 @@ namespace TabbedExplorer
                 TabStrip = tabStrip.Handle,
                 FavBar = favBar.Handle,
                 HasOverflow = delegate { return tabStrip.OverflowCached; },
-                // 标签条上：左半边（标签）切前后标签，右半边（那排按钮）横向滑标签（川 2026-09-22）
+                // 标签条上：左半边（标签）切前后标签，右半边（那排按钮）横向滑标签（用户）
                 StripWheel = delegate(int x, int delta)
                 {
                     if (tabStrip.InButtonArea(x))
@@ -429,7 +429,7 @@ namespace TabbedExplorer
             // 窗口可能已经被销毁（多窗口之后 Theme.Changed 的订阅者不止一个，没法逐条退订），
             // 对着已释放的控件设颜色会抛 ObjectDisposedException。
             if (IsDisposed || Disposing) return;
-            // 激活 / 失活两套外壳底色（川 2026-09-22：主窗口也要模拟原生那套激活逻辑）
+            // 激活 / 失活两套外壳底色（用户：主窗口也要模拟原生那套激活逻辑）
             Color chrome = inactive ? Theme.ChromeOff : Theme.Chrome;
             BackColor = chrome;
             content.BackColor = chrome;
@@ -444,7 +444,7 @@ namespace TabbedExplorer
         /// ⚠ 每一次切换都要走完，**包括切回「跟随系统」**。
         /// 早先这里碰到 System 就直接 return，于是「强制深色 -> 跟随系统(而系统是浅色)」
         /// 这一步只把外壳刷成浅色、嵌进来的 explorer 还停在深色 ——
-        /// 就是川 2026-09-22 截图里那个「一半深一半浅」。
+        /// 就是用户截图里那个「一半深一半浅」。
         /// System 不等于「不用管」，它只是把目标值换成「当前系统值」而已。
         /// </summary>
         private void OnThemeChanged()
@@ -550,11 +550,11 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 「川自己打开的文件夹窗口被收进来了」—— 需要现身把它露出来。
+        /// 「用户自己打开的文件夹窗口被收进来了」—— 需要现身把它露出来。
         ///
         /// 跟 `ShowForUser` 的区别（**别混用**）：
         ///   · 不 `EnsureFirstTab`（标签刚收进来就是第一个，不能再自作主张开一个「此电脑」）；
-        ///   · 不判虚拟桌面（那个窗口本来就开在川眼前，他在哪张桌面我们就在哪张）；
+        ///   · 不判虚拟桌面（那个窗口本来就开在用户眼前，他在哪张桌面我们就在哪张）；
         ///   · 不 `newTab`（收进来的那个就是要看的那个）。
         /// 但**要**抢一下前台：他刚双击文件夹，本该有一扇窗弹到最前面；
         /// 我们把那扇窗藏了收进标签，就得由我们把窗口顶上来，不然他眼前像是「什么都没发生」。
@@ -592,7 +592,7 @@ namespace TabbedExplorer
                 int skipped = 0;
 
                 // ---- 先把「记忆里当时选中那个」挑出来，让它**第一个入队** ----
-                // 川 2026-09-22：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
+                // 用户：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
                 // 串行队列（PumpLaunch）是**按入队顺序**起 explorer 的 —— 先建谁谁先出来。
                 // 所以这里先建「该激活的那个」，等其余都建完再把它挪回原来的位置（见 MoveTabSynced）。
                 int activeAt = -1;
@@ -697,7 +697,7 @@ namespace TabbedExplorer
             Diag.Step("EmbedForm: 收进托盘（进程常驻，继续接 Win+E）");
             Visible = false;
             MarkDirty();
-            // 窗口都收起来了，正是收本进程驻留内存的好时候（川 2026-09-22 的优化 5）
+            // 窗口都收起来了，正是收本进程驻留内存的好时候（用户的优化 5）
             ExplorerHost.TrimSelf();
             if (!trayTipShown)
             {
@@ -752,7 +752,7 @@ namespace TabbedExplorer
             Diag.Log("EmbedForm: 不认识的热键命令 " + cmd);
         }
 
-        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。目标是「此电脑」（川报的 bug 4）。</summary>
+        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。目标是「此电脑」（用户报的 bug 4）。</summary>
         private void HotkeyNewTab()
         {
             Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo("newtab") + " -> 新标签（此电脑）");
@@ -878,7 +878,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 起 explorer —— **一次只起一个**，排成队依次来。
         ///
-        /// 这是「有时候标签页点开是空的」的**根治**（2026-09-22）：
+        /// 这是「有时候标签页点开是空的」的**根治**（）：
         /// 原来还原 6 个标签就是**一口气起 6 个 explorer**，6 个窗口几乎同时冒出来，
         /// 而每个标签都只能靠「扫一个刚出现的新窗口」来认自己那个 —— 于是互相认错，
         /// 或者谁都认不到、空等 25 秒超时（日志里就是这么演的）。
@@ -918,11 +918,11 @@ namespace TabbedExplorer
         // ------------------------------------------------------------------
         // 备用窗口（预热）
         //
-        // 川 2026-09-22 报「新建标签页反应慢」。慢在哪（日志实测）：一次点击到内容出来大约 1.7 秒，
+        // 用户报「新建标签页反应慢」。慢在哪（日志实测）：一次点击到内容出来大约 1.7 秒，
         // 其中「起 explorer 进程 + 等它把文件列表建出来」占掉 0.8 秒左右 ——
         // 这两步跟用户按没按 + 号毫无关系，那就提前做掉：
         // 每批标签都起完之后，在后台（也走串行队列）再起一个**藏着的**窗口备着，
-        // 加载完也不显示；川一按 + / Ctrl+T，把它直接显出来即可，几乎瞬时。用掉立刻再备一个。
+        // 加载完也不显示；用户一按 + / Ctrl+T，把它直接显出来即可，几乎瞬时。用掉立刻再备一个。
         //
         // 只在目标是「此电脑」时才用得上（备用窗口加载的就是它）—— 而「新建标签页」现在就是「此电脑」。
         // ------------------------------------------------------------------
@@ -995,7 +995,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 开一个「接管别人窗口」的标签 —— 川从开始菜单 / 桌面双击打开的那个文件夹（Bug 1）。
+        /// 开一个「接管别人窗口」的标签 —— 用户从开始菜单 / 桌面双击打开的那个文件夹（Bug 1）。
         /// 跟 `NewTab` 唯一的区别：**不起新 explorer**，直接把已经存在的那个窗口收进来。
         /// 所以它**不进队列**（队列的意义是「别同时起两个进程」，这条不进程）。
         /// </summary>
@@ -1052,7 +1052,7 @@ namespace TabbedExplorer
 
         private void OnHostReady(ExplorerHost h)
         {
-            // 备用窗口不在 hosts 里 —— 它到这就绪，等川按 + 号的时候直接显出来
+            // 备用窗口不在 hosts 里 —— 它到这就绪，等用户按 + 号的时候直接显出来
             if (h == reserve)
             {
                 reserveReady = true;
@@ -1080,7 +1080,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// explorer 在里面导航了，把标签标题跟上。
-        /// 否则就是川報的那个 bug：“换了目录，标签页也没变”。
+        /// 否则就是用户報的那个 bug：“换了目录，标签页也没变”。
         /// </summary>
         private void OnHostTitleChanged(ExplorerHost h)
         {
@@ -1137,7 +1137,7 @@ namespace TabbedExplorer
             LaunchDone(h);   // 先让队列往前走（这一个已经结束了）
 
             // 干等 25 秒 —— 多半是那个窗口被别人抢了 / explorer 这次没给新建窗口。
-            // 自动再来一次，别把一个黑标签留在那儿等川自己发现。
+            // 自动再来一次，别把一个黑标签留在那儿等用户自己发现。
             // 只重试一次（Retried 标记），重试还不行就老实报错。重试也走队列，别破坏串行。
             if (!h.Retried && !string.IsNullOrEmpty(want) && PathRules.Restorable(want))
             {
@@ -1184,7 +1184,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 把**非当前**标签的 explorer 进程驻留内存收一收（川 2026-09-22 的优化 3）。
+        /// 把**非当前**标签的 explorer 进程驻留内存收一收（用户的优化 3）。
         ///
         /// 为什么值当：一个标签 = 一个独立 explorer.exe，非激活那几十 MB 全在别人进程里，
         /// 我们自己进程怎么省都省不出这一块。
@@ -1221,7 +1221,7 @@ namespace TabbedExplorer
             ExplorerHost h = hosts[idx];
 
             // 记进「刚关掉的」栈 —— Ctrl+Shift+T 要按「后进先出」往回捞：
-            // 点一下恢复最近关的那个、再点一下恢复上上个（川的要求）。
+            // 点一下恢复最近关的那个、再点一下恢复上上个（用户的要求）。
             string gone = LivePath(h);
             if (PathRules.Restorable(gone))
             {
@@ -1256,7 +1256,7 @@ namespace TabbedExplorer
             if (hosts.Count == 0)
             {
                 // 最后一个标签被关 ⇒ 收进托盘（**不是退出**）。
-                // 进程一退 Win+E 就没人接了，系统就会去开原生资源管理器 —— 正是川報的那个问题。
+                // 进程一退 Win+E 就没人接了，系统就会去开原生资源管理器 —— 正是用户報的那个问题。
                 Diag.Step("EmbedForm: 最后一个标签被关，收进托盘");
                 HideToTray();
                 return;
@@ -1269,11 +1269,11 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>
-        /// 「设置」——**开一个独立的设置窗口**（川 2026-09-22 要的）。
+        /// 「设置」——**开一个独立的设置窗口**（用户要的）。
         ///
         /// 原来是就地弹一份菜单，换成窗口有两个理由：① 菜单里放不下东西（标签宽度只能做成子菜单、
         /// 说明文字根本没处写）；② 窗口里能一并把**程序名 / 版本 / 简介**摆出来。
-        /// 托盘图标右键那份菜单**保持原样**（川明确要求），所以内容的唯一来源还是 `SettingsMenu.Spec`，
+        /// 托盘图标右键那份菜单**保持原样**（用户明确要求），所以内容的唯一来源还是 `SettingsMenu.Spec`，
         /// 窗口只是换一种渲染方式 —— 以后加设置项不会漏一边。
         ///
         /// 仍然走 `Defer`（BeginInvoke）—— 当初弹菜单连着卡死三次是同一个道理：
@@ -1287,7 +1287,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 历史 / 恢复关闭 / 右键菜单 / 书签栏（2026-09-22 川点名的三个新功能）
+        // 历史 / 恢复关闭 / 右键菜单 / 书签栏（用户点名的三个新功能）
         // ==================================================================
 
         /// <summary>
@@ -1340,7 +1340,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 从「历史记录 / 书签」挑了一个位置 —— 开成新标签（已经开着就切过去）。
-        /// 单独抽出来是为了能记日志：川报过「历史里选了条目没打开」，有日志才查得下去。
+        /// 单独抽出来是为了能记日志：用户报过「历史里选了条目没打开」，有日志才查得下去。
         /// </summary>
         private void OpenFromHistory(string p)
         {
@@ -1397,7 +1397,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 建一条菜单项：点下去**先在日志里记一笔**再执行（实现在 `MenuFx.Item`，书签栏那份菜单也用同一个）。
-        /// 川 2026-09-22 连着两轮报「右键菜单功能没实现」—— 这里加一行日志是为了以后不用猜：
+        /// 用户连着两轮报「右键菜单功能没实现」—— 这里加一行日志是为了以后不用猜：
         /// 「菜单弹出来了但点了没反应」和「点了、动作自己失败了」在日志里是两回事。
         /// </summary>
         private static PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
@@ -1415,7 +1415,7 @@ namespace TabbedExplorer
             return -1;
         }
 
-        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 左边 / 右边」—— 川 2026-09-22 新增）。</summary>
+        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 左边 / 右边」—— 用户新增）。</summary>
         private void ShowTabMenu(int idx)
         {
             if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
@@ -1452,7 +1452,7 @@ namespace TabbedExplorer
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
-            // ---- 川 2026-09-22 新增的三条（跟浏览器右键对表）----
+            // ---- 用户新增的三条（跟浏览器右键对表）----
             // 只剩一个标签 / 当前就在最左（右）时置灰 —— 点了什么也不发生的项还不如直接灰着
             m.Add(Mi("关闭其它标签页", hosts.Count > 1
                 ? (Action)delegate { Defer(delegate { CloseOtherTabs(idx); }); } : null));
@@ -1515,7 +1515,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 批量关标签：
         ///
-        /// ⚠ 川 2026-09-22：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」。
+        /// ⚠ 用户：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」。
         /// 两个原因，这一个是主要的：`CloseTab` 本来**每关一个就 `Activate` 一次**，
         /// 批量关时就变成「关张三 → 显示李四 → 关李四 → 显示王五 → …」——
         /// 每一下都是把一个**真 explorer 窗口**现出来再藏掉，屏幕上看到的就是整个内容区在闪。
@@ -1546,7 +1546,7 @@ namespace TabbedExplorer
                 return;
             }
             Diag.Step("EmbedForm: 加入书签 -> " + path);
-            // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+            // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
             // 书签栏开着的话，那一项会**立刻出现在标签条下面那条栏上**，那就够了，不再弹气泡。
             // 只有书签栏是关着的时候才提示一句（那时界面上真的什么都没发生，不说一声就成了「点了没反应」）。
             if (favBar == null || !favBar.Visible) Toast.Show("已加入书签", name);
@@ -1555,7 +1555,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 标签条**空白处**右键（标签右边的空条 + 标签左边的空条都算）。
         ///
-        /// 川 2026-09-22 报「右边空白菜单的功能还没实现」—— 两个原因，都在这儿收掉：
+        /// 用户报「右边空白菜单的功能还没实现」—— 两个原因，都在这儿收掉：
         ///   ① 真的定位错了：标签溢出时最后半个标签的矩形伸到了按钮底下，右键落在那一块被
         ///      `HitTest` 认成「标签」而不是「空白」（修在 TabStrip.HitTest）；
         ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 书签栏 / 三个关标签 / 设置都放进来。
@@ -1573,7 +1573,7 @@ namespace TabbedExplorer
 
             bool on = favBarOn;
             // 勾选走 `PopItem.On`（PopMenu 把它落到 `Checked`，菜单自己画勾）——
-            // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（川报过）。
+            // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（用户报过）。
             m.Add(Mi("显示书签栏(" + Hotkeys.Combo("favbar") + ")", delegate
             {
                 if (hub != null) hub.SetFavBar(!on);

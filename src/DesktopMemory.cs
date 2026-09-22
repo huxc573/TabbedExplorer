@@ -9,7 +9,7 @@ namespace TabbedExplorer
     /// 「地址栏上那个字符串」和「能存能还原的路径」之间的翻译。
     ///
     /// 地址栏给的**不是**永远都是路径：
-    ///   - 真目录 → 完整路径（实测 `地址: D:\Dev\Workspaces\WorkBuddy\TabbedExplorer`）；
+    ///   - 真目录 → 完整路径（实测 `地址: D:\My Tools\TabbedExplorer`）；
     ///   - `此电脑` / `回收站` / `网络` 这种虚拟文件夹 → 就是那个**显示名**，拿去喂 explorer 是错的；
     ///   - 库（比如 `视频`）→ 也是显示名，而且它压根不对应某个目录。
     ///
@@ -73,13 +73,13 @@ namespace TabbedExplorer
     }
 
     /// <summary>
-    /// 按虚拟桌面记住标签页 —— 也就是川要的「记忆那个桌面关闭程序窗口时的标签页，下次打开」。
+    /// 按虚拟桌面记住标签页 —— 也就是用户要的「记忆那个桌面关闭程序窗口时的标签页，下次打开」。
     ///
     /// 为什么用桌面 GUID 当 key：`IVirtualDesktop::GetId` 给的 GUID 是 shell 自己生成并持久化的，
     /// 重启、重排桌面都还是同一个；而「第 1/2/3 张桌面」这种序号一重排就全错位了
-    /// （本机实测：090EFE42=Daily、ABF524EA=Game、EC74F739=Other）。
+    /// （拿到手的是一串不透明的 GUID，跟桌面排在第几位无关）。
     ///
-    /// 存的是**地址栏上的那个字符串**、不是我们当初传给 explorer 的路径 —— 川在标签里一路点进去
+    /// 存的是**地址栏上的那个字符串**、不是我们当初传给 explorer 的路径 —— 用户在标签里一路点进去
     /// 之后，要记的是他最后停在哪儿。
     ///
     /// 文件是 JSON `&lt;程序目录&gt;\data\desktops.json`（绿色便携，见 AppPaths）：
@@ -92,9 +92,9 @@ namespace TabbedExplorer
     ///   }
     ///   </code>
     /// `active` = 那张桌面上「当时选中的那个标签」。
-    /// 2026-09-22 川要求「配置文件一律 json」：原来那版是 `desktops.txt`，现在 `Load` 见到老文件会
+    /// 用户要求「配置文件一律 json」：原来那版是 `desktops.txt`，现在 `Load` 见到老文件会
     /// 读进来、写成 json，再把老文件改名成 `.migrated` 留着（不删）。
-    /// 格式换了，但那条老规矩没变：**出问题时川自己打开就能看、能改、能删**。
+    /// 格式换了，但那条老规矩没变：**出问题时用户自己打开就能看、能改、能删**。
     /// </summary>
     internal sealed class DesktopMemory
     {
@@ -108,7 +108,7 @@ namespace TabbedExplorer
         /// <summary>数据目录：程序目录下的 `data\`（见 AppPaths）—— 拷走整个文件夹就把记忆带走了。</summary>
         public static string Folder { get { return AppPaths.DataDir; } }
 
-        /// <summary>记忆文件（JSON，2026-09-22 川要求「配置一律 json」）。</summary>
+        /// <summary>记忆文件（JSON，用户要求「配置一律 json」）。</summary>
         public static string FileName { get { return Path.Combine(Folder, "desktops.json"); } }
 
         /// <summary>老版本的纯文本记忆 —— 只在迁移时读一次。</summary>

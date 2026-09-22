@@ -10,10 +10,10 @@ namespace TabbedExplorer
     /// <summary>
     /// 常驻后台的「总机」：托盘图标 + Win+E 钩子 + **每张虚拟桌面一个窗口**。
     ///
-    /// 为什么要从 EmbedForm 里把「托盘 + 钩子」拆出来（2026-09-22）：
+    /// 为什么要从 EmbedForm 里把「托盘 + 钩子」拆出来（）：
     /// 原来是谁先建窗口谁就兼任常驻，于是全进程只有**一个**窗口 ——
     /// 三张虚拟桌面共用一套标签，Win+E 每次都把那个窗口搬到当前桌面来。
-    /// 川要的是「每个虚拟桌面单独捕获合并并记忆那个桌面关闭程序窗口时的标签页」，
+    /// 用户要的是「每个虚拟桌面单独捕获合并并记忆那个桌面关闭程序窗口时的标签页」，
     /// 那前提就是**每张桌面各有一个窗口**；而托盘图标和低级键盘钩子全进程只能有一份，
     /// 它们必须住在窗口之外 —— 就是这个 DesktopHub。
     ///
@@ -50,20 +50,20 @@ namespace TabbedExplorer
         /// <summary>
         /// 全局滚轮钩子（按钮区横滚标签条 / 内容区 Shift+滚轮）。
         ///
-        /// ⚠ 2026-09-22 川报「按钮和内容区以及 Shift 滚轮都没生效」—— 根因就是这个类**全项目
+        /// ⚠ 用户报「按钮和内容区以及 Shift 滚轮都没生效」—— 根因就是这个类**全项目
         /// 谁都没 new 过**：`WheelRouter` 的登记表、`TabStrip` 的判定、`EmbedForm` 的回调
         /// 全都写好了，就是没把它装起来，所以失效得很彻底（三个入口一起不动）。
         /// 现在在 Hub 里装一次，全进程共用（`EmbedForm` 只管往 `WheelRouter` 登记）。
         /// </summary>
         private MouseWheelHook wheelHook;
-        /// <summary>「谁被显示出来了」的系统广播 —— 用来抓川自己打开的文件夹窗口（Bug 1）。</summary>
+        /// <summary>「谁被显示出来了」的系统广播 —— 用来抓用户自己打开的文件夹窗口（Bug 1）。</summary>
         private WinShowWatcher captureWatch;
         /// <summary>看见了、但还没到点去收的候选窗口（值 = 第一次看见的时刻 + 用来写日志的事件号）。见 TryCapture。</summary>
         private readonly Dictionary<IntPtr, CaptureCandidate> pendingCapture =
             new Dictionary<IntPtr, CaptureCandidate>();
         /// <summary>
-        /// 「我们主动藏起来、还没收编的」窗口 —— 防闪用（川 2026-09-22：从桌面/开始菜单打开的会闪一下）。
-        /// ⚠ 2026-09-22：藏这件事挪到了 watcher 自己的线程上做（见 OnWindowShown），
+        /// 「我们主动藏起来、还没收编的」窗口 —— 防闪用（用户：从桌面/开始菜单打开的会闪一下）。
+        /// ⚠：藏这件事挪到了 watcher 自己的线程上做（见 OnWindowShown），
         /// 所以这个集合现在是**两个线程都会碰**的 —— 一律走 HiddenByUs / MarkHidden / UnmarkHidden 这三个口，别直接动。
         /// </summary>
         private readonly HashSet<IntPtr> hiddenByUs = new HashSet<IntPtr>();
@@ -71,7 +71,7 @@ namespace TabbedExplorer
         /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
         private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
-        /// <summary>候选窗口要「晾」多久才收。够短，川感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
+        /// <summary>候选窗口要「晾」多久才收。够短，用户感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
         private RegisteredWaitHandle sigWait;
         private RegisteredWaitHandle quitWait;
@@ -118,18 +118,23 @@ namespace TabbedExplorer
             tray.Visible = true;
 
             MenuItem miShow = new MenuItem("打开窗口（Win+E）", delegate { OnWinE(); });
-            MenuItem miSave = new MenuItem("记住当前标签", delegate { RememberNow(); });
+            // 用户：托盘里那条「记住当前标签」去掉，换成两个管理器 ——
+            // 手动存标签本来就用不上（改动攒 800ms 自己落盘 + 退出前再存一次，见 RememberNow），
+            // 而两个管理器以前只在窗口内够得着（书签栏左端 / 标签条右键），放托盘里更好摸。
+            // ⚠ 设置窗口里那条「立即记住当前标签」**保留**（用户明确说的：只删托盘这条）。
+            MenuItem miFav = new MenuItem("书签管理器", delegate { OpenFavManager(); });
+            MenuItem miHist = new MenuItem("历史记录管理器", delegate { OpenHistoryManager(); });
             MenuItem miQuit = new MenuItem("退出", delegate { Quit("托盘菜单"); });
 
             // 设置子菜单跟齿轮那份**同一份内容**（SettingsMenu 里生成），别各写一遍 ——
-            // 川报的「托盘右键没有设置选项」就是两边各写一遍漏出来的。
+            // 用户报的「托盘右键没有设置选项」就是两边各写一遍漏出来的。
             traySettings = SettingsMenu.BuildTraySettings(this);
 
             trayMenu = new ContextMenu(new MenuItem[]
             {
-                miShow, miSave, traySettings.Root, new MenuItem("-"), miQuit
+                miShow, miFav, miHist, traySettings.Root, new MenuItem("-"), miQuit
             });
-            // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（川报的「没和其它选项一样居左对齐」）
+            // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（用户报的「没和其它选项一样居左对齐」）
             MenuFx.Hook(trayMenu);
             tray.ContextMenu = trayMenu;
             tray.DoubleClick += delegate { OnWinE(); };
@@ -233,7 +238,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 打开（或提到前面）**书签管理器**（川 2026-09-22 要的新窗口：仿浏览器那个书签管理器）。
+        /// 打开（或提到前面）**书签管理器**（用户要的新窗口：仿浏览器那个书签管理器）。
         /// 跟设置窗口一样，全进程只开一个 —— 书签栏左端的星标、栏上右键、菜单里都走这一个门。
         /// </summary>
         public void OpenFavManager()
@@ -267,7 +272,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 打开（或提到前面）**历史记录管理器**（川 2026-09-22：「打开历史记录文件」改成它，
+        /// 打开（或提到前面）**历史记录管理器**（用户：「打开历史记录文件」改成它，
         /// 界面模仿书签管理器）。跟设置窗口 / 书签管理器一样，全进程只开一个。
         /// </summary>
         public void OpenHistoryManager()
@@ -301,7 +306,7 @@ namespace TabbedExplorer
         // ==================================================================
         // 捕获「所有」打开的文件夹（Bug 1）
         //
-        // 川的原话：「只捕获了 Win+E 这个按键，而不是所有资源管理器打开的文件夹
+        // 用户的原话：「只捕获了 Win+E 这个按键，而不是所有资源管理器打开的文件夹
         // （比如从开始菜单、从桌面打开的）」。也就是**只要是资源管理器打开了一个文件夹，就该变成
         // 我们窗口里的一个标签** —— 跟浏览器一样，新窗口都归到标签里去。
         //
@@ -321,7 +326,7 @@ namespace TabbedExplorer
 
             captureWatch = new WinShowWatcher();
             captureWatch.WindowShown += OnWindowShown;
-            // ★ 装在自己的线程上（不是 UI 线程）—— 川报的「外部打开的文件夹还是闪一下」就卡在这里，
+            // ★ 装在自己的线程上（不是 UI 线程）—— 用户报的「外部打开的文件夹还是闪一下」就卡在这里，
             //   详见 WinShowWatcher 类注释里那段「为什么 Hub 那条非要另起线程」。
             captureWatch.StartDedicated("TabbedExplorer.CaptureWatch");
             Diag.Step("Hub: 已开始监听「新打开的文件夹窗口」（专用线程，延迟 " + CaptureDelayMs + "ms 接收）");
@@ -337,7 +342,7 @@ namespace TabbedExplorer
         /// <summary>
         /// ★★ 看见一个新窗口 —— **在 watcher 自己的线程上同步藏**，不绕 UI 线程。
         ///
-        /// 第三轮返工（2026-09-22 川第三次报「从桌面/开始菜单开文件夹还闪」）。
+        /// 第三轮返工（用户第三次报「从桌面/开始菜单开文件夹还闪」）。
         /// 前两轮做对了两件事：① 藏这件事挪到 watcher 自己的线程上（不等 UI 线程）；② 一起听 CREATE。
         /// **但两件都白做了**，日志摊开一看就明白：
         ///   每条都是「事件后 0ms，**当时已可见**」——
@@ -410,14 +415,14 @@ namespace TabbedExplorer
         /// <summary>
         /// 把候选窗口登记进去，等 700ms 后再收。
         ///
-        /// 为什么要拖一下（2026-09-22 实测踩到）：我们给标签起 explorer 时，那个窗口也是「新出现的」，
+        /// 为什么要拖一下（实测踩到）：我们给标签起 explorer 时，那个窗口也是「新出现的」，
         /// 而 Hub 这边跟标签那边的监听是**两个独立的钩子**，系统先叫谁不保证。
-        /// 曾经直接就地收，日志里就出现过「我们自己起的第5个窗口被 Hub 当成川新开的抓走了」——
-        /// 一旦这样，那个标签会去抢别人的窗口，最后就是一个标签空着（正是川报的「有时候标签页点开是空的」）。
+        /// 曾经直接就地收，日志里就出现过「我们自己起的第5个窗口被 Hub 当成用户新开的抓走了」——
+        /// 一旦这样，那个标签会去抢别人的窗口，最后就是一个标签空着（正是用户报的「有时候标签页点开是空的」）。
         ///
         /// 拖这几百毫秒之后，情况就很干净：
         ///   · 是我们自己起的窗口 → 那个标签的 25ms 轮询早就把它**认领**了，这里一看已认领就放手；
-        ///   · 是川自己开的窗口 → 没人认领，到点就收。
+        ///   · 是用户自己开的窗口 → 没人认领，到点就收。
         /// ⚠ 注意「拖」的只是**收**（AdoptWindow），**藏**是在 OnWindowShown 里当场做的 ——
         ///   不然这 700ms 里那个原生窗口就明晃晃地摆在屏幕上，用户看到的就是「闪一下」。
         /// </summary>
@@ -544,7 +549,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 弹一条提示。
         ///
-        /// ⚠ 2026-09-22 改了实现（川报「显示提醒的背景和字体颜色没适配颜色模式」）：
+        /// ⚠改了实现（用户报「显示提醒的背景和字体颜色没适配颜色模式」）：
         /// 原来走 `NotifyIcon.ShowBalloonTip`，那个气泡是**系统画的**，配色跟系统主题走，
         /// 我们强制浅色/深色时它不认 —— 外壳和气泡两套皮。现在换成自己画的 `Toast`。
         /// 方法签名留着不动，调用点一个都不用改。
@@ -578,7 +583,7 @@ namespace TabbedExplorer
         /// 当前桌面的窗口。两种模式两条路：
         ///
         /// **按虚拟桌面分别捕获**（perdesktop，默认）：① 先按「窗口实际挂在哪张桌面」认领
-        /// （川用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面之后，这样能自愈）；② 再按登记表；
+        /// （用户用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面之后，这样能自愈）；② 再按登记表；
         /// ③ 都没有就新建一个。新建的窗口天然落在当前桌面 —— 所以永远不需要「搬窗口」。
         ///
         /// **捕获并迁移到当前桌面**（migrate，v1.0.0 那套）：全进程就应该只有一个窗口，
@@ -651,7 +656,7 @@ namespace TabbedExplorer
         public Settings.CaptureMode Capture { get { return Settings.Capture; } }
 
         /// <summary>
-        /// 换捕获方式 —— 立刻生效，并且**把记忆搬个家**，免得川切一下发现标签「没了」：
+        /// 换捕获方式 —— 立刻生效，并且**把记忆搬个家**，免得用户切一下发现标签「没了」：
         ///   - 切到迁移模式：把当前桌面那一套搬进 `single`（`single` 已有内容就不动）；
         ///     只留前台那个窗口，其余收掉 —— 它们的标签已经各自落进自己桌面的桶里。
         ///   - 切回分桌面模式：把 `single` 搬进当前桌面那张的桶（那张已有内容就不动），
@@ -717,7 +722,7 @@ namespace TabbedExplorer
             Settings.SetColor(m);
             Theme.SetMode(m);        // RaiseChanged -> 各窗口自己重刷（含 explorer 的逐窗口主题）
             RefreshTrayMenu();
-            // 不再弹提示（川：非重要变更不用右下角弹窗）。
+            // 不再弹提示（用户：非重要变更不用右下角弹窗）。
             // ⚠ 仍然要记住的限制：嵌进来的 explorer 是**独立进程**，它那块文件列表按系统主题画，
             //   我们只能逐窗口 SetWindowTheme 尽力而为。这一条写在设置窗口的说明里。
         }
@@ -740,7 +745,7 @@ namespace TabbedExplorer
             RetabAll();
         }
 
-        /// <summary>自适应宽度①：文件夹名过长时自动加宽（川 2026-09-22 把这个和「缩窄」拆开了）。</summary>
+        /// <summary>自适应宽度①：文件夹名过长时自动加宽（用户把这个和「缩窄」拆开了）。</summary>
         public void SetTabAutoWiden(bool on)
         {
             if (Settings.TabAutoWiden == on) return;
@@ -801,7 +806,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// Debug 模式（川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
+        /// Debug 模式（用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
         /// 不过我们要开」）。改了立刻生效 —— `Diag` 每次写之前都现看那个闸，不用重启。
         /// </summary>
         public void SetDebug(bool on)
@@ -814,10 +819,10 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 开机自启（川 2026-09-22 要的设置项）。
+        /// 开机自启（用户要的设置项）。
         ///
         /// 实现的**唯一真相在注册表**：`HKCU\...\Run` 里的 `TabbedExplorer` 值（见 AutoStart），
-        /// 不往 settings.json 里再存一份 —— 两份状态一旦对不上（川自己用任务管理器禁用了启动项），
+        /// 不往 settings.json 里再存一份 —— 两份状态一旦对不上（用户自己用任务管理器禁用了启动项），
         /// 菜单里打的勾就是假的。所以这个开关没有 `Settings.XXX` 字段，每次都现问注册表。
         ///
         /// 启动方式带 `--tray`：只驻留托盘 + 装 Win+E 钩子，**不弹窗口**。
@@ -828,7 +833,7 @@ namespace TabbedExplorer
             RefreshTrayMenu();
             if (!ok)
             {
-                // 改不动是「出错」，得说一声；成功就不弹了（川：非重要变更不用弹窗）
+                // 改不动是「出错」，得说一声；成功就不弹了（用户：非重要变更不用弹窗）
                 Notify("开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
                 return;
             }
@@ -903,8 +908,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 把每个**活着的**窗口现在的标签写进它那张桌面的桶里，然后落盘。
         ///
-        /// 只覆盖「有窗口在的桌面」—— 这一轮没碰过的桌面（比如川今天没去 Game 桌面）
-        /// 读进来什么样就写回去什么样，不会被清空。
+        /// 只覆盖「有窗口在的桌面」—— 这一轮没碰过的那些桌面，读进来什么样就写回去什么样，不会被清空。
         /// 另外**不动已经关掉的窗口**的桶：那次会话最后长什么样就留着什么样的标签，下次还在。
         /// </summary>
         public void SaveNow(string why)

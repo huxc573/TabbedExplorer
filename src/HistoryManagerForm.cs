@@ -8,7 +8,7 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 历史记录管理器（川 2026-09-22 要的：「打开历史记录文件」改成「打开历史记录管理器」，
+    /// 历史记录管理器（用户要的：「打开历史记录文件」改成「打开历史记录管理器」，
     /// 界面模仿书签管理器）。
     ///
     /// 版式跟 `FavManagerForm` 一套（同一个程序、同一套 Theme 调色板、同一套自绘行），
@@ -53,8 +53,8 @@ namespace TabbedExplorer
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
         // 跟 FavManagerForm 一样：全部走 Px()，并给小标题留出 CaptionH（不然标题和第一行会字压字）。
-        // 2026-09-22 第二轮：把逻辑尺寸调紧一档（行 30->24、窗口 920x560 -> 860x500），
-        // 免得 150% 屏上整张窗口过于空旷（川：「自有窗口好像也变长了」）。
+        //第二轮：把逻辑尺寸调紧一档（行 30->24、窗口 920x560 -> 860x500），
+        // 免得 150% 屏上整张窗口过于空旷（用户：「自有窗口好像也变长了」）。
         private static int TopH { get { return Px(34); } }
         private static int LeftW { get { return Px(300); } }
         private static int ListRowH { get { return Px(24); } }
@@ -72,7 +72,7 @@ namespace TabbedExplorer
         private readonly TextBox search;
         private readonly Font font, fontDim;
 
-        // ---- 多选（川 2026-09-22：「管理器没有多选功能」）----
+        // ---- 多选（用户：「管理器没有多选功能」）----
         // 跟资源管理器一套做法：点 = 只选它；Ctrl+点 = 把它加进去 / 拿出去；
         // Shift+点 = 从上次点的那条到这条一整段；Ctrl+A = 全选。
         // 存的是**路径**而不是下标 —— `view` 是过滤后的子集，一改搜索词下标全变了，
@@ -134,7 +134,7 @@ namespace TabbedExplorer
                 multi.Clear();
                 Rebuild();
                 Invalidate();
-                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
                 // 整张表当场就空了，这就是反馈，不再弹气泡。
             });
 
@@ -204,7 +204,7 @@ namespace TabbedExplorer
             string lastDay = null;
             for (int i = 0; i < view.Count; i++)
             {
-                // 川 2026-09-22：按日期归类 —— 换了一天就插一条灰标题
+                // 用户：按日期归类 —— 换了一天就插一条灰标题
                 string day = History.DayLabel(view[i].At);
                 if (day != lastDay)
                 {
@@ -631,7 +631,7 @@ namespace TabbedExplorer
             if (i < 0) return;
             Row row = rows[i];
 
-            // ---- 日期分堆标题上右键 = 整组删（川 2026-09-22 要的）----
+            // ---- 日期分堆标题上右键 = 整组删（用户要的）----
             if (row.Item == null)
             {
                 string day = row.Head;

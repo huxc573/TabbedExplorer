@@ -7,13 +7,13 @@ namespace TabbedExplorer
     /// <summary>
     /// 设置项的**唯一一份规格** —— 三个入口都从这儿渲染，别各写一遍：
     ///   - 托盘图标右键：`BuildTraySettings`（WinForms 1.x 的 `MenuItem`）
-    ///   - 齿轮 / 标签条空白右键：`SettingsForm`（独立窗口，川 2026-09-22 要的）
+    ///   - 齿轮 / 标签条空白右键：`SettingsForm`（独立窗口，用户要的）
     ///
     /// 这就是当初「托盘右键漏了设置项」的根治办法：加一项只需要在 `Spec` 里加一行。
     ///
     /// 两份菜单的「打勾」画法不一样，原因在渲染那边：
     ///   - 菜单：用 `MenuItem.Checked` + **自绘**（`MenuFx`）—— 勾画在我们自己的勾选列里，
-    ///     既不会像「文字前缀 `✓ `」那样把这一项顶得比同级项突出一块（川报的「没和其它选项一样居左对齐」），
+    ///     既不会像「文字前缀 `✓ `」那样把这一项顶得比同级项突出一块（用户报的「没和其它选项一样居左对齐」），
     ///     也解决了自带的那个小方块在深色下「勾了但看不见」的老毛病。
     ///   - 窗口：就是标准的单选 / 勾选框，不用前缀。
     /// </summary>
@@ -39,8 +39,7 @@ namespace TabbedExplorer
             /// </summary>
             public string Group;
             /// <summary>
-            /// **只在设置窗口里出现**，托盘菜单里不排它（川 2026-09-22：
-            /// 「删除一些不方便以菜单形式设置的内容」）。
+            /// **只在设置窗口里出现**，托盘菜单里不排它（用户：/// 「删除一些不方便以菜单形式设置的内容」）。
             /// 典型是数值输入项（标签页宽度 → 菜单里塞一排预设值很别扭）和纯说明行。
             /// </summary>
             public bool WindowOnly;
@@ -85,7 +84,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 数值项（设置窗口里画成可自己敲的数字输入框）。托盘菜单里不排 —— 菜单里塞一排预设
-        /// 值很别扭（川 2026-09-22：「标签页宽度也可自己输入数值」）。
+        /// 值很别扭（用户：「标签页宽度也可自己输入数值」）。
         /// </summary>
         private static Node Num(string text, int min, int max, int step, Func<int> get, Action<int> set)
         {
@@ -113,7 +112,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 内容（顺序 = 川要的顺序：捕获方式 → 颜色模式 → 保留标签 → 标签宽度 → 自适应 → 书签栏 → 捕获所有 → 开机自启）
+        // 内容（顺序 = 用户要的顺序：捕获方式 → 颜色模式 → 保留标签 → 标签宽度 → 自适应 → 书签栏 → 捕获所有 → 开机自启）
         // ==================================================================
 
         internal static List<Node> Spec(DesktopHub hub)
@@ -147,7 +146,7 @@ namespace TabbedExplorer
                        () => hub.SetKeepTabs(!Settings.KeepTabs)));
             n.Add(Sep());
 
-            // ④ 标签页宽度（川 2026-09-22：「也可自己输入数值」）
+            // ④ 标签页宽度（用户：「也可自己输入数值」）
             //    原来是「80/96/112/…」一串预设的子菜单 —— 只能挑不能敲，而且托盘菜单里挂着一层子菜单很难点。
             //    现在改成设置窗口里的数字输入框（64~240 逻辑像素），菜单里不排它。
             n.Add(Num("标签页宽度（逻辑像素，" + Settings.TabWidthMin + " ~ " + Settings.TabWidthMax + "）",
@@ -155,7 +154,7 @@ namespace TabbedExplorer
                       delegate { return Settings.TabWidth; },
                       delegate(int w) { hub.SetTabWidth(w); }));
 
-            // ⑤ 自适应宽度（2026-09-22 川要拆成两项：加宽 / 缩窄）
+            // ⑤ 自适应宽度（用户要拆成两项：加宽 / 缩窄）
             n.Add(Leaf("自适应宽度：名称过长时自动加宽",
                        () => Settings.TabAutoWiden,
                        () => hub.SetTabAutoWiden(!Settings.TabAutoWiden)));
@@ -168,7 +167,7 @@ namespace TabbedExplorer
             n.Add(Leaf("显示书签栏（Ctrl+Shift+B）",
                        () => Settings.FavBar,
                        () => hub.SetFavBar(!Settings.FavBar)));
-            // 川 2026-09-22：原来这条是「打开书签栏数据目录」，改成**管理书签** ——
+            // 用户：原来这条是「打开书签栏数据目录」，改成**管理书签** ——
             // 数据目录在他眼里只是个 json 文件，改不动也看不懂；给他一扇仿浏览器的管理窗更实用
             // （树 + 搜索 + 重命名 + 嵌套 + 「设为书签栏」）。窗口里那个「打开 json」按钮仍然直达文件。
             n.Add(Leaf("管理书签…", null, () => hub.OpenFavManager()));
@@ -180,14 +179,14 @@ namespace TabbedExplorer
                        () => hub.SetCaptureAll(!Settings.CaptureAll)));
             n.Add(Sep());
 
-            // ⑧ 开机自启（川 2026-09-22 要的）。状态现问注册表，见 AutoStart。
-            //    ⚠ 标签就写「开机自启」四个字，不加括号说明（川明确说的）。
+            // ⑧ 开机自启（用户要的）。状态现问注册表，见 AutoStart。
+            //    ⚠ 标签就写「开机自启」四个字，不加括号说明（用户明确说的）。
             n.Add(Leaf("开机自启",
                        () => AutoStart.IsEnabled(),
                        () => hub.SetAutoStart(!AutoStart.IsEnabled())));
             n.Add(Sep());
 
-            // ⑨ 诊断（川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
+            // ⑨ 诊断（用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
             //    不过我们要开。增加清理日志按钮。」）
             //    日志本身也归到 Spec 里 —— 否则又是「托盘菜单和设置窗口各写一遍」那个老毛病。
             n.Add(Leaf("Debug 模式（把详细过程写进 data\\log.txt）",
@@ -198,13 +197,13 @@ namespace TabbedExplorer
             n.Add(Sep());
 
             // ⑩ 常用动作 + 说明
-            // 川 2026-09-22 问「记住当前标签功能是干嘛的」—— 说明这个标签没讲清自己。
+            // 用户问「记住当前标签功能是干嘛的」—— 说明这个标签没讲清自己。
             // 它跟上面「保留标签页」不是一回事：那个是**开关**（开=以后才记），
             // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有
             // （改动攒 800ms 落盘 + 退出前再存），所以手动这一下只在「怕它没来得及存」时用。
             n.Add(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow()));
             n.Add(Info("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）"));
-            // 川 2026-09-22 问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
+            // 用户问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
             // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：
             // 这里**不再写这行说明**，要了解去 README/CHANGELOG 看（那条记在 README 的已知限制里）。
             return n;
@@ -246,7 +245,7 @@ namespace TabbedExplorer
             ts.Root = new MenuItem("设置");
             ts.Root.MenuItems.AddRange(ToMenus(Spec(hub), ts));
 
-            // 川 2026-09-22：「右键设置 菜单最后加：更多选项」——
+            // 用户：「右键设置 菜单最后加：更多选项」——
             // 菜单里只留「在菜单里设着顺手」的那些，别的都去设置窗口；这一条就是入口。
             // 同时也是「删掉那些不方便以菜单形式设置的内容」的兜底：删掉的东西窗口里都还能改。
             ts.Root.MenuItems.Add(MenuFx.Sep());

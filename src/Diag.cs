@@ -6,7 +6,7 @@ namespace TabbedExplorer
     /// 诊断日志。每一步立即落盘（崩溃时能知道死在哪一步）。
     /// 文件：程序目录下 `data\log.txt`（见 AppPaths，绿色便携；写不动才退回 %APPDATA%）。
     ///
-    /// ⚠ 2026-09-22 川：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
+    /// ⚠ 用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
     /// 所以这里有一个 <see cref="Enabled"/> 总闸 —— 关着的时候**一个字节都不写**（连文件都不建），
     /// 开着的时候照旧每一步落盘。开关的值来自 `settings.json` 的 `debug`，见 `Settings.Debug`。
     /// </summary>
@@ -83,7 +83,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 启动时轮转一次：上一轮的日志已经很大（&gt; 1MB）就先挪成 `log.txt.prev.txt`，
-        /// 免得**常年开着 Debug** 时这个文件无限长下去（川要「清理日志」按钮，就是因为它会变很大）。
+        /// 免得**常年开着 Debug** 时这个文件无限长下去（用户要「清理日志」按钮，就是因为它会变很大）。
         /// 轮转只留一份，更老的那份直接丢掉。
         /// </summary>
         public static void Rotate()
@@ -105,7 +105,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 清空日志（设置窗口里那个「清理日志」按钮）。返回是否成功。
-        /// 主日志和轮转出来那份一起清 —— 否则川点了「清理」还看到 data 目录里躺着几百 KB。
+        /// 主日志和轮转出来那份一起清 —— 否则用户点了「清理」还看到 data 目录里躺着几百 KB。
         /// </summary>
         public static bool Clear()
         {

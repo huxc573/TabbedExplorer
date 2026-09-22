@@ -9,12 +9,12 @@ namespace TabbedExplorer
     /// <summary>
     /// 书签栏（Ctrl+Shift+B 开关）—— 夹在标签条和内容之间，跟浏览器那条书签栏一个位置。
     ///
-    /// 2026-09-22 川改的几条：
+    /// 用户改的几条：
     ///   1. **内容程序自己记** —— 数据在 `data\favorites.json`，结构是树（见 `FavStore`）。
     ///      栏上显示的是「书签栏」那个文件夹的直接孩子；里面**带孩子的节点**（子文件夹）
     ///      点一下会**往下列一层**（浏览器就是这么干的）。
     ///   2. **最左边一枚固定的书签图标** —— 这条栏的「名牌」，不跟着内容横向滚动；
-    ///      点它开**书签管理器**（原来点它是开数据目录，川改成了「管理书签」）。
+    ///      点它开**书签管理器**（原来点它是开数据目录，用户改成了「管理书签」）。
     ///   3. 项上右键可以**重命名**（改我们自己这份 json 里记的显示名，磁盘上那个文件夹不动）。
     ///
     /// 点击行为：文件夹 → 开成新标签；文件 → 交给系统（默认程序）打开。
@@ -58,7 +58,7 @@ namespace TabbedExplorer
         private int contentWidth;
         private string tipKey;
 
-        // ---- 拖动（川 2026-09-22：栏上的项要能调顺序 / 拖进子文件夹）----
+        // ---- 拖动（用户：栏上的项要能调顺序 / 拖进子文件夹）----
         // 按下时只记状态，**动作留到 MouseUp** —— 不这样就没法跟拖动区分（见 OnMouseDown 注释）。
         private int dragIndex = -1;          // 按下时命中的那一项
         private Point dragStart;
@@ -149,7 +149,8 @@ namespace TabbedExplorer
                 {
                     Item it = new Item();
                     it.Node = n;
-                    it.Icon = n.IsFolder ? null : ShellIcon.PathIcon(n.Path, Px(18));
+                    // 书签自己的文件夹用我们那颗（蓝文件夹 + 金徽），别跟磁盘上的真文件夹撞脸
+                    it.Icon = n.IsFolder ? ShellIcon.FavFolderIcon(Px(18)) : ShellIcon.PathIcon(n.Path, Px(18));
                     items.Add(it);
                 }
                 Diag.Step("书签栏: 载入 " + items.Count + " 项");
@@ -212,7 +213,7 @@ namespace TabbedExplorer
             Graphics g = e.Graphics;
             g.FillRectangle(new SolidBrush(TheBack), ClientRectangle);
 
-            // ---- 左边那枚固定的「书签」图标（川 2026-09-22 要的）----
+            // ---- 左边那枚固定的「书签」图标（用户要的）----
             Rectangle lead = LeadBounds();
             if (hoverLead) g.FillRectangle(new SolidBrush(Theme.Hover), lead);
             Image li = LeadImage();
@@ -287,7 +288,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 「书签」那枚图标（MDL2 的实心星星）。
-        /// 川 2026-09-22：「用已打开书签栏的那个蓝色图标」+「有点小」——
+        /// 用户：「用已打开书签栏的那个蓝色图标」+「有点小」——
         /// 于是改成跟标签条上那枚**开了书签栏时一样**的蓝色实心星（E735 + Theme.Accent），
         /// 尺寸 16 → 20（字形 ink 比字号小，同字号下星星看着比齿轮/历史那几个都小）。
         /// </summary>
@@ -316,7 +317,7 @@ namespace TabbedExplorer
             base.OnMouseMove(e);
 
             // ---- 拖动：拖栏上的项调顺序；拖到某个文件夹项上 = **放进那个文件夹** ----
-            // （川 2026-09-22：原来拖到书签栏文件夹上只会并排加一个同级项，不是加进文件夹。）
+            // （用户：原来拖到书签栏文件夹上只会并排加一个同级项，不是加进文件夹。）
             // ⚠ 这里必须问 `Control.MouseButtons`（现读物理按键状态），**不能用 `e.Button`** ——
             //   WinForms 的 `MouseMove` 事件里那个字段经常是 `None`（它只对 Down/Up 才填得准），
             //   拿它判「左键还按着没」会一直判成「没按」，拖动就永远触发不了。
@@ -387,7 +388,7 @@ namespace TabbedExplorer
         }
 
         // ------------------------------------------------------------------
-        // 拖放：从文件列表里拖文件夹 / 文件过来（川 2026-09-22 要的）
+        // 拖放：从文件列表里拖文件夹 / 文件过来（用户要的）
         // ------------------------------------------------------------------
 
         protected override void OnDragEnter(DragEventArgs e)
@@ -430,7 +431,7 @@ namespace TabbedExplorer
                 if (added > 0)
                 {
                     Reload();
-                    // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                    // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
                     // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
                     // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
                 }
@@ -472,7 +473,7 @@ namespace TabbedExplorer
             // ⚠ 项上的「打开」动作**推迟到 MouseUp**（原来在 MouseDown 里），两个理由：
             //   ① 要跟拖动分开 —— 按下就跳走的话没机会拖；
             //   ② 弹菜单那条硬规矩：菜单必须在**松手之后**弹。按着键弹菜单，一松手系统就把
-            //      鼠标捕获收走，看门狗会把菜单关掉 —— 川报过的「闪一下就没了」就是这个。
+            //      鼠标捕获收走，看门狗会把菜单关掉 —— 用户报过的「闪一下就没了」就是这个。
             dragIndex = i;
             dragStart = e.Location;
         }
@@ -599,7 +600,7 @@ namespace TabbedExplorer
             Rectangle r = BoundsOf(index);
             Point at = new Point(r.Left, r.Bottom + Px(1));
             string what = "书签子文件夹 " + nd.Display;
-            // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（川报的「点书签栏文件夹，
+            // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（用户报的「点书签栏文件夹，
             //   里面的子项点不动」的根就在那儿）—— 这里不用自己 Defer。
             PopMenu.Show(kids, this, at, what);
         }
@@ -645,7 +646,7 @@ namespace TabbedExplorer
                 if (it.IsFolder)
                 {
                     FavNode nd = it.Node;
-                    // 川 2026-09-22：文件夹（含它下面的子文件夹）能「全部打开」，超过 7 项先问一句
+                    // 用户：文件夹（含它下面的子文件夹）能「全部打开」，超过 7 项先问一句
                     m.Add(FavActions.OpenAllItem(this, nd, delegate(FavNode f)
                     {
                         if (OpenAllRequested != null) OpenAllRequested(f);
@@ -669,7 +670,7 @@ namespace TabbedExplorer
                         try { Clipboard.SetText(p); }
                         catch (Exception ex) { Diag.Log("书签栏: 复制失败 " + ex.Message); }
                     }));
-                    // 川 2026-09-22 要的：栏上的项能改名（改的是**我们自己这份 json 里记的显示名**，
+                    // 用户要的：栏上的项能改名（改的是**我们自己这份 json 里记的显示名**，
                     // 磁盘上那个文件夹/文件一个字节都不动）
                     FavNode nd = it.Node;
                     m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));

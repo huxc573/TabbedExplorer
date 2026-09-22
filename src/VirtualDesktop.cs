@@ -22,14 +22,14 @@ namespace TabbedExplorer
     /// <summary>
     /// 虚拟桌面：让窗口「跟着你当前正在看的那个桌面」出现。
     ///
-    /// 川报的现象：在别的虚拟桌面上按 Win+E，窗口没出现，反而把人**拽回原来的桌面** ——
+    /// 用户报的现象：在别的虚拟桌面上按 Win+E，窗口没出现，反而把人**拽回原来的桌面** ——
     /// 因为窗口属于它被创建时那个桌面，而 SetForegroundWindow 会让系统切到那个桌面去。
     ///
     /// 做法：动手抢前台**之前**先问「你现在在哪个桌面」，把窗口搬过去再显示。
     ///
-    /// ⚠ 2026-09-22 修「在 Other 桌面还是会切走」：原来「当前桌面」只能靠
+    /// ⚠修「在别的桌面按 Win+E 还是会被切走」：原来「当前桌面」只能靠
     /// `GetWindowDesktopId(前台窗口)` 反推，而这个读**会间歇性失败**（日志实证：
-    /// 16:10:24 成功、16:10:26 与 16:10:36 取不到，紧接着抢前台把人拽回 Daily）。
+    /// 连着两次都取不到，紧接着抢前台就把用户拽回了他原来那张桌面）。
     /// 三处一起修：
     ///   ① 「当前桌面」改走未公开的 `IVirtualDesktopManagerInternal::GetCurrentDesktop`（权威、
     ///      已在本机实测可用且与公开反推一致），公开反推降为兜底并加重试；
@@ -38,7 +38,7 @@ namespace TabbedExplorer
     ///      拿到 `Failed` 就**只显示、不激活** —— 结构上杜绝「把人拽走」。
     ///
     /// 用公开的 IVirtualDesktopManager 只能搬**本进程**的窗口；搬别人的会 E_ACCESSDENIED
-    /// （那要另一套未公开接口，见 skill `win10-vd-move-foreign-window`）。
+    /// （那要另一套未公开接口）。
     /// 我们的嵌入子窗口挂在主窗口底下，跟着父窗口走，不用单独搬。
     /// </summary>
     internal static class VirtualDesktop
@@ -149,7 +149,7 @@ namespace TabbedExplorer
         /// 某个窗口属于哪张虚拟桌面（**跨进程也能问**，公开接口本来就支持）。取不到返回 Guid.Empty。
         ///
         /// 用途：每张桌面一个窗口之后，要用它来认领「哪个窗口是这张桌面的」——
-        /// 川要是用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面，靠它还能把窗口跟桌面重新对上。
+        /// 用户要是用 Win+Ctrl+Shift+方向键把窗口挪到别的桌面，靠它还能把窗口跟桌面重新对上。
         /// </summary>
         public static Guid WindowDesktopId(IntPtr hwnd)
         {

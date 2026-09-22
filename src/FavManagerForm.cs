@@ -7,7 +7,7 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 书签管理器（川 2026-09-22 要的「管理书签」）—— 仿浏览器那个书签管理器：
+    /// 书签管理器（用户要的「管理书签」）—— 仿浏览器那个书签管理器：
     /// 左边是**文件夹树**（可无限嵌套），右边是这个文件夹里的东西，顶上一条搜索框 + 几个动作。
     ///
     /// 风格按程序来（自绘行 + Theme 调色板），不用 TreeView / ListView ——
@@ -57,12 +57,12 @@ namespace TabbedExplorer
         // ⚠ 这几个原来是**裸像素**（没乘 DPI）—— 150% 下整张窗口挤成一团：
         //   顶部动作条（TopH=40 设备像素 = 26 逻辑像素）装不下高 Px(26)=39 的按钮，按钮溢到标题行上；
         //   行高 26/30 设备像素也只有 17/20 逻辑像素，文字上下贴边。
-        //   2026-09-22 川报的「无图标 + 文字堆叠错位」是两个毛病叠在一起：
+        //   用户报的「无图标 + 文字堆叠错位」是两个毛病叠在一起：
         //   ① 小标题（“书签” / 选中文件夹名）画在 `TopH + Px(4)`，第一行却从 `TopH + Px(6)` 开始
         //      ⇒ 两者**同一行**，字压字（截图里“书签书签栏（书签…”、“新建文件夹新建文件夹”）；
         //   ② 行离谱地矮。现在一律走 Px()，并给小标题留出 CaptionH。
         //
-        // ⚠ 2026-09-22 **第二轮**（川：「字体是不是变大了？自有窗口好像也变长了」）：
+        // ⚠**第二轮**（用户：「字体是不是变大了？自有窗口好像也变长了」）：
         //   字体一个都没动 —— 变大的是**行高 / 窗口**。上面那轮把裸像素换成 Px()，
         //   150% 屏上整张窗口和每一行都直接放大了 1.5 倍（行 30 -> 45 设备像素、窗口 880x560 -> 1320x840）。
         //   现在把**逻辑尺寸**调紧一档，让观感贴近资源管理器（图标与文字大小没变，只是不再那么空）。
@@ -83,14 +83,14 @@ namespace TabbedExplorer
         private Row pressed;                 // 双击判定用
         private string filter = "";
 
-        // ---- 多选（川 2026-09-22：「管理器没有多选功能」）----
+        // ---- 多选（用户：「管理器没有多选功能」）----
         // 只作用于**右列**（左树选中哪个文件夹是另一件事，`sel`）。
         // 统一走 `FavNode` 引用比（树上的节点本来就是同一批对象，不像历史那边存路径）。
         private readonly List<FavNode> multi = new List<FavNode>();
         /// <summary>Shift 选范围的锚点。</summary>
         private FavNode anchorNode;
 
-        // ---- 拖动（川 2026-09-22：管理器和书签栏都要能拖）----
+        // ---- 拖动（用户：管理器和书签栏都要能拖）----
         // 跟书签栏一套做法：按下只记状态，MouseMove 超阈值才算拖动，MouseUp 才真改数据。
         private FavNode dragNode;
         private Point dragStart;
@@ -146,7 +146,7 @@ namespace TabbedExplorer
                 string p = InputBox.Ask(this, "添加书签", "文件夹或文件的完整路径", "");
                 if (string.IsNullOrEmpty(p)) return;
                 string name;
-                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
                 // 加成功了新项**当场就出现在右边这一列里**，那就是反馈，所以成功这条路什么都不弹；
                 // 只有没加进去（重复 / 没有真实路径）才说一句。
                 if (!FavStore.Add(p, out name))
@@ -500,10 +500,11 @@ namespace TabbedExplorer
             }
             x += Px(15);
 
-            // 图标：书签栏那层用蓝色星，普通文件夹用文件夹图标
+            // 图标：书签栏那层用蓝色星；书签自己的分组文件夹用**我们那颗**（蓝文件夹 + 金徽，
+            // 用户：「换个图标，避免和系统文件夹图标重复」）；真路径才问 shell
             Image ic = null;
             if (r.Node.Bar) ic = BarStar();
-            else if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(15));
+            else if (r.Node.IsFolder) ic = ShellIcon.FavFolderIcon(Px(15));
             else ic = ShellIcon.PathIcon(r.Node.Path, Px(15));
             if (ic != null) g.DrawImage(ic, new Rectangle(x, r.Rect.Top + (r.Rect.Height - Px(15)) / 2, Px(15), Px(15)));
             x += Px(19);
@@ -532,7 +533,7 @@ namespace TabbedExplorer
             }
 
             Image ic;
-            if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(16));
+            if (r.Node.IsFolder) ic = ShellIcon.FavFolderIcon(Px(16));
             else ic = ShellIcon.PathIcon(r.Node.Path, Px(16));
             if (ic != null)
                 g.DrawImage(ic, new Rectangle(r.Rect.Left + Px(4), r.Rect.Top + (r.Rect.Height - Px(16)) / 2, Px(16), Px(16)));
@@ -892,7 +893,7 @@ namespace TabbedExplorer
                 m.Add(PopMenu.Split());
             }            else
             {
-                // 川 2026-09-22：文件夹（含子文件夹）能「全部打开」，超过 7 项先问一句
+                // 用户：文件夹（含子文件夹）能「全部打开」，超过 7 项先问一句
                 m.Add(FavActions.OpenAllItem(this, n, delegate(FavNode f) { OpenAll(f); }));
                 m.Add(Mi("在这个文件夹里新建文件夹", delegate { NewFolder(n); }));
                 m.Add(PopMenu.Split());
@@ -1007,7 +1008,7 @@ namespace TabbedExplorer
                     if (AddInto(parent, raw, out nm)) added++;
                 }
                 Diag.Step("书签管理器: 拖入 " + paths.Length + " 项 -> 加进「" + FavStore.NameOf(parent) + "」" + added + " 项");
-                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
                 // 新项**当场就出现在右边这一列里**了，那就是反馈，不再弹气泡。
                 Rebuild();
                 Invalidate();

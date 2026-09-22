@@ -73,15 +73,15 @@ namespace TabbedExplorer
         /// <summary>
         /// 这个标签**现在**在哪个文件夹 —— 就是地址栏上那个字符串（真目录时就是完整路径）。
         ///
-        /// 为什么不能只用 `TargetPath`：那只是「我们当初让 explorer 打开的」。川在标签里一路点进去之后
+        /// 为什么不能只用 `TargetPath`：那只是「我们当初让 explorer 打开的」。用户在标签里一路点进去之后
         /// 它就不对了，而「记忆标签」记的必须是他**最后停在哪儿**。
         ///
-        /// 怎么读到的（2026-09-22 绕了一圈才找对的那条路）：
+        /// 怎么读到的（绕了一圈才找对的那条路）：
         ///   1. ShellWindows / `IWebBrowser2.LocationURL` 内容是对的，但窗口被我们 SetParent 之后
         ///      它回报的 HWND 变成**我们的顶层窗口** —— 一张桌面上的所有标签会撞成同一个 key，废；
         ///   2. `AccessibleObjectFromWindow(OBJID_NATIVEOM)` 在 CabinetWClass 上直接 E_FAIL；
         ///   3. 地址栏那个 `ToolbarWindow32` 的**窗口文本就是地址本身**
-        ///      （实测 `地址: D:\Dev\Workspaces\WorkBuddy\TabbedExplorer`），
+        ///      （实测 `地址: D:\My Tools\TabbedExplorer`），
         ///      而它就在我们手上这个 HWND 的子树里 —— 按窗口读，天然不会串台。
         /// </summary>
         public string CurrentPath { get { return currentPath; } }
@@ -96,7 +96,7 @@ namespace TabbedExplorer
         private bool embedded;
         private bool disposed;
         /// <summary>
-        /// 这个标签是**接管**来的（川自己从开始菜单/桌面打开的窗口），不是我们起的。
+        /// 这个标签是**接管**来的（用户自己从开始菜单/桌面打开的窗口），不是我们起的。
         /// 区别只在收尾：接管的窗口关标签时要**把窗口关掉**（不然桌面上留一个孤儿），
         /// 而且**绝不能 kill 它的 explorer 进程**（多半就是桌面那个 shell 进程）。
         /// </summary>
@@ -185,7 +185,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 接管一个**别人建出来的**文件夹窗口（川从开始菜单 / 桌面双击打开的）。
+        /// 接管一个**别人建出来的**文件夹窗口（用户从开始菜单 / 桌面双击打开的）。
         ///
         /// 跟自己起那条路的区别：这里不 `Process.Start`（窗口已经有了），
         /// 所以也不会一闪 —— 它可能已经在屏幕上露了一下，我们**立刻把它藏掉**；
@@ -262,7 +262,7 @@ namespace TabbedExplorer
         /// 等窗口出现 → 发现就藏 → 等它加载完 → 嵌进来。
         ///
         /// 为什么要「藏」：`explorer.exe /n,/separate` 起的窗口会**先在桌面上画出来**，
-        /// 我们轮询到它再 SetParent 之间有一段可见时间 —— 川看到的就是「开标签时闪一下」。
+        /// 我们轮询到它再 SetParent 之间有一段可见时间 —— 用户看到的就是「开标签时闪一下」。
         /// 藏起来之后它压根不在桌面上露面，等内部加载好了再作为子窗口现身到我们容器里。
         ///
         /// （为什么不干脆让它「最小化启动」：那个窗口是 DCOM 激活出来的进程建的，
@@ -281,7 +281,7 @@ namespace TabbedExplorer
                 if (cab != IntPtr.Zero && !relax && !CabMatches(cab, TargetPath))
                 {
                     // 找到了一个窗口，但地址栏显示的不是我们要开的那个 —— 十有八九是
-                    // **同时开了好几个标签**，把别人的窗口扫到自己这儿了（川报的「有时候标签页
+                    // **同时开了好几个标签**，把别人的窗口扫到自己这儿了（用户报的「有时候标签页
                     // 点开是空的」就是这个：真窗口被别的标签嵌走，这个标签就永远等不到东西）。
                     // 先别嵌，继续等；4 秒后 relax 打开就不再挑了（宁可就近凑一个，也别永远空着）。
                     Diag.Step("Embed: 扫到的窗口地址对不上，继续等：" + cab.ToInt64().ToString("X"));
@@ -442,7 +442,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 把这条标签的 explorer 进程**驻留内存**收一收（非激活标签省内存，川报的优化 3）。
+        /// 把这条标签的 explorer 进程**驻留内存**收一收（非激活标签省内存，用户报的优化 3）。
         ///
         /// 做什么：`EmptyWorkingSet` —— 把它当前驻留的物理页尽量换到 standby 列表。
         /// **安全**：进程本身、它开的窗口、里面的状态一点都不动，只是那些页下次被访问时
@@ -701,7 +701,7 @@ namespace TabbedExplorer
             {
                 try
                 {
-                    // ★★ 关之前**先藏**（川 2026-09-22：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」）。
+                    // ★★ 关之前**先藏**（用户：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」）。
                     //
                     //   为什么非得藏：嵌进来的时候 `AttachWindow` 对它做过 `ShowWindow(SW_SHOW)`，
                     //   所以它一直带着 `WS_VISIBLE`；而非当前标签是靠**父面板** `Host.Visible = false`
@@ -746,7 +746,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 把**我们自己这个进程**的驻留内存也收一收（川 2026-09-22：「程序本身运行时内存占用高」）。
+        /// 把**我们自己这个进程**的驻留内存也收一收（用户：「程序本身运行时内存占用高」）。
         ///
         /// 做法跟标签那一条一样是 `EmptyWorkingSet` —— 只是目标是本进程。
         /// 它**不释放任何托管对象**，只是把当前用不到的物理页换到 standby 列表，

@@ -15,7 +15,7 @@ namespace TabbedExplorer
     ///   2) **只在我们窗口是前台时**接管标签快捷键（新建/关闭/前后标签/历史/恢复/书签栏 + Ctrl+1..9）。
     ///      这些绑定是**可自定义**的，真源在 settings.json 的 `hotkey_*`（解析在 Hotkeys）。
     ///
-    /// 为什么标签快捷键也得走钩子（2026-09-22 川報「Ctrl+T 完全没效果，Ctrl+W 直接把程序关掉了」）：
+    /// 为什么标签快捷键也得走钩子（用户報「Ctrl+T 完全没效果，Ctrl+W 直接把程序关掉了」）：
     /// 真正持有键盘焦点的是**嵌进来的 explorer 子进程**（跨进程 SetParent 进来的那个窗口树），
     /// 按键根本不会流进我们的窗体 —— `Form.KeyPreview` / `OnPreviewKeyDown` 一条都收不到。
     /// 于是：Ctrl+T（explorer 没这个键）什么都不发生；Ctrl+W（explorer 自带「关闭窗口」）
@@ -59,7 +59,7 @@ namespace TabbedExplorer
         /// 吞到了一条**可自定义**的命令。参数是命令标识（`newtab` / `closetab` / `nexttab` /
         /// `prevtab` / `history` / `reopen` / `favbar` —— 就是 `Settings.HotkeyKeys` 那 7 条），
         /// 绑的组合键由 `Hotkeys`（settings.json 里可改）说了算。
-        /// 2026-09-22 改的：原来是一条命令一个事件、组合键写死在本文件里；
+        ///改的：原来是一条命令一个事件、组合键写死在本文件里；
         /// 现在合成一个事件，加/改绑定只动 settings.json 和设置窗口。
         /// </summary>
         public event Action<string> Command;

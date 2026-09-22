@@ -8,7 +8,7 @@ namespace TabbedExplorer
     /// <summary>
     /// 全局设置，JSON `&lt;程序目录&gt;\data\settings.json`（**绿色便携**，见 AppPaths）。
     ///
-    /// 现在这些项（2026-09-22）：
+    /// 现在这些项（）：
     ///   capture    = perdesktop | migrate   标签捕获方式（每桌面一个窗口 / 全进程一个窗口 + Win+E 搬过来）
     ///   keeptabs   = 1 | 0                  是否保留标签页（退出后记住、下次还原）
     ///   theme      = system | light | dark  颜色模式
@@ -19,9 +19,9 @@ namespace TabbedExplorer
     ///   captureall = 1 | 0                  是否把「从开始菜单/桌面打开的文件夹」也收成标签
     ///   debug      = 1 | 0                  是否把详细过程写进 data\log.txt（默认关，见 Diag）
     ///
-    /// ⚠ 用 JSON 而不是 `key=value`（2026-09-22 川要求「配置项文件用 json 格式」）：
+    /// ⚠ 用 JSON 而不是 `key=value`（用户要求「配置项文件用 json 格式」）：
     /// JSON 本体不支持注释，所以说明写在 `_` 开头的键里 —— 那既是**合法 JSON**（任何工具都读得动），
-    /// 又能让川打开文件就看见每一项是什么意思。读的是老 `settings.txt` 也没事：
+    /// 又能让用户打开文件就看见每一项是什么意思。读的是老 `settings.txt` 也没事：
     /// `Load` 会把它读进来、写成 json，再把老文件改名成 `.migrated` 留着（不删）。
     /// 解析统一走 `Json`（src/Json.cs）—— `desktops.json` / `history.json` / `favorites.json` 共用一套。
     /// </summary>
@@ -58,7 +58,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 自适应宽度（二）：**挤不下时自动缩窄** —— 全排标签加起来超过可用宽度就等比缩到能放下。
         /// 关了就不缩（总宽仍然不越过右边那排按钮，多出来的标签要靠横向滚动才看得到）。
-        /// 2026-09-22 川把这一个拆成了两项（原来只有这个「自适应宽度」）。
+        /// 用户把这一个拆成了两项（原来只有这个「自适应宽度」）。
         /// </summary>
         public static bool TabAutoFit = true;
         /// <summary>书签栏是否显示（Ctrl+Shift+B）。</summary>
@@ -72,7 +72,7 @@ namespace TabbedExplorer
         /// <summary>
         /// Debug 模式：把每一步的详细过程写进 `data\log.txt`。
         ///
-        /// 川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
+        /// 用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
         /// 默认关（普通用户不需要一个会一直变大的文件），本机自己那份 settings.json 里开着。
         /// 它只影响 `Diag` 写不写盘，**不影响任何功能**。
         /// </summary>
@@ -86,13 +86,13 @@ namespace TabbedExplorer
         /// 「名称过长时自动加宽」**最多能加到多宽**（逻辑像素）。
         /// 注意这是**另一个上限**，不是 `TabWidth`：
         ///   开自动加宽时 `TabWidth` 是**基准宽度**，名字放不下才往上加，最多加到这里。
-        /// 川 2026-09-22 报「单标签页并未加宽」的根因就是原来把它卡在 `TabWidth` 上 ——
+        /// 用户报「单标签页并未加宽」的根因就是原来把它卡在 `TabWidth` 上 ——
         /// 名字再长，宽也超不过 `TabWidth`，看着就是「没加宽」。
         /// </summary>
         public const int TabWidenMax = 240;
 
         // ==================================================================
-        // 快捷键（川 2026-09-22：设置窗口新增「快捷键」页，程序自己的热键可改）
+        // 快捷键（用户：设置窗口新增「快捷键」页，程序自己的热键可改）
         //
         // 只存「命令 → 组合键文本」这一层；解析 / 匹配在 `Hotkeys`（src/Hotkeys.cs）。
         // 存成**扁平键** `hotkey_<命令>`（Json.cs 是手写的单层解析，不认嵌套对象）。
@@ -168,7 +168,7 @@ namespace TabbedExplorer
                     for (int i = 0; i < HotkeyKeys.Length; i++)
                     {
                         string v = Json.Get(json, "hotkey_" + HotkeyKeys[i]);
-                        // 读到的跟默认一样就不存 —— 让文件里只留「川真改过」的那几条
+                        // 读到的跟默认一样就不存 —— 让文件里只留「用户真改过」的那几条
                         if (!string.IsNullOrEmpty(v) &&
                             !string.Equals(v, HotkeyDefaults[i], StringComparison.OrdinalIgnoreCase))
                             hotkeys[HotkeyKeys[i]] = v;
@@ -190,7 +190,7 @@ namespace TabbedExplorer
                     return;
                 }
 
-                // 两样都没有 ⇒ 写一份默认的，川打开就能改
+                // 两样都没有 ⇒ 写一份默认的，用户打开就能改
                 Diag.Step("设置: 还没有 " + FileName + "（写一份默认的）");
                 Save();
                 Diag.Enabled = Debug;
@@ -234,7 +234,7 @@ namespace TabbedExplorer
                 Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
                 // 说明写在 `_` 开头的键里 —— 既是**合法 JSON**（任何 JSON 工具都读得动），
-                // 又能让川打开文件就看见每一项是什么意思（JSON 本体不支持注释）。
+                // 又能让用户打开文件就看见每一项是什么意思（JSON 本体不支持注释）。
                 sb.Append("{\r\n");
                 sb.Append("  \"_note\": \"TabbedExplorer 设置。就在程序目录的 data\\\\ 下，拷走整个文件夹就带走了设置和标签记忆。\",\r\n");
                 sb.Append("  \"_capture\": \"perdesktop = 每张虚拟桌面各一个窗口、各记一套标签；migrate = 全进程只一个窗口，Win+E 把它搬到当前桌面\",\r\n");

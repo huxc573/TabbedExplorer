@@ -68,7 +68,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 图标缓存（川 2026-09-22：「程序本身运行时内存占用高，尝试优化下」——
+        // 图标缓存（用户：「程序本身运行时内存占用高，尝试优化下」——
         //   这是里面最实在的一刀，而且同时省的是**磁盘查询 + 内存**两样东西）
         //
         // 为什么非加不可：`PathIcon` 每一次调用都是 **SHGetFileInfo（要碰磁盘 / 问 shell）
@@ -216,6 +216,115 @@ namespace TabbedExplorer
             }
             catch (Exception ex) { Diag.Log("ShellIcon: 取路径图标失败 " + path + " " + ex.Message); }
             return FolderIcon(target);
+        }
+
+        // ==================================================================
+        // 「书签文件夹」—— 我们自己的分组文件夹专用图标
+        //   （用户：「书签自有文件夹换个图标，避免和系统文件夹图标重复」）
+        //
+        // 为什么非自己画不可：书签树里的文件夹以前借的就是**系统那颗黄色文件夹**，
+        // 于是「书签里的分组」和「磁盘上真实的文件夹」在管理器和书签栏上长得一模一样，
+        // 一眼分不出哪个是书签分组、哪个是真路径。
+        //
+        // 样子：蓝色文件夹（比系统那颗的曼尼拉黄冷）+ 右下角一颗金星（书签 / 收藏那层意思）。
+        // 颜色**故意不跟主题走** —— 它是「这是书签」的标识，深色浅色下都得是同一个样子；
+        // 蓝底 + 金徽在两种背景上都看得清。
+        //
+        // 画法：先在 `f` 倍大的画布上用 GDI+ 画好（开抗锯齿），再缩到目标尺寸 ——
+        // 15px 这种尺寸上直接画没有抗锯齿的余地，只有「大图缩下来」才干净（同 `RenderIcon` 的思路）。
+        // ⚠ 传出去的位图**不 Dispose**：它进的是上面那张 `cache`，调用方拿到缓存里那张就别再动它。
+        // ==================================================================
+
+        private static readonly Color FavFolderBody = Color.FromArgb(59, 130, 246);    // 主体蓝
+        private static readonly Color FavFolderTab = Color.FromArgb(125, 176, 252);    // 耳（亮一档，小尺寸下靠它认出是文件夹）
+        private static readonly Color FavFolderEdge = Color.FromArgb(29, 78, 216);     // 描边
+        private static readonly Color FavFolderStar = Color.FromArgb(255, 197, 61);    // 金徽
+
+        /// <summary>
+        /// 书签自己的文件夹图标（`FavNode.IsFolder` 那种）。
+        /// 画不出来就退回系统那颗 —— 难看总比空白强。
+        /// </summary>
+        public static Bitmap FavFolderIcon(int target)
+        {
+            if (target <= 0) return null;
+            string key = "favfolder|" + target;
+            Bitmap hit = CacheGet(key);
+            if (hit != null) return hit;
+            try
+            {
+                Bitmap b = DrawFavFolder(target);
+                if (b != null) { CachePut(key, b); return b; }
+            }
+            catch (Exception ex) { Diag.Log("ShellIcon: 画书签文件夹失败 " + ex.Message); }
+            return FolderIcon(target);
+        }
+
+        private static Bitmap DrawFavFolder(int target)
+        {
+            // 小图标多重采样、大图标少采样（32px 以上再乘 8 就是 256px 的白费劲）
+            int f = target <= 32 ? 8 : (target <= 64 ? 4 : 2);
+            int s = target * f;
+            Bitmap big = new Bitmap(s, s, PixelFormat.Format32bppArgb);
+            try
+            {
+                using (Graphics g = Graphics.FromImage(big))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+
+                    // 先两层深色打底（耳 + 主体），再把亮色压上去 —— 1px 级别的描边不用 Pen 画，
+                    // 直接「大一圈的深色 + 小一圈的亮色」最稳。
+                    float e = s * 0.02f;               // 描边厚度
+                    float L = s * 0.045f, R = s * 0.955f;          // 主体左右
+                    float T = s * 0.190f, B = s * 0.880f;          // 主体上下
+                    float TL = s * 0.100f, TR = s * 0.360f, TX = s * 0.500f;   // 耳
+
+                    FillRound(g, L - e, TL - e, TX + e, TR + e, s * 0.070f, FavFolderEdge);
+                    FillRound(g, L - e, T - e, R + e, B + e, s * 0.110f, FavFolderEdge);
+                    FillRound(g, L, TL, TX, TR, s * 0.065f, FavFolderTab);
+                    FillRound(g, L, T, R, B, s * 0.105f, FavFolderBody);
+
+                    // 右下角那颗金星：正五角、尖朝上
+                    float cx = s * 0.745f, cy = s * 0.735f, ro = s * 0.235f, ri = s * 0.100f;
+                    PointF[] pts = new PointF[10];
+                    for (int i = 0; i < 10; i++)
+                    {
+                        double a = -Math.PI / 2 + i * Math.PI / 5;
+                        double r = (i % 2 == 0) ? ro : ri;
+                        pts[i] = new PointF((float)(cx + r * Math.Cos(a)), (float)(cy + r * Math.Sin(a)));
+                    }
+                    using (SolidBrush b = new SolidBrush(FavFolderStar)) g.FillPolygon(b, pts);
+                }
+
+                Bitmap result = new Bitmap(target, target, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(result))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.Clear(Color.Transparent);
+                    g.DrawImage(big, new Rectangle(0, 0, target, target));
+                }
+                return result;
+            }
+            finally { big.Dispose(); }
+        }
+
+        /// <summary>画一个圆角矩形（给的是左上 / 右下两个角，r = 圆角半径）。</summary>
+        private static void FillRound(Graphics g, float x1, float y1, float x2, float y2,
+                                      float r, Color c)
+        {
+            float w = x2 - x1, h = y2 - y1;
+            if (w <= 0 || h <= 0) return;
+            float d = Math.Min(r * 2f, Math.Min(w, h));
+            using (GraphicsPath p = new GraphicsPath())
+            {
+                p.AddArc(x1, y1, d, d, 180, 90);
+                p.AddArc(x2 - d, y1, d, d, 270, 90);
+                p.AddArc(x2 - d, y2 - d, d, d, 0, 90);
+                p.AddArc(x1, y2 - d, d, d, 90, 90);
+                p.CloseFigure();
+                using (SolidBrush b = new SolidBrush(c)) g.FillPath(b, p);
+            }
         }
 
         /// <summary>把一个 HICON 画成 target×target 的 32bppArgb 位图（保留 alpha）。</summary>

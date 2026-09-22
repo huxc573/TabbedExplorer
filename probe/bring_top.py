@@ -1,4 +1,4 @@
-"""把 TabbedExplorer 的主窗口置顶 + 显示出来，好让川看得见
+"""把 TabbedExplorer 的主窗口置顶 + 显示出来，好让用户看得见
 （他的 IDE 最大化且自带置顶，新窗口会被压在底下）。
 
 ⚠ 三个必须做对的点（都在 memories / skill 里记着）：

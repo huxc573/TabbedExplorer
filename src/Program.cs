@@ -69,7 +69,7 @@ namespace TabbedExplorer
         /// （AppContext + 自绘外壳 + IExplorerBrowser）实测会**硬崩**：
         /// .NET Runtime 事件 1023，退出码 0x80131506（COR_E_EXECUTIONENGINE，CLR 内部错误/执行引擎错误），
         /// 三次都崩在 CreateBrowser→navigate 之后、日志停在 `navigate: item ok`
-        /// （2026-09-22 09:56:52 / 10:11:19 / 10:20:08）—— 表现就是「程序崩了，我都没打开成功」。
+        /// （09:56:52 / 10:11:19 / 10:20:08）—— 表现就是「程序崩了，我都没打开成功」。
         ///
         /// 要回去跑老路做对比排查，加 --classic。
         /// </summary>
@@ -93,7 +93,7 @@ namespace TabbedExplorer
             }
 
             // 数据全部在**程序目录的 data\** 下（绿色便携，见 AppPaths）；
-            // 第一次跑先把老位置（%APPDATA%）的设置/记忆搬过来，别让川觉得「记忆丢了」。
+            // 第一次跑先把老位置（%APPDATA%）的设置/记忆搬过来，别让用户觉得「记忆丢了」。
             AppPaths.MigrateFromLegacy();
 
             // 上一轮日志攒得太大就先挪走一份（常年开着 Debug 时它会一直长）。
@@ -103,7 +103,7 @@ namespace TabbedExplorer
             Settings.Load();
 
             // 开机自启开着的话，把启动项里的 exe 路径刷成现在这个（程序目录被挪过也能对上）。
-            // 没开就什么都不做 —— 绝不替川打开。
+            // 没开就什么都不做 —— 绝不替用户打开。
             try { AutoStart.Sync(); } catch { }
 
             Theme.Mode = Settings.Color;   // 跟随系统 / 浅色 / 深色

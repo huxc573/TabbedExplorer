@@ -6,14 +6,14 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 标签条 —— 照浏览器那套做（2026-09-22 川定：整个程序就是「仿浏览器设计、增强 Win10 资源管理器」）。
+    /// 标签条 —— 照浏览器那套做（用户定：整个程序就是「仿浏览器设计、增强 Win10 资源管理器」）。
     ///
     /// 布局（从右往左）：
     ///   [×][□][—]  [齿轮] | [书签栏] [恢复关闭] [历史]  ……空白……  [+ 紧跟最后一个标签]
     /// 最右边那三个是**窗口按钮**（最小化 / 最大化 / 关闭），齿轮单独用一条竖线隔开
     /// （跟 Edge 一样：扩展一块、头像一块）。
     ///
-    /// 2026-09-22 第二次改（川报的 bug 2 + 评估 1）：
+    ///第二次改（用户报的 bug 2 + 评估 1）：
     ///   · 标签**只有一行** —— 就显示文件夹名（上一轮做成两行是改错了）；
     ///     完整路径挪到**悬停提示**里（提示里名字和路径一样时就只显示名字，别重复两遍）。
     ///   · **自绘标题栏整条去掉了**（原来那排「模仿资源管理器快速访问工具栏」的图标点了没反应），
@@ -64,7 +64,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 悬停提示。⚠ `ShowAlways = true` 是必须的：不开的时候**宿主窗口不是前台就不弹** ——
-        /// 川报的「未激活时移到标签上没显示名字，可关闭按钮会变色」就是这个（鼠标事件收到了，提示被憋掉了）。
+        /// 用户报的「未激活时移到标签上没显示名字，可关闭按钮会变色」就是这个（鼠标事件收到了，提示被憋掉了）。
         /// 配色走 `Theme.StyleTip`（自绘，跟着颜色模式走）。
         /// </summary>
         private readonly ToolTip tips = new ToolTip();
@@ -132,20 +132,20 @@ namespace TabbedExplorer
             return folderIcon != null;
         }
 
-        private readonly Font titleFont;      // 标签文字（**不加粗** —— 川 2026-09-22：加粗留给悬停提示）
+        private readonly Font titleFont;      // 标签文字（**不加粗** —— 用户：加粗留给悬停提示）
         private readonly Font tipTitleFont;   // 悬停提示里「文件夹名」那一行的字体（加粗）
         private readonly Font glyphFont;      // 右侧工具按钮的 MDL2 字形
         /// <summary>
         /// 窗口按钮（最小化 / 最大化 / 关闭）的字形 —— **比工具按钮小一号**。
         /// MDL2 里这三个字形（E921/E922/E923/E8BB）是**填满 em 框**的，同样 12px 下看着比
-        /// 齿轮 / 星星 / 历史那几个大一圈（川 2026-09-22 报的「三个按钮图标太大了，和其它不统一」）。
+        /// 齿轮 / 星星 / 历史那几个大一圈（用户报的「三个按钮图标太大了，和其它不统一」）。
         /// 10px 正好是 Win10 原生标题栏里这三个字形的尺寸（96dpi 下量到约 10px）。
         /// </summary>
         private readonly Font wbtnFont;
         /// <summary>
         /// 书签那枚星（E734/E735）单独用大一档的字号 ——
         /// 它是空心/实心五角星，ink 天生比齿轮（自绘）、历史（E81C 圆盘）、恢复（E7A7 弯箭头）小一圈，
-        /// 同一个字号并排会明显看着小（川 2026-09-22：「右上三颗窗控图标已经一样大了，书签图标有点小」）。
+        /// 同一个字号并排会明显看着小（用户：「右上三颗窗控图标已经一样大了，书签图标有点小」）。
         /// </summary>
         private readonly Font favGlyphFont;
 
@@ -163,7 +163,7 @@ namespace TabbedExplorer
         }
         private bool inactive;
 
-        /// <summary>标签条底：激活 / 未激活两套色（川要的「主窗口也模拟原生激活逻辑」）。</summary>
+        /// <summary>标签条底：激活 / 未激活两套色（用户要的「主窗口也模拟原生激活逻辑」）。</summary>
         private Color BarBack { get { return inactive ? Theme.TabBarOff : Theme.TabBar; } }
 
         /// <summary>窗口最大化着没（决定右上角那颗画「最大化」还是「还原」）。</summary>
@@ -197,7 +197,7 @@ namespace TabbedExplorer
         public event IndexEventHandler OrderChanged;   // 拖拽排序后：原索引
         /// <summary>标签条**空白区域**（不是标签、不是按钮）上按了右键。</summary>
         public event Action<Point> BlankRightClicked;
-        /// <summary>在标签条上滚滚轮（川 2026-09-22：标签条上滚轮 = 切换前后标签页）。参数是 delta（正=往上滚=上一个）。</summary>
+        /// <summary>在标签条上滚滚轮（用户：标签条上滚轮 = 切换前后标签页）。参数是 delta（正=往上滚=上一个）。</summary>
         public event Action<int> TabWheel;
 
         public TabStrip()
@@ -206,7 +206,7 @@ namespace TabbedExplorer
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.Selectable, true);
             Height = Px(StdHeight);
-            // 标签标题**不加粗**（川：加粗留给悬停提示）；悬停提示里名字那行加粗、路径不加粗。
+            // 标签标题**不加粗**（用户：加粗留给悬停提示）；悬停提示里名字那行加粗、路径不加粗。
             titleFont = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             tipTitleFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
             glyphFont = new Font("Segoe MDL2 Assets", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
@@ -276,7 +276,7 @@ namespace TabbedExplorer
             tabs.RemoveAt(index);
             if (hoverIndex == index) hoverIndex = -1;
             // 不用把 scrollX 归零：下一次 EnsureLayout 会把它夹到新的 maxScroll 上
-            // （归零反而会让川刚滑到的位置白滑 —— 关一个标签不该把视口弹回最左边）。
+            // （归零反而会让用户刚滑到的位置白滑 —— 关一个标签不该把视口弹回最左边）。
             Invalidate();
         }
 
@@ -327,7 +327,7 @@ namespace TabbedExplorer
         /// 排一次版。右侧那一排是**固定**的（窗口按钮 + 齿轮 + 竖线 + 三个功能按钮），
         /// 标签和「+」只在剩下的宽度里排。尺寸只由 Width + 标签数决定，鼠标事件里可以随手重算。
         ///
-        /// 宽度规则（2026-09-22 川要求拆成两项）：
+        /// 宽度规则（用户要求拆成两项）：
         ///   ① `tabautowiden` 开 → 每个标签按**自己那行文字**的宽度来（夹在 MinTabWidth ~ TabWidth 之间）；
         ///      关 → 一律 `TabWidth`。
         ///   ② `tabautofit` 开 → 全排加起来挤不下就**一起缩窄**（下限 MinTabWidth）；
@@ -360,7 +360,7 @@ namespace TabbedExplorer
 
             // ① 每个标签想要的宽度
             //
-            // ⚠ 2026-09-22 川报「开启名称过长时自动加宽时，单标签页并未加宽」——
+            // ⚠ 用户报「开启名称过长时自动加宽时，单标签页并未加宽」——
             //   根因：原来把加宽也卡在 `TabWidth` 上（`min(MaxTabWidth, need)`），
             //   于是名字再长、宽也超不过「标签页宽度」那一项，看着就是没加宽。
             //   现在 `TabWidth` 是**基准宽度**：名字放得下就一样宽，放不下才往上加，上限 `TabWidenMax`。
@@ -376,7 +376,7 @@ namespace TabbedExplorer
                     // 图标 + 左右留白 + 右边给关闭按钮留位
                     int need = Px(TextPadLeft) + IconSize + Px(IconGap) + t + CloseAreaWidth + Px(4);
                     w = Math.Max(MaxTabWidth, Math.Min(WidenMaxWidth, need));
-                    // ⚠ 2026-09-22 川报「过长依然出现遮挡问题（没收到滚动条范围内）」：
+                    // ⚠ 用户报「过长依然出现遮挡问题（没收到滚动条范围内）」：
                     //   原来这里还把 w 再夹一次「标签区可用宽度」（`if (w > avail) w = avail`），
                     //   于是超长名字的标签被硬切成 avail 宽 —— `total == avail`，
                     //   `maxScroll` 只剩 Px(4)，**被吃掉的那一截滚也滚不出来**，看着就是「被遮挡」。
@@ -411,7 +411,7 @@ namespace TabbedExplorer
             }
 
             // 「+」紧跟在最后一个标签右边；挤到边上了就贴在按钮左边（浏览器就是这样）
-            // ⚠ 2026-09-22 川报「标签占满后，关闭按钮和加号堆叠」：
+            // ⚠ 用户报「标签占满后，关闭按钮和加号堆叠」：
             //   原来这里是 `limit = areaRight - NewButtonWidth`，可 `areaRight` 上面**已经**扣过一个
             //   `NewButtonWidth` 了（见 357 行注释）—— 又扣一次，「+」被硬推到最后一个标签的关闭
             //   按钮底下，两个按钮就重在一起。areaRight 本身就是「标签区右界」，「+」只要不越过它即可。
@@ -465,7 +465,7 @@ namespace TabbedExplorer
         private int scrollX;
         private int maxScroll;
 
-        // ---- 横向滚动条（川 2026-09-22：平时隐藏、鼠标进标签条才显示、能点能拖）----
+        // ---- 横向滚动条（用户：平时隐藏、鼠标进标签条才显示、能点能拖）----
         /// <summary>鼠标在不在标签条里 —— 决定这条滚动条显不显示（平时是隐的）。</summary>
         private bool pointerIn;
         /// <summary>鼠标压在滚动条轨道上（亮一点）。</summary>
@@ -562,10 +562,10 @@ namespace TabbedExplorer
         private int HitTest(Point p)
         {
             EnsureLayout();     // 位置随时可能变（标签增删 / 窗口改宽），先重算一遍
-            // ⚠ 「标签和右边那排按钮是同一层」的另一半（川 2026-09-22）：
+            // ⚠ 「标签和右边那排按钮是同一层」的另一半（用户）：
             //   标签溢出了的话，最后几个标签的矩形是**伸到按钮底下**的（只被裁掉了不画）。
             //   命中判定不过这一刀，在右边空白处右键就会弹「标签右键」（那个 x 坐落在被裁掉的
-            //   那半个标签里）—— 川报的「右边空白菜单没反应」就是这个。先按裁剪线切一刀。
+            //   那半个标签里）—— 用户报的「右边空白菜单没反应」就是这个。先按裁剪线切一刀。
             if (p.X >= Math.Max(0, tabsClipRight)) return -1;
             for (int i = 0; i < bounds.Count; i++)
             {
@@ -707,7 +707,7 @@ namespace TabbedExplorer
 
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
-            // ---- 选中标签的蓝色指示条：**贴在标签条底部**（川 2026-09-22 指定）----
+            // ---- 选中标签的蓝色指示条：**贴在标签条底部**（用户指定）----
             // 原来画在顶上，会跟顶部的滚动条轨道抢同一排像素。挪到底部后各占一边，互不打架。
             // ⚠ 必须**画在上面那条分隔线之后**：分隔线压在 Height-1，先画蓝线会被它盖掉一像素。
             int accentH = Math.Max(2, Px(2));
@@ -723,7 +723,7 @@ namespace TabbedExplorer
             }
             g.Clip = clipForAccent;
 
-            // ---- 标签溢出时的位置指示条（川 2026-09-22 要的「隐藏进度条」）----
+            // ---- 标签溢出时的位置指示条（用户要的「隐藏进度条」）----
             // 就画在标签条**最顶上、拉满整条宽度**：底 = 标签区宽度，滑块 = 当前能看到的那一段。
             // 它在裁剪区之外（先 Clip 恢复再画），不然滑块永远只能看到左边一截。
             DrawScrollBar(g);
@@ -784,7 +784,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 算滚动条的**轨道 / 滑块**矩形（没溢出就返回 false）。
         /// ⚠ 画和命中判定都走这一份 —— 两处各算一次的话，看到的滑块和点得着的滑块迟早会差几个像素。
-        /// 轨道 = **整条标签条的宽度、贴在最顶上**（川 2026-09-22 指定），
+        /// 轨道 = **整条标签条的宽度、贴在最顶上**（用户指定），
         /// 滑块宽 = 「看得见的那一段 / 全部」的比例，滑块位置 = 滚到哪儿了。
         /// </summary>
         private bool LayoutScrollBar(out Rectangle track, out Rectangle thumb)
@@ -792,7 +792,7 @@ namespace TabbedExplorer
             track = Rectangle.Empty; thumb = Rectangle.Empty;
             if (maxScroll <= 0 || tabs.Count < 2) return false;
 
-            // 川 2026-09-22：挪到**顶部**、并且**拉满整条标签条的宽度**
+            // 用户：挪到**顶部**、并且**拉满整条标签条的宽度**
             // （原来是压在标签底下、只占标签区）。平时不显示（`DrawScrollBar` 里判 `pointerIn`）；
             // 选中标签那条蓝线已经挪到底部了（见 `OnPaint`），两边各占一头、不再抢像素。
             int x0 = 0;
@@ -816,8 +816,8 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 画标签溢出时那条横向滚动条（川 2026-09-22：**平时隐藏**，鼠标进标签条才显示；
-        /// 位置在标签条**最顶上、拉满整条宽度** —— 川后来指定的，放底下不好找）。
+        /// 画标签溢出时那条横向滚动条（用户：**平时隐藏**，鼠标进标签条才显示；
+        /// 位置在标签条**最顶上、拉满整条宽度** —— 用户后来指定的，放底下不好找）。
         /// 没溢出 / 鼠标不在条里就不画 —— 没超出屏幕时画一条只会是干扰。
         /// </summary>
         private void DrawScrollBar(Graphics g)
@@ -1117,7 +1117,7 @@ namespace TabbedExplorer
             }
 
             // ---- 功能按钮：**松手才发**（松手时鼠标还在同一颗按钮上才算一次点击）----
-            // ⚠ 2026-09-22 川报「点击历史记录图标，出菜单后闪一下就没了；按快捷键不会」。
+            // ⚠ 用户报「点击历史记录图标，出菜单后闪一下就没了；按快捷键不会」。
             //   根因：按钮原来在 **MouseDown** 里就发事件，菜单紧接着就弹出来了 —— 那一刻
             //   **左键还按着**。我们的菜单窗口不是前台窗口，Windows 只允许「有按键按着的时候」
             //   抓着鼠标捕获；用户一松手，捕获当场被系统收走，菜单的看门狗（250ms）以为捕获被
@@ -1133,7 +1133,7 @@ namespace TabbedExplorer
                 return;
             }
 
-            // ⚠ 右键菜单必须在 **MouseUp** 里发（2026-09-22 川报「空白处和标签右键功能均没有实现」）：
+            // ⚠ 右键菜单必须在 **MouseUp** 里发（用户报「空白处和标签右键功能均没有实现」）：
             // 在 MouseDown 里叫起菜单时，紧接着那条「右键抬起」消息会投到刚弹出来的菜单窗口上
             // （菜单自己抓着鼠标捕获），菜单把它当成「点在别处」→ 当场关掉。
             // 于是：菜单一闪而过、或者用户点哪个条目都对不上 —— 看着就是「右键没功能」。
@@ -1166,7 +1166,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 标签条上的滚轮 = **切换前后标签页**（川 2026-09-22）。
+        /// 标签条上的滚轮 = **切换前后标签页**（用户）。
         /// 横向滚动标签条是另一个入口：滚轮在非标签条区域时由上层（EmbedForm）转发到 `ScrollTabsBy`。
         /// </summary>
         protected override void OnMouseWheel(MouseEventArgs e)

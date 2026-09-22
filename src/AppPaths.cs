@@ -12,7 +12,7 @@ namespace TabbedExplorer
     ///
     /// 从老位置搬过来：第一次用新位置时，把 `%APPDATA%\TabbedExplorer` 里的
     /// `desktops.txt` / `settings.txt` 抄一份（**只在新位置还没有这个文件时**），
-    /// 免得川觉得「记忆丢了」。
+    /// 免得用户觉得「记忆丢了」。
     /// </summary>
     internal static class AppPaths
     {

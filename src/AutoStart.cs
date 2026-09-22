@@ -6,13 +6,13 @@ using Microsoft.Win32;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 开机自启（2026-09-22 川要的设置项）。
+    /// 开机自启（用户要的设置项）。
     ///
     /// 实现就一行注册表：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 里的 `TabbedExplorer` 值。
     /// 写的是**当前用户**的启动项，不需要管理员权限，也不碰 HKLM、不建计划任务。
     ///
     /// ⚠ 状态**只认注册表**，不在 `settings.json` 里再存一份：
-    /// 两份状态迟早会对不上（川自己在「任务管理器 → 启动」里禁用一个项，注册表值还在、
+    /// 两份状态迟早会对不上（用户自己在「任务管理器 → 启动」里禁用一个项，注册表值还在、
     /// 但开不起来了），那时菜单里打的勾就是假的。菜单每次现问 `IsEnabled()` 最省事也最准。
     ///
     /// 启动命令行带 `--tray`：开机只**常驻托盘 + 装 Win+E 钩子**，不弹窗口
@@ -30,7 +30,7 @@ namespace TabbedExplorer
             {
                 string exe = ExePath();
                 if (string.IsNullOrEmpty(exe)) return null;
-                // 路径一定要带引号：川的目录名里带空格（D:\Dev\Workspaces\...）就跑不起来了
+                // 路径一定要带引号：目录名里带空格（比如 D:\My Tools\TabbedExplorer）就跑不起来了
                 return "\"" + exe + "\" --tray";
             }
         }
@@ -82,7 +82,7 @@ namespace TabbedExplorer
                     }
                     else
                     {
-                        // 本来就没有这个值也算成功（幂等），别让川看到「改不了」
+                        // 本来就没有这个值也算成功（幂等），别让用户看到「改不了」
                         k.DeleteValue(ValueName, false);
                         Diag.Step("AutoStart: 已移除启动项");
                     }
@@ -98,7 +98,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 开着的话，把启动项里的路径刷新成「现在这个 exe」—— 程序目录被挪过也能对上。
-        /// 启动时调一次；没开就什么都不做（绝不替川打开）。
+        /// 启动时调一次；没开就什么都不做（绝不替用户打开）。
         /// </summary>
         public static void Sync()
         {

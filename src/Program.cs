@@ -97,6 +97,10 @@ namespace TabbedExplorer
             AppPaths.MigrateFromLegacy();
             Settings.Load();
 
+            // 开机自启开着的话，把启动项里的 exe 路径刷成现在这个（程序目录被挪过也能对上）。
+            // 没开就什么都不做 —— 绝不替川打开。
+            try { AutoStart.Sync(); } catch { }
+
             Theme.Mode = Settings.Color;   // 跟随系统 / 浅色 / 深色
             Theme.Reload();                // 先定下深浅色，后面所有自绘都按它来
 

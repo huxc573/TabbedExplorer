@@ -5,13 +5,15 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 设置菜单的内容 —— 窗口里那枚齿轮和托盘右键用的是**同一份**，只是换了两种菜单元件：
-    ///   - 齿轮：`ContextMenuStrip`（能吃我们自己的深色渲染器）
-    ///   - 托盘：WinForms 1.x 的 `MenuItem`（托盘本来就用的这套）
-    /// 两边都别各写一遍，否则加一项就会漏一边（川报的「托盘右键没有设置选项」就是这么来的）。
+    /// 设置项的**唯一一份规格** —— 三个入口都从这儿渲染，别各写一遍：
+    ///   - 托盘图标右键：`BuildTraySettings`（WinForms 1.x 的 `MenuItem`）
+    ///   - 齿轮 / 标签条空白右键：`SettingsForm`（独立窗口，川 2026-09-22 要的）
     ///
-    /// 勾选状态一律用**文字前缀** `✓ `，不用 `MenuItem.Checked` / `ToolStripMenuItem.Checked`：
-    /// 那个小方块是渲染器画的位图，深色下经常「勾了但看不见」。前缀跟着前景色走，深浅都成立。
+    /// 这就是当初「托盘右键漏了设置项」的根治办法：加一项只需要在 `Spec` 里加一行。
+    ///
+    /// 两份菜单的「打勾」画法不一样，原因在渲染那边：
+    ///   - 菜单：用文字前缀 `✓ `（`MenuItem.Checked` 的小方块在深色下经常「勾了但看不见」）
+    ///   - 窗口：就是标准的单选 / 勾选框，不用前缀
     /// </summary>
     internal static class SettingsMenu
     {
@@ -26,9 +28,17 @@ namespace TabbedExplorer
         internal sealed class Node
         {
             public string Text;
-            public Func<bool> Checked;      // null = 这一项不打勾（「关于」那种）
+            /// <summary>勾选状态（**活的**取值函数）。null = 这一项不打勾（「配置文件在哪」那种说明项）。</summary>
+            public Func<bool> Checked;
             public Action Click;
             public List<Node> Children;
+            /// <summary>
+            /// 互斥分组名 —— **设置窗口**用它决定「这几个画成一组单选」。
+            /// 挨着的、名字一样的叶子 = 一组（比如「捕获方式」那两项、「颜色模式」那三项）；
+            /// null 就是独立的一项（画成勾选框）。
+            /// 托盘菜单不看这个字段（它统一用 `✓ ` 前缀表示「当前是哪个 / 开没开」）。
+            /// </summary>
+            public string Group;
         }
 
         private static Node Sep() { return new Node(); }
@@ -38,38 +48,43 @@ namespace TabbedExplorer
             return new Node { Text = text, Checked = check, Click = click };
         }
 
+        private static Node Leaf(string text, Func<bool> check, Action click, string group)
+        {
+            return new Node { Text = text, Checked = check, Click = click, Group = group };
+        }
+
         private static Node Branch(string text, List<Node> kids)
         {
             return new Node { Text = text, Children = kids };
         }
 
         // ==================================================================
-        // 内容（顺序 = 川要的顺序：捕获方式 → 颜色模式 → 保留标签 → 标签宽度 → 自适应）
+        // 内容（顺序 = 川要的顺序：捕获方式 → 颜色模式 → 保留标签 → 标签宽度 → 自适应 → 收藏夹栏 → 捕获所有 → 开机自启）
         // ==================================================================
 
-        private static List<Node> Spec(DesktopHub hub)
+        internal static List<Node> Spec(DesktopHub hub)
         {
             List<Node> n = new List<Node>();
 
-            // ① 标签捕获方式
+            // ① 标签捕获方式（互斥）
             n.Add(Leaf(Settings.Label(Settings.CaptureMode.PerDesktop),
                        () => Settings.Capture == Settings.CaptureMode.PerDesktop,
-                       () => hub.SetCaptureMode(Settings.CaptureMode.PerDesktop)));
+                       () => hub.SetCaptureMode(Settings.CaptureMode.PerDesktop), "capture"));
             n.Add(Leaf(Settings.Label(Settings.CaptureMode.Migrate),
                        () => Settings.Capture == Settings.CaptureMode.Migrate,
-                       () => hub.SetCaptureMode(Settings.CaptureMode.Migrate)));
+                       () => hub.SetCaptureMode(Settings.CaptureMode.Migrate), "capture"));
             n.Add(Sep());
 
-            // ② 颜色模式
+            // ② 颜色模式（互斥）
             n.Add(Leaf(Settings.Label(Settings.ColorMode.System),
                        () => Settings.Color == Settings.ColorMode.System,
-                       () => hub.SetColorMode(Settings.ColorMode.System)));
+                       () => hub.SetColorMode(Settings.ColorMode.System), "theme"));
             n.Add(Leaf(Settings.Label(Settings.ColorMode.Light),
                        () => Settings.Color == Settings.ColorMode.Light,
-                       () => hub.SetColorMode(Settings.ColorMode.Light)));
+                       () => hub.SetColorMode(Settings.ColorMode.Light), "theme"));
             n.Add(Leaf(Settings.Label(Settings.ColorMode.Dark),
                        () => Settings.Color == Settings.ColorMode.Dark,
-                       () => hub.SetColorMode(Settings.ColorMode.Dark)));
+                       () => hub.SetColorMode(Settings.ColorMode.Dark), "theme"));
             n.Add(Sep());
 
             // ③ 是否保留标签页
@@ -78,7 +93,7 @@ namespace TabbedExplorer
                        () => hub.SetKeepTabs(!Settings.KeepTabs)));
             n.Add(Sep());
 
-            // ④ 标签页宽度（预设几个常用值；想要别的直接改 settings.txt）
+            // ④ 标签页宽度（预设几个常用值；想要别的直接改 settings.json）
             List<Node> widths = new List<Node>();
             foreach (int w in Settings.TabWidthPresets)
             {
@@ -106,42 +121,17 @@ namespace TabbedExplorer
                        () => hub.SetCaptureAll(!Settings.CaptureAll)));
             n.Add(Sep());
 
-            // ⑦ 常用动作 + 关于
+            // ⑧ 开机自启（川 2026-09-22 要的）。状态现问注册表，见 AutoStart。
+            //    ⚠ 标签就写「开机自启」四个字，不加括号说明（川明确说的）。
+            n.Add(Leaf("开机自启",
+                       () => AutoStart.IsEnabled(),
+                       () => hub.SetAutoStart(!AutoStart.IsEnabled())));
+            n.Add(Sep());
+
+            // ⑨ 常用动作 + 说明
             n.Add(Leaf("记住当前标签", null, () => hub.RememberNow()));
-            n.Add(Leaf("配置文件：程序目录\\data\\settings.json", null, null));            return n;
-        }
-
-        // ==================================================================
-        // 齿轮：ContextMenuStrip
-        // ==================================================================
-
-        /// <summary>
-        /// 齿轮那份菜单。**跟托盘是同一个类**（`ContextMenu` + `MenuItem`），只是 Shell 拿到的入口不同：
-        ///   托盘由 NotifyIcon 弹，齿轮由 `EmbedForm` 用 `Show(owner, point)` 弹。
-        ///
-        /// ⚠ 这里踩过一次大坑（2026-09-22 川连报三次「点齿轮卡死」）：
-        ///   原来齿轮用的是 `ContextMenuStrip`，而且**不挂 owner** 直接 `Show(屏幕坐标)` ——
-        ///   那个组合弹出来是非模态的、还抢着鼠标捕获，从用户角度就是「界面死了」，
-        ///   日志却照样打出「弹菜单返回」（Show 立刻就返回了），所以查日志看不出问题。
-        ///   换回 `ContextMenu` 之后走的是 WinForms 的模态菜单循环（`Show` 一直阻塞到菜单关掉），
-        ///   跟托盘右键那条**已经在川机器上验证没问题**的路径完全一致。
-        /// </summary>
-        public static ContextMenu BuildGear(DesktopHub hub)
-        {
-            ContextMenu m = new ContextMenu();
-            m.MenuItems.AddRange(ToMenus(Spec(hub), null));
-            return m;
-        }
-
-        /// <summary>齿轮菜单里每一项的文字（给「不能弹菜单」的场景兜底用，比如日志）。</summary>
-        public static string[] GearTexts(DesktopHub hub)
-        {
-            List<string> r = new List<string>();
-            foreach (Node nd in Spec(hub))
-            {
-                if (nd.Text != null) r.Add(TextOf(nd));
-            }
-            return r.ToArray();
+            n.Add(Leaf("配置文件：程序目录\\data\\settings.json", null, null));
+            return n;
         }
 
         // ==================================================================

@@ -52,16 +52,14 @@ namespace TabbedExplorer
         private const int HTBOTTOMRIGHT = 17;
 
         private readonly DesktopHub hub;
-        private readonly TitleBar titleBar;
         private readonly TabStrip tabStrip;
         private readonly Panel content;
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
 
-        /// <summary>齿轮菜单 + 它开着没开着的标记（防止点两下弹出两层）。</summary>
-        private ContextMenu gearMenu;
-        private bool gearMenuOpen;
+        /// <summary>设置窗口（齿轮 / 空白右键打开的独立窗口；同一时刻只留一个）。</summary>
+        private SettingsForm settingsForm;
 
         /// <summary>刚关掉的标签路径（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
         private readonly List<string> closedTabs = new List<string>();
@@ -82,10 +80,21 @@ namespace TabbedExplorer
         {
             public ExplorerHost Host;
             public string Path;
+            /// <summary>这一趟起的是**备用窗口**（预热），不是某个标签 —— 见 WarmUp。</summary>
+            public bool Warm;
         }
         private readonly Queue<Launch> launchQueue = new Queue<Launch>();
         /// <summary>现在正在起（还没 Ready / Failed）的那个 —— 一次只允许有一个。</summary>
         private ExplorerHost launching;
+
+        /// <summary>
+        /// 预热好的备用窗口（已经嵌好、藏在容器里不显示）。
+        /// 川 2026-09-22 报「新建标签页反应慢」—— 慢的就是「起 explorer 进程 + 等它加载」这两步，
+        /// 它们跟用户按没按 + 号毫无关系，所以提前做掉。
+        /// </summary>
+        private ExplorerHost reserve;
+        /// <summary>备用窗口已经加载好了（可以用了）。</summary>
+        private bool reserveReady;
 
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
@@ -96,6 +105,8 @@ namespace TabbedExplorer
         /// <summary>自己做的窗口边框厚度（只在不最大化时有）。</summary>
         private readonly int ResizeBorder;
         private bool inLayout;
+        /// <summary>窗口是不是失活的 —— 外壳配色跟着它换（见 SetInactive）。</summary>
+        private bool inactive;
 
         public EmbedForm(DesktopHub owner, string desktopKey)
         {
@@ -110,18 +121,17 @@ namespace TabbedExplorer
             KeyPreview = true;
             Icon = ShellIcon.AppIcon(false);   // 任务栏 / Alt+Tab 用程序自己的图标
 
-            // 无边框 + 自绘标题栏。
-            // 嵌入进来的 explorer 是子窗口、没有标题栏，而它的快速访问工具栏恰好画在
-            // 「标题栏」那一条里 —— 那条丢了就再也拿不回来（实测加回 WS_CAPTION 无效）。
+            // 无边框 + **标签条顶在最上面**。
+            // 原来上面还有一条自绘标题栏（模仿资源管理器的快速访问工具栏），2026-09-22 删掉了：
+            // 那条里的按钮是「我们自己画的图标 + 把快捷键派给 explorer」，实测点了没反应；
+            // 而真正的命令本来就在嵌进来的 explorer 自己的功能区里（文件/主页/共享/查看），一模就响。
+            // 删掉之后窗口多出 30 像素给内容，窗口按钮并在标签条最右边。
             FormBorderStyle = FormBorderStyle.None;
             ResizeBorder = Px(4);
             SyncChrome();
 
-            titleBar = new TitleBar();
-            titleBar.QatClicked += OnQatClicked;
-            titleBar.WindowButtonClicked += OnWindowButtonClicked;
-
             tabStrip = new TabStrip();
+            tabStrip.WindowButtonClicked += OnWindowButtonClicked;
             tabStrip.TabClicked += delegate(object s, int i) { Activate(i); };
             tabStrip.TabCloseClicked += delegate(object s, int i)
             {
@@ -136,7 +146,8 @@ namespace TabbedExplorer
             tabStrip.NewTabClicked += delegate
             {
                 Diag.Step("EmbedForm: 点击新建标签");
-                NewTab(CurrentPath());
+                // 新建标签页 = 开一个「此电脑」，**不是**复制当前标签（川报的 bug 4）
+                NewTab(ExplorerView.ThisPcPath);
             };
             // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 收藏夹栏
             tabStrip.ToolClicked += delegate(TabStrip.Tool t)
@@ -145,7 +156,7 @@ namespace TabbedExplorer
                 {
                     case TabStrip.Tool.Settings:
                         Diag.Step("EmbedForm: 点击设置按钮");
-                        Defer(ShowSettingsMenu);
+                        Defer(ShowSettingsWindow);
                         break;
                     case TabStrip.Tool.History:
                         Diag.Step("EmbedForm: 点击历史按钮");
@@ -194,9 +205,8 @@ namespace TabbedExplorer
             content.BackColor = Theme.Chrome;
 
             // 位置全部手算（DoLayout）：无边框窗口的四周留一圈自己的边框，
-            // 顶部还要多一根自绘标题栏 —— 靠 Dock 拼不出这个形状。
+            // 顶部就是标签条（原来上面的自绘标题栏已经删掉了）。
             // 底部**不再有状态栏**（川：最下面的文件夹名去掉，标签上已经显示了）。
-            Controls.Add(titleBar);
             Controls.Add(tabStrip);
             Controls.Add(favBar);
             Controls.Add(content);
@@ -214,23 +224,24 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>
-        /// 手动布局：自绘标题栏 → 标签条 → 内容 → 状态栏。
+        /// 手动布局：标签条 → （收藏夹栏）→ 内容。
         /// 全部摆在内边距（DisplayRectangle）里，四周那一圈（Padding）留给我们自己做可拖拽边框 ——
         /// 只有**没有被子控件盖住**的地方，窗体的 WM_NCHITTEST 才收得到。
         /// </summary>
         private void DoLayout()
         {
-            if (inLayout || titleBar == null) return;
+            // ⚠ 构造函数里 `Size = ...` 就会触发 OnSizeChanged -> 这里，
+            // 那时 tabStrip / content 还没建出来。原来靠 `titleBar == null` 挡住，
+            // 自绘标题栏删掉之后必须改成判 tabStrip。
+            if (inLayout || tabStrip == null || content == null) return;
             inLayout = true;
             try
             {
                 Rectangle r = DisplayRectangle;
-                int hTitle = Px(30);
                 int hTab = Px(TabStrip.StdHeight);
 
+                // 标签条就在最上面（自绘标题栏那一行已经删了，见 TabStrip 类注释）
                 int top = r.Top;
-                titleBar.SetBounds(r.Left, top, r.Width, hTitle);
-                top += hTitle;
                 tabStrip.SetBounds(r.Left, top, r.Width, hTab);
                 top += hTab;
 
@@ -264,40 +275,23 @@ namespace TabbedExplorer
                 Padding = new Padding(b);
                 DoLayout();
             }
-            if (titleBar != null) titleBar.Maximized = max;
+            if (tabStrip != null) tabStrip.Maximized = max;
         }
 
         /// <summary>
-        /// 快速访问工具栏点了一下。
-        /// 动作**不自己实现**：把对应的快捷键派给那个 explorer 线程正在用的窗口，行为跟原版一模一样。
-        /// 快捷键按 Win10 资源管理器的实际键位来。
+        /// 最右边那三个窗口按钮（最小化 / 最大化还原 / 关闭）。
+        /// 从自绘标题栏搬过来的 —— 标题栏没了，但那三颗还得有地方放。
         /// </summary>
-        private void OnQatClicked(TitleBar.Qat q)
-        {
-            if (activeIndex < 0 || activeIndex >= hosts.Count) return;
-            ExplorerHost h = hosts[activeIndex];
-            switch (q)
-            {
-                case TitleBar.Qat.Properties: h.SendCommand(EmbedApi.VK_RETURN, false, false, true); break; // Alt+Enter
-                case TitleBar.Qat.NewFolder:  h.SendCommand(EmbedApi.VK_N, true, true, false); break;       // Ctrl+Shift+N
-                case TitleBar.Qat.Undo:       h.SendCommand(EmbedApi.VK_Z, true, false, false); break;      // Ctrl+Z
-                case TitleBar.Qat.Redo:       h.SendCommand(EmbedApi.VK_Y, true, false, false); break;      // Ctrl+Y
-                case TitleBar.Qat.Delete:     h.SendCommand(EmbedApi.VK_DELETE, false, false, false); break; // Delete
-                case TitleBar.Qat.Rename:     h.SendCommand(EmbedApi.VK_F2, false, false, false); break;    // F2
-            }
-            h.Focus();   // 点完工具栏，焦点交还给文件列表
-        }
-
-        private void OnWindowButtonClicked(TitleBar.WBtn b)
+        private void OnWindowButtonClicked(TabStrip.WBtn b)
         {
             switch (b)
             {
-                case TitleBar.WBtn.Minimize: WindowState = FormWindowState.Minimized; break;
-                case TitleBar.WBtn.Maximize:
+                case TabStrip.WBtn.Minimize: WindowState = FormWindowState.Minimized; break;
+                case TabStrip.WBtn.Maximize:
                     WindowState = (WindowState == FormWindowState.Maximized)
                         ? FormWindowState.Normal : FormWindowState.Maximized;
                     break;
-                case TitleBar.WBtn.Close: HideToTray(); break;   // 收进托盘，不退进程
+                case TabStrip.WBtn.Close: HideToTray(); break;   // 收进托盘，不退进程
             }
         }
 
@@ -375,11 +369,12 @@ namespace TabbedExplorer
             // 窗口可能已经被销毁（多窗口之后 Theme.Changed 的订阅者不止一个，没法逐条退订），
             // 对着已释放的控件设颜色会抛 ObjectDisposedException。
             if (IsDisposed || Disposing) return;
-            BackColor = Theme.Chrome;
-            content.BackColor = Theme.Chrome;
-            titleBar.BackColor = Theme.Chrome;
-            titleBar.Invalidate();
+            // 激活 / 失活两套外壳底色（川 2026-09-22：主窗口也要模拟原生那套激活逻辑）
+            Color chrome = inactive ? Theme.ChromeOff : Theme.Chrome;
+            BackColor = chrome;
+            content.BackColor = chrome;
             tabStrip.Invalidate();
+            if (favBar != null) favBar.Invalidate();
         }
 
         /// <summary>
@@ -614,6 +609,13 @@ namespace TabbedExplorer
             if (what == "Ctrl+W") { HotkeyCloseTab(); return; }
             if (what == "Ctrl+Tab") { CycleTab(1); return; }
             if (what == "Ctrl+Shift+Tab") { CycleTab(-1); return; }
+            // Ctrl+1..9：跳到第 N 个标签（浏览器那套）。注意判断要卡在数字上 ——
+            // "Ctrl+T"/"Ctrl+W" 也是这个长度，字符不是数字就落下去。
+            if (what.Length == 6 && what.StartsWith("Ctrl+", StringComparison.Ordinal))
+            {
+                char c = what[5];
+                if (c >= '1' && c <= '9') { GotoTab(c - '1'); return; }
+            }
             // ---- 2026-09-22 新加的三个（都跟浏览器对齐）----
             if (what == "Ctrl+H")
             {
@@ -636,12 +638,20 @@ namespace TabbedExplorer
             }
         }
 
-        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。</summary>
+        /// <summary>Ctrl+T：在本窗口开个新标签（不是新开一个窗口）。目标是「此电脑」（川报的 bug 4）。</summary>
         private void HotkeyNewTab()
         {
-            Diag.Step("EmbedForm: 热键 Ctrl+T -> 新标签");
+            Diag.Step("EmbedForm: 热键 Ctrl+T -> 新标签（此电脑）");
             if (!Visible) Show();
-            NewTab(CurrentPath());
+            NewTab(ExplorerView.ThisPcPath);
+        }
+
+        /// <summary>Ctrl+1..9：跳到第 N 个标签（0 基传入）。不够那么多标签就什么都不干。</summary>
+        private void GotoTab(int zeroBased)
+        {
+            if (hosts.Count == 0 || zeroBased < 0 || zeroBased >= hosts.Count) return;
+            Diag.Step("EmbedForm: 热键 Ctrl+" + (zeroBased + 1) + " -> 切到 idx=" + zeroBased);
+            Activate(zeroBased);
         }
 
         /// <summary>Ctrl+W：关当前标签；这是最后一个就收进托盘（不退进程）。</summary>
@@ -721,6 +731,9 @@ namespace TabbedExplorer
         // ==================================================================
         private void NewTab(string path)
         {
+            // 有预热好的备用窗口就直接用（几乎瞬时），没有才现起一个
+            if (UseReserve(path)) return;
+
             ExplorerHost h = AddHost();
             int i = hosts.IndexOf(h);
             // 第二行先摆上要去的路径 —— explorer 要 3 秒才起得来，这 3 秒里也别让第二行空着
@@ -744,19 +757,25 @@ namespace TabbedExplorer
         ///
         /// 代价是「还原 6 个标签」要 6 次 × 大约一两秒。可以接受：标签是**立刻**就出来的
         /// （显示「打开中…」+ 目标路径），内容各填各的 —— 浏览器也是这个样子。
+        ///
+        /// 队列空了就去**预热一个备用窗口**（见 WarmUp）：下次「新建标签页」不用再等进程起来。
         /// </summary>
         private void PumpLaunch()
         {
-            if (launching != null || IsDisposed || Disposing) return;
+            if (IsDisposed || Disposing) return;
+            if (launching != null) return;
             while (launchQueue.Count > 0)
             {
                 Launch j = launchQueue.Dequeue();
-                if (j.Host == null || !hosts.Contains(j.Host)) continue;   // 排队期间被关掉了
+                if (j.Host == null) continue;
+                // 备用窗口不在 hosts 里，别把它当「排队期间被关掉了」扔掉
+                if (!j.Warm && !hosts.Contains(j.Host)) continue;
                 launching = j.Host;
                 Diag.Step("EmbedForm: 起 explorer（串行）" + j.Path);
                 j.Host.Start(j.Path);
                 return;
             }
+            WarmUp();      // 队列空了：提前把下一个「新建标签页」的窗口准备出来
         }
 
         /// <summary>一个标签起完了（成了 / 失败了）—— 轮到队列里的下一个。</summary>
@@ -765,6 +784,85 @@ namespace TabbedExplorer
             if (launching != h) return;
             launching = null;
             PumpLaunch();
+        }
+
+        // ------------------------------------------------------------------
+        // 备用窗口（预热）
+        //
+        // 川 2026-09-22 报「新建标签页反应慢」。慢在哪（日志实测）：一次点击到内容出来大约 1.7 秒，
+        // 其中「起 explorer 进程 + 等它把文件列表建出来」占掉 0.8 秒左右 ——
+        // 这两步跟用户按没按 + 号毫无关系，那就提前做掉：
+        // 每批标签都起完之后，在后台（也走串行队列）再起一个**藏着的**窗口备着，
+        // 加载完也不显示；川一按 + / Ctrl+T，把它直接显出来即可，几乎瞬时。用掉立刻再备一个。
+        //
+        // 只在目标是「此电脑」时才用得上（备用窗口加载的就是它）—— 而「新建标签页」现在就是「此电脑」。
+        // ------------------------------------------------------------------
+
+        private bool CanWarm()
+        {
+            return !IsDisposed && !Disposing && !Quitting
+                   && reserve == null && !reserveReady
+                   && launching == null && launchQueue.Count == 0;
+        }
+
+        private void WarmUp()
+        {
+            if (!CanWarm()) return;
+            ExplorerHost h = CreateHost();
+            reserve = h;
+            reserveReady = false;
+            h.PresetTarget(ExplorerView.ThisPcPath);
+            Diag.Step("EmbedForm: 预热备用标签（此电脑）");
+            launchQueue.Enqueue(new Launch { Host = h, Path = ExplorerView.ThisPcPath, Warm = true });
+            PumpLaunch();
+        }
+
+        /// <summary>把没用上的备用窗口收干净（起失败 / 它自己没了 / 窗口要关了）。</summary>
+        private void KillReserve()
+        {
+            ExplorerHost h = reserve;
+            reserve = null;
+            reserveReady = false;
+            if (h == null) return;
+            if (launching == h) launching = null;
+            try
+            {
+                content.Controls.Remove(h.Host);
+                h.Close("丢弃备用窗口");
+                h.Dispose();
+            }
+            catch (Exception ex) { Diag.Log("EmbedForm: 丢弃备用窗口失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 新建标签页时优先用它。返回 true = 已经开好了，调用方不用再起 explorer。
+        /// </summary>
+        private bool UseReserve(string path)
+        {
+            if (!reserveReady || reserve == null) return false;
+            if (!PathRules.Same(PathRules.Store(path), ExplorerView.ThisPcPath)) return false;
+
+            ExplorerHost h = reserve;
+            if (h.CabWindow == IntPtr.Zero || !NativeMethods.IsWindow(h.CabWindow))
+            {
+                Diag.Step("EmbedForm: 备用窗口已经没了，丢掉");
+                KillReserve();
+                return false;
+            }
+
+            reserve = null;
+            reserveReady = false;
+            hosts.Add(h);
+            int i = hosts.Count - 1;
+            tabStrip.AddTab(h.CurrentDisplayName);
+            tabStrip.SetIcon(i, h.TabIcon);
+            tabStrip.SetPath(i, TabStrip.PathLine(LivePath(h)));
+            History.Add(LivePath(h));
+            Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i + "（秒开）");
+            Activate(i);
+            MarkDirty();
+            PumpLaunch();      // 立刻再备一个
+            return true;
         }
 
         /// <summary>
@@ -789,18 +887,16 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 建一个标签 + 一个空的 shell 容器，把事件全接好。**怎么把它开起来由调用方决定**：
-        /// 自己起一个（`NewTab` → `Start`）还是接管现成的（`NewAdoptedTab` → `Adopt`）。
-        /// 两条路后面完全一样：等 explorer 加载完 → Ready → 嵌进来。
+        /// 建一个 shell 容器 + 把事件接好（**不加标签、不进 hosts**）。
+        /// 两条路都从这儿出发：进 hosts 的就是一个标签（`AddHost`），
+        /// 不进的是那个预热用的备用窗口（`WarmUp`）。
         /// </summary>
-        private ExplorerHost AddHost()
+        private ExplorerHost CreateHost()
         {
             ExplorerHost h = new ExplorerHost();
             h.Host.Dock = DockStyle.Fill;
             h.Host.Visible = false;
             content.Controls.Add(h.Host);
-            hosts.Add(h);
-            tabStrip.AddTab("打开中…");
             h.SetIconTarget(TabStrip.TabIconSize);      // 告诉它图标画多大（设备像素）
 
             h.Ready += delegate(object s, EventArgs e) { OnHostReady(h); };
@@ -812,10 +908,33 @@ namespace TabbedExplorer
             return h;
         }
 
+        /// <summary>
+        /// 建一个标签 + 一个空的 shell 容器。**怎么把它开起来由调用方决定**：
+        /// 自己起一个（`NewTab` → `Start`）还是接管现成的（`NewAdoptedTab` → `Adopt`）。
+        /// 两条路后面完全一样：等 explorer 加载完 → Ready → 嵌进来。
+        /// </summary>
+        private ExplorerHost AddHost()
+        {
+            ExplorerHost h = CreateHost();
+            hosts.Add(h);
+            tabStrip.AddTab("打开中…");
+            return h;
+        }
+
         private void OnHostReady(ExplorerHost h)
         {
+            // 备用窗口不在 hosts 里 —— 它到这就绪，等川按 + 号的时候直接显出来
+            if (h == reserve)
+            {
+                reserveReady = true;
+                Diag.Step("EmbedForm: 备用标签已就绪（下次新建标签页秒开）");
+                LaunchDone(h);
+                return;
+            }
+
             int i = hosts.IndexOf(h);
-            if (i < 0) return;                       // 已经关掉了
+            if (i < 0) { LaunchDone(h); return; }     // 已经关掉了（也得让队列往前走）
+
             tabStrip.SetTitle(i, h.CurrentDisplayName);
             tabStrip.SetIcon(i, h.TabIcon);
             tabStrip.SetPath(i, TabStrip.PathLine(LivePath(h)));
@@ -823,8 +942,7 @@ namespace TabbedExplorer
             if (i == activeIndex)
             {
                 h.Host.Visible = true;
-                Text = tabStrip.Tabs[i].Title;
-                titleBar.Title = Text;
+                Text = tabStrip.Tabs[i].Title;       // 任务栏 / Alt+Tab 的显示名
                 h.Focus();
             }
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
@@ -842,11 +960,7 @@ namespace TabbedExplorer
             string t = h.CurrentDisplayName;
             tabStrip.SetTitle(i, t);
             tabStrip.SetIcon(i, h.TabIcon);          // 导航后文件夹图标也会换（同一个窗口，换的是它自己挂的图标）
-            if (i == activeIndex)
-            {
-                Text = t;
-                titleBar.Title = t;
-            }
+            if (i == activeIndex) Text = t;
         }
 
         /// <summary>标签图标变了（explorer 按当前文件夹换掉了窗口自己那颗图标）。</summary>
@@ -875,8 +989,16 @@ namespace TabbedExplorer
 
         private void OnHostFailed(ExplorerHost h)
         {
+            if (h == reserve)
+            {
+                Diag.Log("EmbedForm: 备用窗口没起起来，丢掉（下次新建标签页走老路）");
+                KillReserve();
+                LaunchDone(h);
+                return;
+            }
+
             int i = hosts.IndexOf(h);
-            if (i < 0) return;
+            if (i < 0) { LaunchDone(h); return; }
             string want = h.TargetPath;
             string why = h.LastError ?? "（没有错误文本）";
             tabStrip.SetTitle(i, "打开失败");
@@ -907,6 +1029,12 @@ namespace TabbedExplorer
         {
             ExplorerHost h = sender as ExplorerHost;
             if (h == null) return;
+            if (h == reserve)
+            {
+                Diag.Step("EmbedForm: 备用窗口自己没了，丢掉");
+                KillReserve();
+                return;
+            }
             int i = hosts.IndexOf(h);
             Diag.Step("EmbedForm: 标签里的 explorer 自己退了 idx=" + i + " -> 收掉这个标签");
             if (i >= 0) CloseTab(i);
@@ -919,8 +1047,7 @@ namespace TabbedExplorer
             for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);
             tabStrip.SetActive(idx);
             hosts[idx].Focus();
-            Text = tabStrip.Tabs[idx].Title;
-            titleBar.Title = Text;
+            Text = tabStrip.Tabs[idx].Title;   // 任务栏 / Alt+Tab 的显示名（自绘标题栏删了，就剩这一处用途）
             MarkDirty();     // 「当时选中那个」也要记
         }
 
@@ -973,60 +1100,42 @@ namespace TabbedExplorer
             Activate(Math.Min(idx, hosts.Count - 1));
         }
 
-        private string CurrentPath()
-        {
-            if (activeIndex < 0 || activeIndex >= hosts.Count) return ExplorerView.ThisPcPath;
-            string p = LivePath(hosts[activeIndex]);
-            // 库里那种「显示名」不能喂给 explorer（会被当成本目录下的相对路径），退回「此电脑」。
-            return PathRules.Restorable(p) ? p : ExplorerView.ThisPcPath;
-        }
-
         // ==================================================================
-        // 设置（标签条最右边那枚齿轮）—— 内容在 SettingsMenu，跟托盘右键共用同一份
+        // 设置（标签条最右边那枚齿轮 / 标签条空白处右键）
         // ==================================================================
 
         /// <summary>
-        /// 齿轮弹出来的设置菜单。真正的内容由 `SettingsMenu` 统一生成（托盘右键也是它），
-        /// 这里只负责「什么时候弹、弹在哪儿」。
+        /// 「设置」——**开一个独立的设置窗口**（川 2026-09-22 要的）。
         ///
-        /// ⚠ 卡死的两个坑都在这段里，2026-09-22 连踩三次才收干净：
-        ///   ① **不能在 MouseDown 里同步弹** —— 鼠标消息没走完就切鼠标捕获，菜单的模态循环
-        ///      跟控件的捕获互相等。所以调用方一律走 `BeginInvoke`（见构造函数里的订阅）。
-        ///   ② 菜单类型必须是 **`ContextMenu`**（跟托盘同一个类），**不能**用 `ContextMenuStrip`
-        ///      再「不挂 owner 直接给屏幕坐标」—— 那个组合弹出来是非模态的、还抢着鼠标捕获，
-        ///      从用户角度就是界面上什么都不响应（而日志里 `Show` 早就返回了，看着一切正常）。
-        /// `ContextMenu.Show(owner, point)` 走 WinForms 的模态菜单循环：**一直阻塞到菜单关掉**，
-        /// 所以「弹菜单返回」这行日志出现时菜单一定已经关了，卡没卡一眼可辨。
+        /// 原来是就地弹一份菜单，换成窗口有两个理由：① 菜单里放不下东西（标签宽度只能做成子菜单、
+        /// 说明文字根本没处写）；② 窗口里能一并把**程序名 / 版本 / 简介**摆出来。
+        /// 托盘图标右键那份菜单**保持原样**（川明确要求），所以内容的唯一来源还是 `SettingsMenu.Spec`，
+        /// 窗口只是换一种渲染方式 —— 以后加设置项不会漏一边。
+        ///
+        /// 仍然走 `Defer`（BeginInvoke）—— 当初弹菜单连着卡死三次是同一个道理：
+        /// 不能在任何控件的 MouseDown 里同步开窗 / 弹菜单。
         /// </summary>
-        private void ShowSettingsMenu()
+        private void ShowSettingsWindow()
         {
-            if (hub == null || gearMenuOpen || IsDisposed || Disposing) return;
-            gearMenuOpen = true;
-            ContextMenu m = null;
+            if (hub == null || IsDisposed || Disposing) return;
             try
             {
-                Diag.Step("EmbedForm: 建设置菜单");
-                m = SettingsMenu.BuildGear(hub);
-                gearMenu = m;
-
-                // 菜单宽度量不出来（Menu 没有 GetPreferredSize），所以把锚点放在齿轮**中心**：
-                // 菜单从那儿往右铺，超出屏幕时 TrackPopupMenu 自己会挪回来。
-                Rectangle sb = tabStrip.SettingsButtonBounds();
-                Point at = tabStrip.PointToScreen(new Point(sb.Left + sb.Width / 2, sb.Bottom));
-                Point local = tabStrip.PointToClient(at);
-                Diag.Step(string.Format("EmbedForm: 弹菜单（模态）锚点 {0},{1}", at.X, at.Y));
-                m.Show(tabStrip, local);
-                Diag.Step("EmbedForm: 菜单已关");
+                if (settingsForm != null && !settingsForm.IsDisposed)
+                {
+                    Diag.Step("EmbedForm: 设置窗口已经开着 -> 提到前面");
+                    if (settingsForm.WindowState == FormWindowState.Minimized)
+                        settingsForm.WindowState = FormWindowState.Normal;
+                    settingsForm.Activate();
+                    return;
+                }
+                Diag.Step("EmbedForm: 打开设置窗口");
+                settingsForm = new SettingsForm(hub);
+                settingsForm.FormClosed += delegate { settingsForm = null; };
+                settingsForm.Show(this);
             }
             catch (Exception ex)
             {
-                Diag.Log("EmbedForm: 设置菜单失败 " + ex);
-            }
-            finally
-            {
-                gearMenuOpen = false;
-                gearMenu = null;
-                if (m != null) { try { m.Dispose(); } catch { } }
+                Diag.Log("EmbedForm: 打开设置窗口失败 " + ex);
             }
         }
 
@@ -1120,6 +1229,16 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
+            m.Add(new MenuItem("复制标签页", delegate
+            {
+                if (!PathRules.Restorable(target))
+                {
+                    Toast.Show("复制不了", "这个位置没有真实路径（库/虚拟文件夹）。");
+                    return;
+                }
+                string p = target;
+                Defer(delegate { NewTab(p); });
+            }));
             m.Add(new MenuItem("重新打开刚关闭的标签页(Ctrl+Shift+T)",
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(new MenuItem("-"));
@@ -1141,7 +1260,7 @@ namespace TabbedExplorer
         {
             if (IsDisposed || Disposing) return;
             List<MenuItem> m = new List<MenuItem>();
-            m.Add(new MenuItem("新建标签页(Ctrl+T)", delegate { Defer(delegate { NewTab(CurrentPath()); }); }));
+            m.Add(new MenuItem("新建标签页(Ctrl+T)", delegate { Defer(delegate { NewTab(ExplorerView.ThisPcPath); }); }));
             m.Add(new MenuItem("-"));
             m.Add(new MenuItem("历史记录(Ctrl+H)", delegate { Defer(ShowHistoryMenu); }));
             m.Add(new MenuItem("恢复关闭的标签页(Ctrl+Shift+T)", delegate { Defer(ReopenClosedTab); }));
@@ -1153,7 +1272,7 @@ namespace TabbedExplorer
             }));
 
             m.Add(new MenuItem("-"));
-            m.Add(new MenuItem("设置", delegate { Defer(ShowSettingsMenu); }));
+            m.Add(new MenuItem("设置", delegate { Defer(ShowSettingsWindow); }));
 
             ContextMenu cm = new ContextMenu(m.ToArray());
             Point at = tabStrip.PointToScreen(blankAt);
@@ -1196,9 +1315,10 @@ namespace TabbedExplorer
         /// </summary>
         private void SetInactive(bool inactive)
         {
-            if (titleBar != null) titleBar.Inactive = inactive;
+            this.inactive = inactive;
             if (tabStrip != null) tabStrip.Inactive = inactive;
-            if (favBar != null) favBar.Invalidate();
+            if (favBar != null) favBar.Inactive = inactive;
+            ApplyTheme();    // 外壳底色也换成激活 / 失活那一套
         }
 
         // ==================================================================
@@ -1231,6 +1351,14 @@ namespace TabbedExplorer
             if (e.Control && e.KeyCode == Keys.Tab)
             {
                 CycleTab(e.Shift ? -1 : 1);
+                e.IsInputKey = true;
+                return;
+            }
+            // Ctrl+1..9 = 第 1..9 个标签（焦点在我们自己控件上时的兼顾路径；
+            // 焦点在嵌进来的 explorer 里那条主路是 WinEHook + Hub，见 DesktopHub.SetupHook）
+            if (e.Control && e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D9)
+            {
+                GotoTab(e.KeyCode - Keys.D1);
                 e.IsInputKey = true;
                 return;
             }
@@ -1267,15 +1395,18 @@ namespace TabbedExplorer
                 catch (Exception ex) { Diag.Log("EmbedForm: 退出清理失败 " + ex.Message); }
             }
             hosts.Clear();
+
+            // 备用窗口不在 hosts 里，得单独收干净 —— 不收就漏一个 explorer 进程 + 一个孤儿窗口
+            KillReserve();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason + " 桌面=" + DesktopKey);
-            if (gearMenu != null)
+            if (settingsForm != null)
             {
-                try { gearMenu.Dispose(); } catch { }
-                gearMenu = null;
+                try { settingsForm.Close(); settingsForm.Dispose(); } catch { }
+                settingsForm = null;
             }
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }

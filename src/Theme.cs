@@ -41,6 +41,19 @@ namespace TabbedExplorer
         public static Color MenuHover;
         public static Color MenuBorder;
 
+        // ---- 窗口**未激活**时的那几个色 ----
+        /// <summary>
+        /// 外壳底色 / 标签条底 / 选中标签底的「失活版」。
+        ///
+        /// 2026-09-22 川：原生资源管理器激活与未激活的颜色是不一样的，我们的外壳要跟着模拟
+        /// （原来是不管激活没有，一律用设置的那种底色）。
+        /// 差值故意做小 —— 我们这几行颜色必须和嵌进来的 explorer 功能区**连成一整片**，
+        /// 差太多反而会露出一条接缝。
+        /// </summary>
+        public static Color ChromeOff;
+        public static Color TabBarOff;
+        public static Color TabActiveOff;
+
         public static event EventHandler Changed;
 
         /// <summary>
@@ -114,6 +127,10 @@ namespace TabbedExplorer
                 MenuBack = Color.FromArgb(43, 43, 43);
                 MenuHover = Color.FromArgb(62, 62, 62);
                 MenuBorder = Color.FromArgb(70, 70, 70);
+                // 失活版：底色 0 -> 18（抬一点，别死黑），选中标签 51 -> 58
+                ChromeOff = Color.FromArgb(18, 18, 18);
+                TabBarOff = Color.FromArgb(18, 18, 18);
+                TabActiveOff = Color.FromArgb(58, 58, 58);
             }
             else
             {
@@ -137,6 +154,10 @@ namespace TabbedExplorer
                 MenuBack = Color.FromArgb(249, 249, 249);
                 MenuHover = Color.FromArgb(225, 235, 245);
                 MenuBorder = Color.FromArgb(200, 200, 200);
+                // 失活版：243 -> 228（压暗一点，跟原生失活标题栏一个观感）
+                ChromeOff = Color.FromArgb(228, 228, 228);
+                TabBarOff = Color.FromArgb(228, 228, 228);
+                TabActiveOff = Color.FromArgb(240, 240, 240);
             }
             return changed;
         }
@@ -281,6 +302,54 @@ namespace TabbedExplorer
             {
                 for (int i = 0; i < mi.DropDownItems.Count; i++) StyleMenuItem(mi.DropDownItems[i]);
             }
+        }
+
+        // ==================================================================
+        // 悬停提示（ToolTip）
+        // ==================================================================
+
+        /// <summary>
+        /// 让一个 `ToolTip` 的背景色 / 字体颜色跟着颜色模式走（2026-09-22 川报的 bug）。
+        ///
+        /// 光设 `BackColor` / `ForeColor` **不够稳**：系统那套 tooltip（comctl32）在开着视觉样式时
+        /// 经常不认 `TTM_SETTIPBKCOLOR`，表现就是「设了却还是那块淡黄底」。
+        /// 所以这里直接开 `OwnerDraw`，整块提示由我们画 —— 底色、边框、文字全是我们自己的调色板，
+        /// 深浅两套都成立，也不用管系统主题。
+        ///
+        /// 画的时候颜色是**当场读** Theme 的字段，所以颜色模式一切换，下次弹出来就是新配色，
+        /// 不用挨个 ToolTip 重新设一遍。
+        ///
+        /// ⚠ 只对「普通提示」成立：气泡（balloon）样式下 comctl 不叫 OwnerDraw。
+        /// </summary>
+        public static void StyleTip(ToolTip t)
+        {
+            if (t == null) return;
+            t.OwnerDraw = true;
+            t.BackColor = MenuBack;     // comctl 自己算尺寸时会参考它
+            t.ForeColor = Text;
+            t.Draw -= OnTipDraw;        // 幂等：重复 Style 同一个对象不会挂两遍
+            t.Draw += OnTipDraw;
+        }
+
+        private static void OnTipDraw(object sender, DrawToolTipEventArgs e)
+        {
+            try
+            {
+                Color back = MenuBack, border = MenuBorder, fore = Text;
+                Rectangle r = e.Bounds;
+
+                using (SolidBrush b = new SolidBrush(back)) e.Graphics.FillRectangle(b, r);
+                using (Pen p = new Pen(border))
+                    e.Graphics.DrawRectangle(p, r.Left, r.Top, r.Width - 1, r.Height - 1);
+
+                // 文字贴着边框内缩几个像素，别顶到线上
+                Rectangle tr = new Rectangle(r.Left + 6, r.Top + 4,
+                                             Math.Max(1, r.Width - 12), Math.Max(1, r.Height - 8));
+                TextRenderer.DrawText(e.Graphics, e.ToolTipText, e.Font, tr, fore,
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
+                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            }
+            catch { }
         }
     }
 }

@@ -132,6 +132,12 @@ namespace TabbedExplorer
             hook.HistoryKey += delegate { Post(delegate { Hotkey("Ctrl+H"); }); };
             hook.ReopenTabKey += delegate { Post(delegate { Hotkey("Ctrl+Shift+T"); }); };
             hook.FavBarKey += delegate { Post(delegate { Hotkey("Ctrl+Shift+B"); }); };
+            // Ctrl+1..9 = 跳到第 N 个标签（参数是 0 基）
+            hook.GotoTabKey += delegate(int i)
+            {
+                int n = i;
+                Post(delegate { Hotkey("Ctrl+" + (n + 1)); });
+            };
             hook.Start();
 
             // 第二个实例被启动（双击 exe）时只会 set 一下这个事件，由我们现身。            // 事件挂在字段上、不能 using 掉 —— 注册等待之后句柄要一直活着。
@@ -541,6 +547,30 @@ namespace TabbedExplorer
             Notify("捕获所有打开的文件夹", on
                 ? "开：从开始菜单 / 桌面双击打开的文件夹也会收成标签（像浏览器）。"
                 : "关：只接管 Win+E，其他文件夹照旧开原生窗口。", false);
+        }
+
+        /// <summary>
+        /// 开机自启（川 2026-09-22 要的设置项）。
+        ///
+        /// 实现的**唯一真相在注册表**：`HKCU\...\Run` 里的 `TabbedExplorer` 值（见 AutoStart），
+        /// 不往 settings.json 里再存一份 —— 两份状态一旦对不上（川自己用任务管理器禁用了启动项），
+        /// 菜单里打的勾就是假的。所以这个开关没有 `Settings.XXX` 字段，每次都现问注册表。
+        ///
+        /// 启动方式带 `--tray`：只驻留托盘 + 装 Win+E 钩子，**不弹窗口**。
+        /// </summary>
+        public void SetAutoStart(bool on)
+        {
+            bool changed = AutoStart.Set(on);
+            RefreshTrayMenu();
+            if (!changed)
+            {
+                Notify("开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
+                return;
+            }
+            Notify("开机自启", on
+                ? "开：开机后自动常驻托盘（按 Win+E 才开窗口）。"
+                : "关：已从启动项里移除。", false);
+            Diag.Step("Hub: 开机自启 -> " + (on ? "开" : "关"));
         }
 
         /// <summary>把 from 桶的内容搬进 to 桶 —— **只在 to 还空着的时候**搬，不覆盖已记过的。</summary>

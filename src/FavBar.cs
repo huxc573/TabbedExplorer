@@ -59,6 +59,21 @@ namespace TabbedExplorer
         private readonly Font font;
         private static Bitmap folderFallback;
 
+        /// <summary>窗口失活时底色换成 ChromeOff（跟标签条、主窗口一个逻辑）。</summary>
+        public bool Inactive
+        {
+            get { return inactive; }
+            set
+            {
+                if (inactive == value) return;
+                inactive = value;
+                BackColor = TheBack;
+                Invalidate();
+            }
+        }
+        private bool inactive;
+        private Color TheBack { get { return inactive ? Theme.ChromeOff : Theme.Chrome; } }
+
         public delegate void PathEventHandler(string path);
         /// <summary>点了某一项 —— 参数是**解析后的目标路径**（新标签页开它）。</summary>
         public event PathEventHandler ItemClicked;
@@ -77,9 +92,10 @@ namespace TabbedExplorer
             tips.InitialDelay = 350;
             tips.AutoPopDelay = 8000;
             tips.ShowAlways = true;      // 窗口没激活也照弹（跟标签条一个理由）
+            Theme.StyleTip(tips);        // 背景 / 字体跟着颜色模式（bug 3）
             Theme.Changed += delegate
             {
-                BackColor = Theme.Chrome;
+                BackColor = TheBack;
                 if (!IsDisposed) Invalidate();
             };
         }
@@ -338,7 +354,7 @@ namespace TabbedExplorer
         {
             EnsureLayout();
             Graphics g = e.Graphics;
-            g.FillRectangle(new SolidBrush(Theme.Chrome), ClientRectangle);
+            g.FillRectangle(new SolidBrush(TheBack), ClientRectangle);
 
             if (items.Count == 0)
             {

@@ -150,7 +150,7 @@ namespace TabbedExplorer
         private static Bitmap folderCache;
 
         /// <summary>
-        /// 取「某个具体东西长什么样」的图标 —— 收藏夹栏那一排用。
+        /// 取「某个具体东西长什么样」的图标 —— 书签栏那一排用。
         /// 跟 `FolderIcon` 的区别是**这次要碰磁盘**（不带 `SHGFI_USEFILEATTRIBUTES`）：
         ///   - `.lnk` 快捷方式 → shell 会把目标解析掉，给的就是它指向那个文件夹/程序的图标；
         ///   - 普通目录 → 自定义图标（有 desktop.ini 的）也能拿到；

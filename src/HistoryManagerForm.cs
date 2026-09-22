@@ -12,13 +12,13 @@ namespace TabbedExplorer
     /// 界面模仿书签管理器）。
     ///
     /// 版式跟 `FavManagerForm` 一套（同一个程序、同一套 Theme 调色板、同一套自绘行），
-    /// 左边那条表 = 去过的地方（新的在前），右边 = 选中那一条的详情 + 能干什么。
+    /// 左边那条表 = 去过的地方（新的在前，**按日期分堆**），右边 = 选中那一条的详情 + 能干什么。
     /// 上面一样是「搜索框 + 一排动作按钮」。
     ///
     /// 行为：
     ///   · 点一行 = 选中；双击 = 在当前窗口开成新标签（跟从历史菜单里点一条一样）
     ///   · 行尾的 ✕ / 右键 / 顶上的按钮 = 从历史里删掉这一条
-    ///   · 顶上的搜索框跨全表过滤（路径或名字里带这个词的都留下）
+    ///   · 顶上的搜索框跨全表过滤（路径里带这个词的都留下）
     ///   · 拖文件夹进来？不需要 —— 历史是**自动记**的，没有「添加」这个动作
     ///
     /// ⚠ 所有动作都只动 `data\history.json`，**磁盘上一个字节都不动**（删记录 ≠ 删文件夹）。
@@ -27,6 +27,15 @@ namespace TabbedExplorer
     {
         /// <summary>双击 / 「打开」一条 —— 交给主窗口开成新标签。</summary>
         public event Action<string> OpenPath;
+
+        /// <summary>一行 = 一条记录，或者一条日期分堆标题（`Item == null`）。</summary>
+        private sealed class Row
+        {
+            public HistoryItem Item;
+            public string Head;
+            public int Index = -1;        // 在 view 里的下标（标题行是 -1）
+            public Rectangle Rect;
+        }
 
         private static readonly float DpiScale = ReadDpi();
 
@@ -44,16 +53,19 @@ namespace TabbedExplorer
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
         // 跟 FavManagerForm 一样：全部走 Px()，并给小标题留出 CaptionH（不然标题和第一行会字压字）。
-        private static int TopH { get { return Px(40); } }
-        private static int LeftW { get { return Px(320); } }
-        private static int ListRowH { get { return Px(30); } }
-        private static int CaptionH { get { return Px(26); } }
+        // 2026-09-22 第二轮：把逻辑尺寸调紧一档（行 30->24、窗口 920x560 -> 860x500），
+        // 免得 150% 屏上整张窗口过于空旷（川：「自有窗口好像也变长了」）。
+        private static int TopH { get { return Px(34); } }
+        private static int LeftW { get { return Px(300); } }
+        private static int ListRowH { get { return Px(24); } }
+        private static int HeadRowH { get { return Px(22); } }
+        private static int CaptionH { get { return Px(22); } }
 
-        private List<string> view = new List<string>();
-        private readonly List<Rectangle> rects = new List<Rectangle>();
+        private List<HistoryItem> view = new List<HistoryItem>();
+        private readonly List<Row> rows = new List<Row>();
 
-        private int sel = -1;
-        private int hover = -1;
+        private int sel = -1;                 // 选中第几条（**view 的下标**，不是行号）
+        private int hover = -1;               // 悬停那一行的下标（rows 的下标）
         private bool hoverClose;
         private string filter = "";
 
@@ -66,8 +78,8 @@ namespace TabbedExplorer
             Icon = ShellIcon.AppIcon(false);
             FormBorderStyle = FormBorderStyle.Sizable;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(Px(920), Px(560));
-            MinimumSize = new Size(Px(600), Px(360));
+            ClientSize = new Size(Px(860), Px(500));
+            MinimumSize = new Size(Px(560), Px(330));
             BackColor = Theme.Chrome;
             ForeColor = Theme.Text;
             font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
@@ -81,7 +93,7 @@ namespace TabbedExplorer
             search.BackColor = Theme.InputBack;
             search.ForeColor = Theme.Text;
             search.Font = font;
-            search.SetBounds(x, y + Px(1), Px(220), Px(24));
+            search.SetBounds(x, y + Px(1), Px(220), Px(22));
             search.TextChanged += delegate { filter = search.Text.Trim(); Rebuild(); Invalidate(); };
             Controls.Add(search);
 
@@ -89,8 +101,9 @@ namespace TabbedExplorer
             bx = AddButton("打开", bx, y, delegate { OpenSelected(); });
             bx = AddButton("复制完整路径", bx, y, delegate
             {
-                if (sel < 0 || sel >= view.Count) return;
-                try { Clipboard.SetText(view[sel]); Toast.Show("已复制", view[sel]); } catch { }
+                string p = Current;
+                if (p == null) return;
+                try { Clipboard.SetText(p); Toast.Show("已复制", p); } catch { }
             });
             bx = AddButton("删除这一条", bx, y, delegate { DeleteSelected(); });
             bx = AddButton("打开 json", bx, y, delegate
@@ -132,7 +145,7 @@ namespace TabbedExplorer
             Size sz = TextRenderer.MeasureText(text, fontDim, new Size(Px(400), Px(24)),
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
             int w = sz.Width + Px(18);
-            b.SetBounds(x, y, w, Px(26));
+            b.SetBounds(x, y, w, Px(24));
             b.Click += delegate { try { a(); } catch (Exception ex) { Diag.Log("历史管理器: " + ex.Message); } };
             Controls.Add(b);
             return x + w + Px(6);
@@ -158,20 +171,37 @@ namespace TabbedExplorer
 
         private void Rebuild()
         {
-            List<string> all = History.Recent;
-            view = new List<string>();
+            List<HistoryItem> all = History.Recent;
+            view = new List<HistoryItem>();
             for (int i = 0; i < all.Count; i++)
             {
                 if (filter.Length == 0 ||
-                    all[i].IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                    (all[i].Path != null &&
+                     all[i].Path.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0))
                     view.Add(all[i]);
             }
 
-            rects.Clear();
+            rows.Clear();
             int y = TopH + CaptionH;
+            string lastDay = null;
             for (int i = 0; i < view.Count; i++)
             {
-                rects.Add(new Rectangle(Px(8), y, Math.Max(1, LeftW - Px(18)), ListRowH));
+                // 川 2026-09-22：按日期归类 —— 换了一天就插一条灰标题
+                string day = History.DayLabel(view[i].At);
+                if (day != lastDay)
+                {
+                    Row hr = new Row();
+                    hr.Head = day;
+                    hr.Rect = new Rectangle(Px(8), y, Math.Max(1, LeftW - Px(18)), HeadRowH);
+                    rows.Add(hr);
+                    y += HeadRowH;
+                    lastDay = day;
+                }
+                Row r = new Row();
+                r.Item = view[i];
+                r.Index = i;
+                r.Rect = new Rectangle(Px(16), y, Math.Max(1, LeftW - Px(26)), ListRowH);
+                rows.Add(r);
                 y += ListRowH;
             }
 
@@ -179,7 +209,15 @@ namespace TabbedExplorer
             if (sel < 0 && view.Count > 0) sel = 0;
         }
 
-        private string Current { get { return (sel >= 0 && sel < view.Count) ? view[sel] : null; } }
+        private string Current
+        {
+            get { return (sel >= 0 && sel < view.Count) ? view[sel].Path : null; }
+        }
+
+        private HistoryItem CurrentItem
+        {
+            get { return (sel >= 0 && sel < view.Count) ? view[sel] : null; }
+        }
 
         // ==================================================================
         // 画
@@ -200,10 +238,10 @@ namespace TabbedExplorer
 
             DrawCaption(g, filter.Length > 0
                 ? ("历史记录（筛出 " + view.Count + " 条）")
-                : ("历史记录（" + view.Count + " 条）"), Px(12), TopH + Px(4));
-            DrawCaption(g, "详情", LeftW + Px(12), TopH + Px(4), true);
+                : ("历史记录（" + view.Count + " 条）"), Px(12), TopH + Px(3));
+            DrawCaption(g, "详情", LeftW + Px(12), TopH + Px(3), true);
 
-            for (int i = 0; i < rects.Count && i < view.Count; i++) DrawRow(g, i);
+            for (int i = 0; i < rows.Count; i++) DrawRow(g, i);
 
             if (view.Count == 0)
                 TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的记录" : "还没有历史记录（去几个文件夹就自动记上了）",
@@ -223,10 +261,18 @@ namespace TabbedExplorer
 
         private void DrawRow(Graphics g, int i)
         {
-            string p = view[i];
-            Rectangle r = rects[i];
+            Row row = rows[i];
+            Rectangle r = row.Rect;
 
-            if (i == sel) g.FillRectangle(new SolidBrush(Theme.Hover), r);
+            // ---- 日期分堆标题：一条灰字，不参与选中 ----
+            if (row.Item == null)
+            {
+                TextRenderer.DrawText(g, row.Head, fontDim, new Rectangle(r.Left, r.Top, r.Width, r.Height),
+                    Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                return;
+            }
+
+            if (row.Index == sel) g.FillRectangle(new SolidBrush(Theme.Hover), r);
             else if (i == hover) g.FillRectangle(new SolidBrush(Theme.Hover), r);
 
             // 行尾的 ✕
@@ -243,40 +289,54 @@ namespace TabbedExplorer
                 }
             }
 
+            string p = row.Item.Path;
             int x = r.Left + Px(4);
             Image ic = IconFor(p);
             if (ic != null)
             {
-                g.DrawImage(ic, new Rectangle(x, r.Top + (r.Height - Px(16)) / 2, Px(16), Px(16)));
-                x += Px(20);
+                g.DrawImage(ic, new Rectangle(x, r.Top + (r.Height - Px(15)) / 2, Px(15), Px(15)));
+                x += Px(19);
             }
 
+            // 末尾：时间 + ✕ 占的位置
+            string tm = History.TimeOf(row.Item.At);
             int rightRoom = close.Width + Px(10);
-            int tw = r.Right - x - rightRoom;
+            int timeW = 0;
+            if (tm.Length > 0)
+            {
+                timeW = TextRenderer.MeasureText(tm, fontDim, new Size(Px(200), Px(18)),
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + Px(8);
+                TextRenderer.DrawText(g, tm, fontDim,
+                    new Rectangle(r.Right - rightRoom - timeW, r.Top, timeW, r.Height),
+                    Theme.TextDim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+
+            int tw = r.Right - x - rightRoom - timeW;
             if (tw > 0)
                 TextRenderer.DrawText(g, p, font, new Rectangle(x, r.Top, tw, r.Height),
-                    i == sel ? Theme.Text : Theme.TextDim,
+                    row.Index == sel ? Theme.Text : Theme.TextDim,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
         }
 
-        /// <summary>右边的详情：这一条到底在哪儿、还开不开得了。</summary>
+        /// <summary>右边的详情：这一条到底在哪儿、什么时候去的、还开不开得了。</summary>
         private void DrawDetail(Graphics g)
         {
-            string p = Current;
+            HistoryItem it = CurrentItem;
             int x = LeftW + Px(14);
             int w = Math.Max(1, Width - x - Px(20));
             int y = TopH + CaptionH;
 
-            if (p == null)
+            if (it == null)
             {
                 TextRenderer.DrawText(g, "左边选一条，这里显示它的完整路径。",
                     fontDim, new Point(x, y), Theme.TextDim, TextFormatFlags.NoPadding);
                 return;
             }
 
-            Line(g, "完整路径：", p, x, ref y, w);
-            Line(g, "类型：", KindOf(p), x, ref y, w);
+            Line(g, "完整路径：", it.Path, x, ref y, w);
+            Line(g, "类型：", KindOf(it.Path), x, ref y, w);
+            Line(g, "去过时间：", string.IsNullOrEmpty(it.At) ? "（老记录，时间未知）" : it.At, x, ref y, w);
             Line(g, "在历史里的位置：", ("第 " + (sel + 1) + " 条，共 " + view.Count + " 条（越靠前越近）"),
                 x, ref y, w);
 
@@ -298,7 +358,7 @@ namespace TabbedExplorer
 
             int h = TextRenderer.MeasureText(g, value, font, new Size(r.Width, Px(400)),
                 TextFormatFlags.WordBreak | TextFormatFlags.NoPadding).Height;
-            y += Math.Max(Px(24), h + Px(10));
+            y += Math.Max(Px(22), h + Px(10));
         }
 
         private static string KindOf(string p)
@@ -319,16 +379,16 @@ namespace TabbedExplorer
         {
             try
             {
-                Image ic = ShellIcon.PathIcon(p, Px(16));
+                Image ic = ShellIcon.PathIcon(p, Px(15));
                 if (ic != null) return ic;
             }
             catch { }
-            return ShellIcon.FolderIcon(Px(16));
+            return ShellIcon.FolderIcon(Px(15));
         }
 
         private static Rectangle CloseRect(Rectangle row)
         {
-            int s = Px(20);
+            int s = Px(18);
             return new Rectangle(row.Right - s - Px(4), row.Top + (row.Height - s) / 2, s, s);
         }
 
@@ -336,9 +396,10 @@ namespace TabbedExplorer
         // 鼠标
         // ==================================================================
 
+        /// <summary>哪个**行号**（rows 的下标）在这个点上；-1 = 不在任何行上。</summary>
         private int RowAt(Point p)
         {
-            for (int i = 0; i < rects.Count; i++) if (rects[i].Contains(p)) return i;
+            for (int i = 0; i < rows.Count; i++) if (rows[i].Rect.Contains(p)) return i;
             return -1;
         }
 
@@ -346,7 +407,7 @@ namespace TabbedExplorer
         {
             base.OnMouseMove(e);
             int i = RowAt(e.Location);
-            bool hc = (i >= 0) && CloseRect(rects[i]).Contains(e.Location);
+            bool hc = (i >= 0) && rows[i].Item != null && CloseRect(rows[i].Rect).Contains(e.Location);
             if (i != hover || hc != hoverClose) { hover = i; hoverClose = hc; Invalidate(); }
         }
 
@@ -362,10 +423,9 @@ namespace TabbedExplorer
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
             int i = RowAt(e.Location);
-            if (i < 0) return;
-            if (CloseRect(rects[i]).Contains(e.Location)) { History.Remove(view[i]); Reload(); return; }
-            sel = i;
-            Rebuild();
+            if (i < 0 || rows[i].Item == null) return;      // 日期标题行点了没反应
+            if (CloseRect(rows[i].Rect).Contains(e.Location)) { History.Remove(rows[i].Item.Path); Reload(); return; }
+            sel = rows[i].Index;
             Invalidate();
         }
 
@@ -374,7 +434,8 @@ namespace TabbedExplorer
             base.OnMouseDoubleClick(e);
             // 双击行尾的 ✕ 不算「打开」（不然会连删两条）
             int i = RowAt(e.Location);
-            if (i >= 0 && CloseRect(rects[i]).Contains(e.Location)) return;
+            if (i >= 0 && rows[i].Item != null && CloseRect(rows[i].Rect).Contains(e.Location)) return;
+            if (i >= 0 && rows[i].Item != null) { sel = rows[i].Index; Invalidate(); }
             OpenSelected();
         }
 
@@ -406,10 +467,10 @@ namespace TabbedExplorer
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Right) return;
             int i = RowAt(e.Location);
-            if (i < 0) return;
-            sel = i;
+            if (i < 0 || rows[i].Item == null) return;
+            sel = rows[i].Index;
 
-            string p = view[i];
+            string p = rows[i].Item.Path;
             List<PopItem> m = new List<PopItem>();
             m.Add(PopMenu.It("打开（新标签）", delegate { OpenSelected(); }));
             m.Add(PopMenu.It("复制完整路径", delegate

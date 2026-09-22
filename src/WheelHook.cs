@@ -208,7 +208,7 @@ namespace TabbedExplorer
                 if (t.StripWheel != null) return t.StripWheel(c.x, delta);
                 return false;
             }
-            if (w == t.FavBar) return false;           // 收藏夹栏自己有横向滚动，别抢
+            if (w == t.FavBar) return false;           // 书签栏自己有横向滚动，别抢
 
             // 内容区：只有标签真的溢出时才接管（否则会把文件列表的滚动弄没了，
             // 包括 shell 原生的 Shift+滚轮横向滚动）

@@ -9,7 +9,7 @@ namespace TabbedExplorer
     /// 标签条 —— 照浏览器那套做（2026-09-22 川定：整个程序就是「仿浏览器设计、增强 Win10 资源管理器」）。
     ///
     /// 布局（从右往左）：
-    ///   [×][□][—]  [齿轮] | [收藏夹栏] [恢复关闭] [历史]  ……空白……  [+ 紧跟最后一个标签]
+    ///   [×][□][—]  [齿轮] | [书签栏] [恢复关闭] [历史]  ……空白……  [+ 紧跟最后一个标签]
     /// 最右边那三个是**窗口按钮**（最小化 / 最大化 / 关闭），齿轮单独用一条竖线隔开
     /// （跟 Edge 一样：扩展一块、头像一块）。
     ///
@@ -143,9 +143,9 @@ namespace TabbedExplorer
         /// </summary>
         private readonly Font wbtnFont;
         /// <summary>
-        /// 收藏夹那枚星（E734/E735）单独用大一档的字号 ——
+        /// 书签那枚星（E734/E735）单独用大一档的字号 ——
         /// 它是空心/实心五角星，ink 天生比齿轮（自绘）、历史（E81C 圆盘）、恢复（E7A7 弯箭头）小一圈，
-        /// 同一个字号并排会明显看着小（川 2026-09-22：「右上三颗窗控图标已经一样大了，收藏夹图标有点小」）。
+        /// 同一个字号并排会明显看着小（川 2026-09-22：「右上三颗窗控图标已经一样大了，书签图标有点小」）。
         /// </summary>
         private readonly Font favGlyphFont;
 
@@ -174,7 +174,7 @@ namespace TabbedExplorer
         }
         private bool maximized;
 
-        /// <summary>收藏夹栏现在是开着的（按钮画成实心星）。</summary>
+        /// <summary>书签栏现在是开着的（按钮画成实心星）。</summary>
         public bool FavBarOn
         {
             get { return favBarOn; }
@@ -342,7 +342,7 @@ namespace TabbedExplorer
             wbtnRects[(int)WBtn.Minimize] =
                 new Rectangle(wbtnRects[(int)WBtn.Maximize].Left - WBtnWidth, 0, WBtnWidth, Height);
 
-            // 再往左：齿轮 → 竖线 → 收藏夹栏 → 恢复关闭 → 历史
+            // 再往左：齿轮 → 竖线 → 书签栏 → 恢复关闭 → 历史
             int right = wbtnRects[(int)WBtn.Minimize].Left;
             settingsRect = new Rectangle(right - SettingsButtonWidth, 0, SettingsButtonWidth, Height);
             int divL = settingsRect.Left - DividerWidth;
@@ -411,8 +411,12 @@ namespace TabbedExplorer
             }
 
             // 「+」紧跟在最后一个标签右边；挤到边上了就贴在按钮左边（浏览器就是这样）
+            // ⚠ 2026-09-22 川报「标签占满后，关闭按钮和加号堆叠」：
+            //   原来这里是 `limit = areaRight - NewButtonWidth`，可 `areaRight` 上面**已经**扣过一个
+            //   `NewButtonWidth` 了（见 357 行注释）—— 又扣一次，「+」被硬推到最后一个标签的关闭
+            //   按钮底下，两个按钮就重在一起。areaRight 本身就是「标签区右界」，「+」只要不越过它即可。
             int nx = (tabs.Count > 0) ? x + Px(4) : Px(4);
-            int limit = areaRight - NewButtonWidth;
+            int limit = areaRight;
             if (nx > limit) nx = Math.Max(Px(2), limit);
             newRect = new Rectangle(nx, 0, NewButtonWidth, Height);
         }
@@ -484,7 +488,7 @@ namespace TabbedExplorer
             return settingsRect;
         }
 
-        /// <summary>某个工具按钮的位置（历史 / 恢复 / 收藏夹栏 / 齿轮都从这儿取锚点）。</summary>
+        /// <summary>某个工具按钮的位置（历史 / 恢复 / 书签栏 / 齿轮都从这儿取锚点）。</summary>
         public Rectangle ToolButtonBounds(Tool t)
         {
             EnsureLayout();
@@ -635,14 +639,8 @@ namespace TabbedExplorer
                              : (i == hoverIndex ? Theme.Hover : bar);
                 g.FillRectangle(new SolidBrush(fill), tab);
 
-                if (tabs[i].Active)
-                {
-                    // 选中标签：顶上一条 2px 蓝线，正好压住这一条的上边缘（原生死白就在这）
-                    int accentH = Math.Max(2, Px(2));
-                    g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),
-                                    new Rectangle(tab.Left, tab.Top, tab.Width, accentH));
-                }
-                else if (i > 0)
+                // 选中标签那条蓝线**不在这儿画** —— 见循环后面那一段（挪到底部，避开顶部滚动条）。
+                if (!tabs[i].Active && i > 0)
                 {
                     g.DrawLine(new Pen(Theme.Border),
                                tab.Left, tab.Top + Px(6), tab.Left, tab.Bottom - Px(6));
@@ -707,12 +705,28 @@ namespace TabbedExplorer
             // 底部与容器分隔
             g.Clip = oldClip;      // 右边那排按钮 / 加号不受上面那一刀的影响
 
+            g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
+
+            // ---- 选中标签的蓝色指示条：**贴在标签条底部**（川 2026-09-22 指定）----
+            // 原来画在顶上，会跟顶部的滚动条轨道抢同一排像素。挪到底部后各占一边，互不打架。
+            // ⚠ 必须**画在上面那条分隔线之后**：分隔线压在 Height-1，先画蓝线会被它盖掉一像素。
+            int accentH = Math.Max(2, Px(2));
+            Region clipForAccent = g.Clip;
+            g.SetClip(new Rectangle(0, 0, clipR, Height));
+            for (int i = 0; i < tabs.Count; i++)
+            {
+                if (!tabs[i].Active) continue;
+                Rectangle ab = bounds[i];
+                if (ab.Right < 0 || ab.Left > Width) continue;
+                g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),
+                                new Rectangle(ab.Left, ab.Bottom - accentH, ab.Width, accentH));
+            }
+            g.Clip = clipForAccent;
+
             // ---- 标签溢出时的位置指示条（川 2026-09-22 要的「隐藏进度条」）----
-            // 就画在标签区**贴底**一条细条上：底 = 标签区宽度，滑块 = 当前能看到的那一段。
+            // 就画在标签条**最顶上、拉满整条宽度**：底 = 标签区宽度，滑块 = 当前能看到的那一段。
             // 它在裁剪区之外（先 Clip 恢复再画），不然滑块永远只能看到左边一截。
             DrawScrollBar(g);
-
-            g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
             // “+” 新建：紧跟在最后一个标签右边（位置由 EnsureLayout 算）
             Rectangle nb = newRect;
@@ -779,8 +793,8 @@ namespace TabbedExplorer
             if (maxScroll <= 0 || tabs.Count < 2) return false;
 
             // 川 2026-09-22：挪到**顶部**、并且**拉满整条标签条的宽度**
-            // （原来是压在标签底下、只占标签区）。平时不显示（`DrawScrollBar` 里判 `pointerIn`），
-            // 所以压住选中标签那条蓝线不影响观感。
+            // （原来是压在标签底下、只占标签区）。平时不显示（`DrawScrollBar` 里判 `pointerIn`）；
+            // 选中标签那条蓝线已经挪到底部了（见 `OnPaint`），两边各占一头、不再抢像素。
             int x0 = 0;
             int w = Width;
             if (w < Px(24)) return false;
@@ -846,7 +860,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 三个功能按钮的图标。用的是 `Segoe MDL2 Assets` 的码位 ——
         /// 这几个都拿 PIL 渲染对照图**看过实物**才写的（E81C 带逆时针箭头的钟 = 历史、
-        /// E7A7 回弯箭头 = 恢复、E734/E735 空心/实心星 = 收藏夹栏开没开），别凭记忆改。
+        /// E7A7 回弯箭头 = 恢复、E734/E735 空心/实心星 = 书签栏开没开），别凭记忆改。
         /// </summary>
         private string GlyphOf(Tool t)
         {
@@ -865,7 +879,7 @@ namespace TabbedExplorer
             {
                 case Tool.History: return "历史记录(Ctrl+H)";
                 case Tool.Reopen: return "恢复关闭的标签页(Ctrl+Shift+T)";
-                case Tool.Fav: return (favBarOn ? "隐藏" : "显示") + "收藏夹栏(Ctrl+Shift+B)";
+                case Tool.Fav: return (favBarOn ? "隐藏" : "显示") + "书签栏(Ctrl+Shift+B)";
                 case Tool.Settings: return "设置";
             }
             return "";
@@ -1052,7 +1066,7 @@ namespace TabbedExplorer
                 if (t >= 0)
                 {
                     // ⚠ **只记下来**，事件推迟到 OnMouseUp 再发 —— 见 OnMouseUp 里
-                    //   「为什么功能按钮不能在这一刻响应」。齿轮 / 历史 / 恢复 / 收藏夹栏都走这条路。
+                    //   「为什么功能按钮不能在这一刻响应」。齿轮 / 历史 / 恢复 / 书签栏都走这条路。
                     dragFromIndex = -1;
                     pendingTool = t;
                     return;

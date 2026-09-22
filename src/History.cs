@@ -1,11 +1,22 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
 {
+    /// <summary>历史里的一条：去过哪儿 + 什么时候去的（`At` 为空 = 老数据，时间不知道）。</summary>
+    internal sealed class HistoryItem
+    {
+        public string Path;
+        /// <summary>本地时间 `yyyy-MM-dd HH:mm`。空字符串 = 迁移过来的老记录。</summary>
+        public string At;
+
+        public HistoryItem(string path, string at) { Path = path; At = at; }
+    }
+
     /// <summary>
     /// 「去过哪些文件夹」—— Ctrl+H / 标签条上的历史按钮用。
     ///
@@ -16,10 +27,14 @@ namespace TabbedExplorer
     ///
     /// 存 `<程序目录>\data\history.json`（绿色便携，见 AppPaths）：
     ///   <code>
-    ///   { "history": ["D:\\FB.Data", "::{20D04FE0-...}", "shell:Downloads"] }
+    ///   { "history": [ { "path": "D:\\FB.Data", "at": "2026-09-22 21:30" } ] }
     ///   </code>
-    /// 新的在前。**故意不带时间戳**：川要的是「挑一个再去一次」，不是考古；带时间反而让文件变脏、还得处理时区。
-    /// 重复访问只把那条提到最前面，不会刷屏。
+    /// 新的在前。重复访问只把那条提到最前面（并刷新时间），不会刷屏。
+    ///
+    /// ⚠ 2026-09-22 川要「历史记录按日期归类」—— 原来这里**故意不带时间戳**
+    ///   （当时的理由：「挑一个再去一次」，不是考古）。要按日期归类就必须有时间，
+    ///   所以这一版给每条加上 `at`，菜单/管理器按「今天 / 昨天 / M月d日」分堆。
+    ///   老数据（裸字符串数组）读进来 `at` 留空，归到「更早」那一堆，不会被丢掉。
     ///
     /// 2026-09-22 川要求「配置一律 json」：原来那版是 `history.txt`，现在见到老文件会读过来、写成 json，
     /// 再把老文件改名成 `.migrated` 留着（不删）。
@@ -32,7 +47,7 @@ namespace TabbedExplorer
         /// <summary>菜单里最多列几条（再多就翻不动了）。</summary>
         public const int MenuMax = 15;
 
-        private static readonly List<string> items = new List<string>();
+        private static readonly List<HistoryItem> items = new List<HistoryItem>();
         private static bool loaded;
 
         public static string FileName { get { return AppPaths.File("history.json"); } }
@@ -41,9 +56,21 @@ namespace TabbedExplorer
         public static string LegacyFileName { get { return AppPaths.File("history.txt"); } }
 
         /// <summary>最近去过的地方（新的在前）。返回的是内部列表的拷贝，外面随便用。</summary>
-        public static List<string> Recent
+        public static List<HistoryItem> Recent
         {
-            get { EnsureLoaded(); return new List<string>(items); }
+            get { EnsureLoaded(); return new List<HistoryItem>(items); }
+        }
+
+        /// <summary>只要路径（有些地方不关心时间）。</summary>
+        public static List<string> RecentPaths
+        {
+            get
+            {
+                List<HistoryItem> l = Recent;
+                List<string> r = new List<string>(l.Count);
+                for (int i = 0; i < l.Count; i++) r.Add(l[i].Path);
+                return r;
+            }
         }
 
         private static void EnsureLoaded()
@@ -70,14 +97,37 @@ namespace TabbedExplorer
             catch (Exception ex) { Diag.Log("历史: 读失败 " + ex.Message); }
         }
 
+        /// <summary>
+        /// 读 json。**两种格式都认** ——
+        /// 新的是 `{ "path": …, "at": … }` 对象，老的是裸字符串（时间留空）。
+        /// 用 `FavStore.JsonLite` 那个只认自家格式的小解析器（它顺手就把对象 / 字符串都读出来了）。
+        /// </summary>
         private static void LoadJson(string json)
         {
-            foreach (string p in Json.Strings(Json.GetBlock(json, "history")))
+            List<object> arr = FavStore.JsonLite.GetArray(Json.GetBlock(json, "history"));
+            for (int i = 0; i < arr.Count; i++)
             {
-                if (string.IsNullOrEmpty(p)) continue;
-                if (!items.Contains(p)) items.Add(p);
+                object o = arr[i];
+                Dictionary<string, object> d = o as Dictionary<string, object>;
+                if (d != null)
+                {
+                    object pv, av;
+                    string p = d.TryGetValue("path", out pv) ? pv as string : null;
+                    string at = d.TryGetValue("at", out av) ? av as string : null;
+                    AddRaw(p, at);
+                }
+                else AddRaw(o as string, null);
                 if (items.Count >= Max) break;
             }
+        }
+
+        /// <summary>收一条（读盘用，不去重地往后追加；`At` 空 = 时间未知）。</summary>
+        private static void AddRaw(string path, string at)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            for (int i = 0; i < items.Count; i++)
+                if (PathRules.Same(items[i].Path, path)) return;      // 老文件里有重复：只留第一条
+            items.Add(new HistoryItem(path, at ?? ""));
         }
 
         private static void LoadLegacyText()
@@ -86,14 +136,14 @@ namespace TabbedExplorer
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == '#') continue;
-                if (!items.Contains(line)) items.Add(line);
+                AddRaw(line, null);
                 if (items.Count >= Max) break;
             }
         }
 
         /// <summary>
         /// 记一条。**在 UI 线程上调**（会写盘）。
-        /// 已经有的话只提到最前面 —— 这样「最近去过的」总是排在前面，而且不会越积越多。
+        /// 已经有的话只提到最前面（并刷新时间）—— 这样「最近去过的」总是排在前面，而且不会越积越多。
         /// </summary>
         public static void Add(string path)
         {
@@ -102,17 +152,20 @@ namespace TabbedExplorer
             if (!PathRules.Restorable(p)) return;      // 开不了的东西不值得记（重启后点了会打不开）
 
             EnsureLoaded();
+            string now = Stamp();
             int at = -1;
             for (int i = 0; i < items.Count; i++)
             {
-                if (PathRules.Same(items[i], p)) { at = i; break; }
+                if (PathRules.Same(items[i].Path, p)) { at = i; break; }
             }
-            if (at == 0) return;                       // 已经就是最近那条，什么都不用动
+            if (at == 0) { items[0].At = now; Save(); return; }   // 已经是最新那条：只把时间往前提
             if (at > 0) items.RemoveAt(at);
-            items.Insert(0, p);
+            items.Insert(0, new HistoryItem(p, now));
             while (items.Count > Max) items.RemoveAt(items.Count - 1);
             Save();
         }
+
+        private static string Stamp() { return DateTime.Now.ToString("yyyy-MM-dd HH:mm"); }
 
         private static void Save()
         {
@@ -121,8 +174,15 @@ namespace TabbedExplorer
                 Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
                 sb.Append("{\r\n");
-                sb.Append("  \"_note\": \"TabbedExplorer 的历史记录（去过哪些文件夹），新的在前。删掉某一项就少一条记录。\",\r\n");
-                sb.Append("  \"history\": ").Append(Json.Array(items)).Append("\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 的历史记录（去过哪些文件夹），新的在前。at 是本地时间；删掉某一项就少一条记录。\",\r\n");
+                sb.Append("  \"history\": [\r\n");
+                for (int i = 0; i < items.Count; i++)
+                {
+                    sb.Append("    { \"path\": ").Append(Json.Str(items[i].Path))
+                      .Append(", \"at\": ").Append(Json.Str(items[i].At)).Append(" }")
+                      .Append(i < items.Count - 1 ? ",\r\n" : "\r\n");
+                }
+                sb.Append("  ]\r\n");
                 sb.Append("}\r\n");
                 string tmp = FileName + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
@@ -147,7 +207,7 @@ namespace TabbedExplorer
             EnsureLoaded();
             for (int i = 0; i < items.Count; i++)
             {
-                if (PathRules.Same(items[i], path))
+                if (PathRules.Same(items[i].Path, path))
                 {
                     items.RemoveAt(i);
                     Save();
@@ -158,6 +218,40 @@ namespace TabbedExplorer
             return false;
         }
 
+        // ==================================================================
+        // 按日期归类（川 2026-09-22：历史记录按日期归类）
+        // ==================================================================
+
+        /// <summary>
+        /// 一条记录的日期分堆标题：「今天」「昨天」「9月20日」；时间未知的老记录归「更早」。
+        /// 菜单和管理器都用这一个，两处口径才不会不一样。
+        /// </summary>
+        public static string DayLabel(string at)
+        {
+            if (string.IsNullOrEmpty(at) || at.Length < 10) return "更早（时间未知）";
+            string d = at.Substring(0, 10);
+            DateTime t;
+            if (!DateTime.TryParseExact(d, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                                       DateTimeStyles.None, out t))
+                return d;
+            DateTime today = DateTime.Today;
+            if (t == today) return "今天";
+            if (t == today.AddDays(-1)) return "昨天";
+            if (t.Year == today.Year) return t.Month + "月" + t.Day + "日";
+            return t.ToString("yyyy年M月d日");
+        }
+
+        /// <summary>只要时间那一段（`HH:mm`），列表行尾显示用。</summary>
+        public static string TimeOf(string at)
+        {
+            if (string.IsNullOrEmpty(at) || at.Length < 16) return "";
+            return at.Substring(11, 5);
+        }
+
+        // ==================================================================
+        // 菜单
+        // ==================================================================
+
         /// <summary>
         /// 拼出「历史记录」那份菜单 —— 走 `PopMenu`。
         /// 2026-09-22 从老的 `ContextMenu`/`MenuItem` 换过来：那条路上**点条目不触发 Click**
@@ -165,11 +259,13 @@ namespace TabbedExplorer
         /// `open == null` 的条目就是灰着的标题/说明行。
         /// `openManager` = 「打开历史记录管理器」（川 2026-09-22 把原来那条「打开历史记录文件」换成了它 ——
         /// 直接把 json 丢给记事本太糙，管理器里能搜、能挑、能手删）。
+        ///
+        /// 川 2026-09-22 追加：**按日期归类** —— 同一堆的前面插一条灰标题（今天 / 昨天 / …）。
         /// </summary>
         public static PopItem[] BuildMenu(Action<string> open, Action openManager)
         {
             List<PopItem> r = new List<PopItem>();
-            List<string> list = Recent;
+            List<HistoryItem> list = Recent;
 
             r.Add(PopMenu.It("历史记录（" + Hotkeys.Combo("history") + "）", null));
             r.Add(PopMenu.Split());
@@ -181,15 +277,24 @@ namespace TabbedExplorer
             else
             {
                 int n = Math.Min(list.Count, MenuMax);
+                string lastDay = null;
                 for (int i = 0; i < n; i++)
                 {
-                    string target = list[i];
+                    HistoryItem h = list[i];
+                    string day = DayLabel(h.At);
+                    if (day != lastDay)
+                    {
+                        r.Add(PopMenu.It("── " + day + " ──", null));   // 日期分堆标题（灰的，点不动）
+                        lastDay = day;
+                    }
+                    string target = h.Path;
                     // ⚠ 这个三元要显式转成 Action：`null` 和匿名方法之间没有隐式转换（CS0173）。
                     Action act = open == null ? (Action)null : delegate { open(target); };
-                    r.Add(PopMenu.It(Elide(target, 72), act));
+                    string t = TimeOf(h.At);
+                    r.Add(PopMenu.It(Elide(target, 72) + (t.Length > 0 ? ("    " + t) : ""), act));
                 }
                 if (list.Count > n)
-                    r.Add(PopMenu.It("（还有 " + (list.Count - n) + " 条更早的，看 data\\history.json）", null));
+                    r.Add(PopMenu.It("（还有 " + (list.Count - n) + " 条更早的，打开管理器查看）", null));
             }
 
             r.Add(PopMenu.Split());

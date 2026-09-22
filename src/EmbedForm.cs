@@ -68,7 +68,7 @@ namespace TabbedExplorer
         private readonly List<string> closedTabs = new List<string>();
         private const int ClosedKeep = 20;
 
-        /// <summary>收藏夹栏（Ctrl+Shift+B 开关）。</summary>
+        /// <summary>书签栏（Ctrl+Shift+B 开关）。</summary>
         private readonly FavBar favBar;
         private bool favBarOn;
 
@@ -159,7 +159,7 @@ namespace TabbedExplorer
                 // 新建标签页 = 开一个「此电脑」，**不是**复制当前标签（川报的 bug 4）
                 NewTab(ExplorerView.ThisPcPath);
             };
-            // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 收藏夹栏
+            // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 书签栏
             tabStrip.ToolClicked += delegate(TabStrip.Tool t)
             {
                 switch (t)
@@ -177,7 +177,7 @@ namespace TabbedExplorer
                         ReopenClosedTab();
                         break;
                     case TabStrip.Tool.Fav:
-                        Diag.Step("EmbedForm: 点击收藏夹栏按钮");
+                        Diag.Step("EmbedForm: 点击书签栏按钮");
                         if (hub != null) hub.SetFavBar(!favBarOn);
                         break;
                 }
@@ -205,24 +205,26 @@ namespace TabbedExplorer
             favBar = new FavBar();
             favBar.ItemClicked += delegate(string path)
             {
-                Diag.Step("EmbedForm: 收藏夹 -> " + path);
+                Diag.Step("EmbedForm: 书签 -> " + path);
                 NewTab(path);
             };
-            // 最左边那枚收藏夹图标：点一下开**收藏夹管理器**
-            // （川 2026-09-22：原来点是开数据目录，改成「管理收藏夹」）
+            // 最左边那枚书签图标：点一下开**书签管理器**
+            // （川 2026-09-22：原来点是开数据目录，改成「管理书签」）
             favBar.LeadClicked += delegate
             {
-                Diag.Step("EmbedForm: 收藏夹图标 -> 管理收藏夹");
+                Diag.Step("EmbedForm: 书签图标 -> 管理书签");
                 if (hub != null) hub.OpenFavManager();
             };
             favBar.ManageRequested += delegate
             {
                 if (hub != null) hub.OpenFavManager();
             };
-            // 收藏夹栏上右键「隐藏收藏夹栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
+            // 书签栏文件夹上右键「全部打开（N 书签）」（川 2026-09-22）
+            favBar.OpenAllRequested += delegate(FavNode f) { OpenAllFromFavBar(f); };
+            // 书签栏上右键「隐藏书签栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
             favBar.HideRequested += delegate
             {
-                Diag.Step("EmbedForm: 收藏夹栏右键 -> 隐藏");
+                Diag.Step("EmbedForm: 书签栏右键 -> 隐藏");
                 if (hub != null) hub.SetFavBar(false);
             };
             favBar.Visible = false;
@@ -282,7 +284,7 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>
-        /// 手动布局：标签条 → （收藏夹栏）→ 内容。
+        /// 手动布局：标签条 → （书签栏）→ 内容。
         /// 全部摆在内边距（DisplayRectangle）里，四周那一圈（Padding）留给我们自己做可拖拽边框 ——
         /// 只有**没有被子控件盖住**的地方，窗体的 WM_NCHITTEST 才收得到。
         /// </summary>
@@ -303,7 +305,7 @@ namespace TabbedExplorer
                 tabStrip.SetBounds(r.Left, top, r.Width, hTab);
                 top += hTab;
 
-                // 收藏夹栏（Ctrl+Shift+B 开）：夹在标签条和内容之间，跟浏览器一样
+                // 书签栏（Ctrl+Shift+B 开）：夹在标签条和内容之间，跟浏览器一样
                 if (favBar != null)
                 {
                     if (favBarOn)
@@ -741,7 +743,7 @@ namespace TabbedExplorer
                     ReopenClosedTab();
                     return;
                 case "favbar":
-                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 收藏夹栏开关");
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 书签栏开关");
                     if (hub != null) hub.SetFavBar(!favBarOn);
                     return;
             }
@@ -1274,7 +1276,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 历史 / 恢复关闭 / 右键菜单 / 收藏夹栏（2026-09-22 川点名的三个新功能）
+        // 历史 / 恢复关闭 / 右键菜单 / 书签栏（2026-09-22 川点名的三个新功能）
         // ==================================================================
 
         /// <summary>
@@ -1302,12 +1304,36 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 从「历史记录 / 收藏夹」挑了一个位置 —— 开成新标签（已经开着就切过去）。
+        /// 书签栏上「全部打开（N 书签）」—— 把这个文件夹里（含子文件夹）的书签一项一项开出来。
+        /// **必须串行排队**：开 explorer 是串行队列（见 `PumpLaunch`），并发起 N 个会互相认错、
+        /// 标签空等超时。文件夹开成新标签，文件交给系统默认程序。
+        /// </summary>
+        private void OpenAllFromFavBar(FavNode folder)
+        {
+            if (folder == null || IsDisposed || Disposing) return;
+            FavNode[] items = FavStore.ItemsIn(folder);
+            Diag.Step("EmbedForm: 全部打开「" + FavStore.NameOf(folder) + "」共 " + items.Length + " 项");
+            if (!Visible) Show();
+            for (int i = 0; i < items.Length; i++)
+            {
+                string p = items[i] == null ? null : items[i].Path;
+                if (string.IsNullOrEmpty(p)) continue;
+                if (FavStore.IsFolder(p)) NewTab(p);
+                else
+                {
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(p) { UseShellExecute = true }); }
+                    catch (Exception ex) { Diag.Log("EmbedForm: 全部打开，跳过 " + p + "：" + ex.Message); }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 从「历史记录 / 书签」挑了一个位置 —— 开成新标签（已经开着就切过去）。
         /// 单独抽出来是为了能记日志：川报过「历史里选了条目没打开」，有日志才查得下去。
         /// </summary>
         private void OpenFromHistory(string p)
         {
-            Diag.Step("EmbedForm: 历史/收藏夹 -> " + p);
+            Diag.Step("EmbedForm: 历史/书签 -> " + p);
             Defer(delegate
             {
                 if (IsDisposed || Disposing) return;
@@ -1354,18 +1380,18 @@ namespace TabbedExplorer
             Diag.Step("EmbedForm: 恢复关闭的标签「" + p + "」（栈里还剩 " + closedTabs.Count + "）");
             if (!Visible) Show();
             int dup = IndexOfPath(p);
-            if (dup >= 0) Activate(dup);   // 已经开着（历史/收藏夹又开过）就切过去，别开两个一样的
+            if (dup >= 0) Activate(dup);   // 已经开着（历史/书签又开过）就切过去，别开两个一样的
             else NewTab(p);
         }
 
         /// <summary>
-        /// 建一条菜单项：点下去**先在日志里记一笔**再执行（实现在 `MenuFx.Item`，收藏夹栏那份菜单也用同一个）。
+        /// 建一条菜单项：点下去**先在日志里记一笔**再执行（实现在 `MenuFx.Item`，书签栏那份菜单也用同一个）。
         /// 川 2026-09-22 连着两轮报「右键菜单功能没实现」—— 这里加一行日志是为了以后不用猜：
         /// 「菜单弹出来了但点了没反应」和「点了、动作自己失败了」在日志里是两回事。
         /// </summary>
         private static PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
 
-        /// <summary>带勾选的菜单项（「显示收藏夹栏」那种）。</summary>
+        /// <summary>带勾选的菜单项（「显示书签栏」那种）。</summary>
         private static PopItem Mi(string text, Action a, bool on) { return PopMenu.It(text, a, on); }
 
         /// <summary>分隔线（菜单项一律走 Mi，分隔线也收在这儿）。</summary>
@@ -1378,7 +1404,7 @@ namespace TabbedExplorer
             return -1;
         }
 
-        /// <summary>标签上右键：复制 / 打开 / 收藏 / 关（含「关闭其它 / 左边 / 右边」—— 川 2026-09-22 新增）。</summary>
+        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 左边 / 右边」—— 川 2026-09-22 新增）。</summary>
         private void ShowTabMenu(int idx)
         {
             if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
@@ -1410,7 +1436,7 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
-            m.Add(Mi("添加到收藏夹栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
+            m.Add(Mi("添加到书签栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
             m.Add(Mi("重新打开刚关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(SepItem());
@@ -1464,19 +1490,19 @@ namespace TabbedExplorer
             Activate(Math.Min(idx, hosts.Count - 1));
         }
 
-        /// <summary>把这个位置加进收藏夹栏（收藏夹是我们自己那份 data\favorites.json，见 FavStore）。</summary>
+        /// <summary>把这个位置加进书签栏（书签是我们自己那份 data\favorites.json，见 FavStore）。</summary>
         private void AddToFavorites(string path)
         {
             string name;
             if (!FavStore.Add(path, out name))
             {
-                Toast.Show("加不进收藏夹", string.IsNullOrEmpty(name)
-                    ? "这个位置没有真实路径（库 / 虚拟文件夹），收藏夹放不了。"
-                    : "「" + name + "」已经在收藏夹里了。");
+                Toast.Show("加不进书签", string.IsNullOrEmpty(name)
+                    ? "这个位置没有真实路径（库 / 虚拟文件夹），书签放不了。"
+                    : "「" + name + "」已经在书签里了。");
                 return;
             }
-            Diag.Step("EmbedForm: 加入收藏夹 -> " + path);
-            Toast.Show("已加入收藏夹", name);   // 用户主动做的动作，值得回一句
+            Diag.Step("EmbedForm: 加入书签 -> " + path);
+            Toast.Show("已加入书签", name);   // 用户主动做的动作，值得回一句
         }
 
         /// <summary>
@@ -1485,7 +1511,7 @@ namespace TabbedExplorer
         /// 川 2026-09-22 报「右边空白菜单的功能还没实现」—— 两个原因，都在这儿收掉：
         ///   ① 真的定位错了：标签溢出时最后半个标签的矩形伸到了按钮底下，右键落在那一块被
         ///      `HitTest` 认成「标签」而不是「空白」（修在 TabStrip.HitTest）；
-        ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 收藏夹栏 / 三个关标签 / 设置都放进来。
+        ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 书签栏 / 三个关标签 / 设置都放进来。
         /// 每条都从 `Mi` 建 —— 点下去日志里会留一行，以后不用再猜「到底点没点中」。
         /// </summary>
         private void ShowBlankMenu()
@@ -1501,7 +1527,7 @@ namespace TabbedExplorer
             bool on = favBarOn;
             // 勾选走 `PopItem.On`（PopMenu 把它落到 `Checked`，菜单自己画勾）——
             // 不再用「✓ 」文字前缀：那会让这一行比同级项多两个字符、看着没对齐（川报过）。
-            m.Add(Mi("显示收藏夹栏(" + Hotkeys.Combo("favbar") + ")", delegate
+            m.Add(Mi("显示书签栏(" + Hotkeys.Combo("favbar") + ")", delegate
             {
                 if (hub != null) hub.SetFavBar(!on);
             }, on));
@@ -1536,7 +1562,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 外面（收藏夹管理器）让这个窗口把一个路径开成新标签。
+        /// 外面（书签管理器）让这个窗口把一个路径开成新标签。
         /// 跟 `OpenFromHistory` 同一条路：已经有一样的标签就切过去，别开两个。
         /// </summary>
         internal void OpenPathAsTab(string p)
@@ -1554,7 +1580,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 收藏夹栏开关。**所有入口都汇到这一条**（Ctrl+Shift+B、按钮、设置菜单、空白右键、栏上右键），
+        /// 书签栏开关。**所有入口都汇到这一条**（Ctrl+Shift+B、按钮、设置菜单、空白右键、栏上右键），
         /// 免得像当初「托盘没有设置项」那样漏一边。由 Hub 调（它要同时刷所有窗口 + 托盘菜单）。
         /// </summary>
         internal void SetFavBarOn(bool on)
@@ -1563,7 +1589,7 @@ namespace TabbedExplorer
             favBarOn = on;
             tabStrip.FavBarOn = on;
             if (on) favBar.Reload();
-            Diag.Step("EmbedForm: 收藏夹栏 -> " + (on ? "显示" : "隐藏"));
+            Diag.Step("EmbedForm: 书签栏 -> " + (on ? "显示" : "隐藏"));
             DoLayout();
         }
 

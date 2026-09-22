@@ -5,7 +5,7 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 一个跟着颜色模式走的「输入一行字」小对话框（收藏夹重命名 / 新建文件夹都用它）。
+    /// 一个跟着颜色模式走的「输入一行字」小对话框（书签重命名 / 新建文件夹都用它）。
     ///
     /// 为什么不用 `Microsoft.VisualBasic.Interaction.InputBox`：它跟系统主题走 ——
     /// 深色模式下会弹出一整块惨白的窗口，和程序其它部分完全不搭。

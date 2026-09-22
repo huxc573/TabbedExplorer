@@ -7,7 +7,7 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 收藏夹管理器（川 2026-09-22 要的「管理收藏夹」）—— 仿浏览器那个收藏夹管理器：
+    /// 书签管理器（川 2026-09-22 要的「管理书签」）—— 仿浏览器那个书签管理器：
     /// 左边是**文件夹树**（可无限嵌套），右边是这个文件夹里的东西，顶上一条搜索框 + 几个动作。
     ///
     /// 风格按程序来（自绘行 + Theme 调色板），不用 TreeView / ListView ——
@@ -15,8 +15,8 @@ namespace TabbedExplorer
     ///
     /// 行为：
     ///   · 左树：点一行 = 选中那个文件夹；点左边的三角 = 展开/收起；双击 = 打开这个文件夹（新标签）
-    ///   · 右列：双击 = 打开（文件夹开新标签 / 文件交给系统）；行尾的 ✕ = 从收藏夹移出
-    ///   · 右键：重命名 / 新建文件夹 / 删除 / **设为收藏夹栏**（哪个文件夹喂给横向那条栏）
+    ///   · 右列：双击 = 打开（文件夹开新标签 / 文件交给系统）；行尾的 ✕ = 从书签移出
+    ///   · 右键：重命名 / 新建文件夹 / 删除 / **设为书签栏**（哪个文件夹喂给横向那条栏）
     ///   · 从资源管理器**拖文件夹进来** = 加进当前选中的文件夹（这就是嵌套的做法）
     ///   · 搜索框：输入就跨全树过滤，右边列变成搜索结果（显示它在哪个文件夹里）
     ///
@@ -32,6 +32,11 @@ namespace TabbedExplorer
             public FavNode Node;
             public int Depth;
             public Rectangle Rect;
+            // 拖放要用：这一行挂在哪个文件夹下、是第几项。
+            // ⚠ 搜索结果的 `Parent` 是 null —— 那个列表不属于任何文件夹，
+            //   所以在搜索结果里只能「拖进文件夹」，不能在列表内调顺序。
+            public FavNode Parent;
+            public int Index = -1;
         }
 
         private static readonly float DpiScale = ReadDpi();
@@ -53,15 +58,20 @@ namespace TabbedExplorer
         //   顶部动作条（TopH=40 设备像素 = 26 逻辑像素）装不下高 Px(26)=39 的按钮，按钮溢到标题行上；
         //   行高 26/30 设备像素也只有 17/20 逻辑像素，文字上下贴边。
         //   2026-09-22 川报的「无图标 + 文字堆叠错位」是两个毛病叠在一起：
-        //   ① 小标题（“收藏夹” / 选中文件夹名）画在 `TopH + Px(4)`，第一行却从 `TopH + Px(6)` 开始
-        //      ⇒ 两者**同一行**，字压字（截图里“收藏夹收藏夹栏（收藏…”、“新建文件夹新建文件夹”）；
+        //   ① 小标题（“书签” / 选中文件夹名）画在 `TopH + Px(4)`，第一行却从 `TopH + Px(6)` 开始
+        //      ⇒ 两者**同一行**，字压字（截图里“书签书签栏（书签…”、“新建文件夹新建文件夹”）；
         //   ② 行离谱地矮。现在一律走 Px()，并给小标题留出 CaptionH。
-        private static int TopH { get { return Px(40); } }        // 顶部动作条
-        private static int LeftW { get { return Px(250); } }      // 左树宽度
-        private static int TreeRowH { get { return Px(26); } }
-        private static int ListRowH { get { return Px(30); } }
+        //
+        // ⚠ 2026-09-22 **第二轮**（川：「字体是不是变大了？自有窗口好像也变长了」）：
+        //   字体一个都没动 —— 变大的是**行高 / 窗口**。上面那轮把裸像素换成 Px()，
+        //   150% 屏上整张窗口和每一行都直接放大了 1.5 倍（行 30 -> 45 设备像素、窗口 880x560 -> 1320x840）。
+        //   现在把**逻辑尺寸**调紧一档，让观感贴近资源管理器（图标与文字大小没变，只是不再那么空）。
+        private static int TopH { get { return Px(34); } }        // 顶部动作条
+        private static int LeftW { get { return Px(240); } }      // 左树宽度
+        private static int TreeRowH { get { return Px(22); } }
+        private static int ListRowH { get { return Px(24); } }
         /// <summary>小标题（左树 / 右列各一条）占的高度 —— 行必须从它下面开始，不然字压字。</summary>
-        private static int CaptionH { get { return Px(26); } }
+        private static int CaptionH { get { return Px(22); } }
 
         private readonly List<Row> treeRows = new List<Row>();
         private readonly List<Row> listRows = new List<Row>();
@@ -73,6 +83,16 @@ namespace TabbedExplorer
         private Row pressed;                 // 双击判定用
         private string filter = "";
 
+        // ---- 拖动（川 2026-09-22：管理器和书签栏都要能拖）----
+        // 跟书签栏一套做法：按下只记状态，MouseMove 超阈值才算拖动，MouseUp 才真改数据。
+        private FavNode dragNode;
+        private Point dragStart;
+        private bool dragging;
+        private FavNode dropIntoNode;        // 放进这个文件夹
+        private FavNode dropParentNode;      // 插到这个文件夹下面（null = 顶层）
+        private int dropAt = -1;             // 插到第几项之前
+        private bool dropInList;             // 落点在右列（决定提示画在哪个窗格）
+
         private readonly TextBox search;
         private readonly Font font, fontDim;
         private readonly Action<bool> setFavBar;
@@ -83,12 +103,12 @@ namespace TabbedExplorer
             this.setFavBar = setFavBar;
             this.getFavBar = getFavBar;
 
-            Text = "管理收藏夹";
+            Text = "管理书签";
             Icon = ShellIcon.AppIcon(false);   // 标题栏 / Alt+Tab 用程序自己的图标（原来这里是空的）
             FormBorderStyle = FormBorderStyle.Sizable;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(Px(880), Px(560));
-            MinimumSize = new Size(Px(560), Px(360));
+            ClientSize = new Size(Px(840), Px(500));
+            MinimumSize = new Size(Px(520), Px(330));
             BackColor = Theme.Chrome;
             ForeColor = Theme.Text;
             font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
@@ -104,7 +124,7 @@ namespace TabbedExplorer
             search.BackColor = Theme.InputBack;
             search.ForeColor = Theme.Text;
             search.Font = font;
-            search.SetBounds(x, y + Px(1), Px(220), Px(24));
+            search.SetBounds(x, y + Px(1), Px(220), Px(22));
             search.TextChanged += delegate { filter = search.Text.Trim(); Rebuild(); Invalidate(); };
             Controls.Add(search);
 
@@ -114,18 +134,18 @@ namespace TabbedExplorer
                 FavNode f = NewFolder();
                 if (f != null) { favBarChanged(); }
             });
-            bx = AddButton("添加收藏夹", bx, y, delegate
+            bx = AddButton("添加书签", bx, y, delegate
             {
-                string p = InputBox.Ask(this, "添加收藏夹", "文件夹或文件的完整路径", "");
+                string p = InputBox.Ask(this, "添加书签", "文件夹或文件的完整路径", "");
                 if (string.IsNullOrEmpty(p)) return;
                 string name;
-                if (FavStore.Add(p, out name)) Toast.Show("已加入收藏夹", name);
-                else Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在收藏夹里了。"));
+                if (FavStore.Add(p, out name)) Toast.Show("已加入书签", name);
+                else Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
             });
             bx = AddButton("删除这一项", bx, y, delegate
             {
                 if (sel == null) return;
-                if (FavStore.BarFolder == sel) { Toast.Show("删不了", "「收藏夹栏」这一层是横向那条栏的根，先换个文件夹当栏。"); return; }
+                if (FavStore.BarFolder == sel) { Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根，先换个文件夹当栏。"); return; }
                 FavNode tmp = sel;
                 FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
                 sel = null;
@@ -136,7 +156,7 @@ namespace TabbedExplorer
                 try { Process.Start(FavStore.FileName); }
                 catch (Exception ex) { Toast.Show("打不开", ex.Message); }
             });
-            bx = AddButton("回到收藏夹栏", bx, y, delegate { sel = FavStore.BarFolder; Rebuild(); Invalidate(); });
+            bx = AddButton("回到书签栏", bx, y, delegate { sel = FavStore.BarFolder; Rebuild(); Invalidate(); });
 
             Theme.Changed += OnTheme;
             FavStore.Changed += OnStore;
@@ -181,8 +201,8 @@ namespace TabbedExplorer
             Size sz = TextRenderer.MeasureText(text, fontDim, new Size(Px(400), Px(24)),
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
             int w = sz.Width + Px(18);
-            b.SetBounds(x, y, w, Px(26));
-            b.Click += delegate { try { a(); } catch (Exception ex) { Diag.Log("收藏夹管理器: " + ex.Message); } };
+            b.SetBounds(x, y, w, Px(24));
+            b.Click += delegate { try { a(); } catch (Exception ex) { Diag.Log("书签管理器: " + ex.Message); } };
             Controls.Add(b);
             return x + w + Px(6);
         }
@@ -215,7 +235,7 @@ namespace TabbedExplorer
             // 左树：拍平（收起来的文件夹不展开）
             int y = TopH + CaptionH;
             FavNode[] roots = FavStore.Tree;
-            for (int i = 0; i < roots.Length; i++) Flatten(roots[i], 0, ref y);
+            for (int i = 0; i < roots.Length; i++) Flatten(roots[i], null, i, 0, ref y);
 
             // 右列：某个文件夹的孩子，或者（搜索时）全树的过滤结果
             y = TopH + CaptionH;
@@ -227,6 +247,8 @@ namespace TabbedExplorer
                 {
                     Row r = new Row();
                     r.Node = hits[i];
+                    r.Parent = null;      // 搜索结果不属于任何文件夹，只能「拖进文件夹」
+                    r.Index = -1;
                     r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
                     listRows.Add(r);
                     y += ListRowH;
@@ -238,27 +260,31 @@ namespace TabbedExplorer
                 {
                     Row r = new Row();
                     r.Node = sel.Kids[i];
+                    r.Parent = sel;       // 拖放在列表内调顺序靠这两个
+                    r.Index = i;
                     r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
                     listRows.Add(r);
                     y += ListRowH;
                 }
             }
 
-            // 选中项如果被删了/移走了，退回收藏夹栏
+            // 选中项如果被删了/移走了，退回书签栏
             if (sel != null && !InTree(sel)) sel = FavStore.BarFolder;
         }
 
-        private void Flatten(FavNode n, int depth, ref int y)
+        private void Flatten(FavNode n, FavNode parent, int indexInParent, int depth, ref int y)
         {
             if (n == null) return;
             Row r = new Row();
             r.Node = n;
+            r.Parent = parent;
+            r.Index = indexInParent;
             r.Depth = depth;
             r.Rect = new Rectangle(Px(8) + depth * Px(14), y, Math.Max(1, LeftW - Px(18) - depth * Px(14)), TreeRowH);
             treeRows.Add(r);
             y += TreeRowH;
             if (n.IsFolder && !collapsed.Contains(n))
-                for (int i = 0; i < n.Kids.Count; i++) Flatten(n.Kids[i], depth + 1, ref y);
+                for (int i = 0; i < n.Kids.Count; i++) Flatten(n.Kids[i], n, i, depth + 1, ref y);
         }
 
         private void Search(FavNode n, List<FavNode> hits)
@@ -312,17 +338,19 @@ namespace TabbedExplorer
             }
 
             // 左树 / 右列的标题
-            DrawCaption(g, "收藏夹", Px(12), TopH + Px(4));
+            DrawCaption(g, "书签", Px(12), TopH + Px(3));
             string right = filter.Length > 0
                 ? ("搜索结果（" + listRows.Count + "）")
                 : (sel != null ? FavStore.NameOf(sel) : "");
-            DrawCaption(g, right, LeftW + Px(12), TopH + Px(4), true);
+            DrawCaption(g, right, LeftW + Px(12), TopH + Px(3), true);
 
             for (int i = 0; i < treeRows.Count; i++) DrawTreeRow(g, treeRows[i]);
             for (int i = 0; i < listRows.Count; i++) DrawListRow(g, listRows[i]);
 
+            DrawDropHint(g);      // 拖动中的落点提示（画在行上面）
+
             if (listRows.Count == 0)
-                TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的收藏" : "这个文件夹里还没有收藏（拖文件夹进来，或点上面的「添加」）",
+                TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的书签" : "这个文件夹里还没有书签（拖文件夹进来，或点上面的「添加」）",
                     fontDim, new Rectangle(LeftW + Px(14), TopH + CaptionH + Px(6), Math.Max(1, Width - LeftW - Px(30)), Px(24)),
                     Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.NoPadding);
         }
@@ -356,16 +384,17 @@ namespace TabbedExplorer
             }
             x += Px(15);
 
-            // 图标：收藏夹栏那层用蓝色星，普通文件夹用文件夹图标
+            // 图标：书签栏那层用蓝色星，普通文件夹用文件夹图标
             Image ic = null;
             if (r.Node.Bar) ic = BarStar();
-            else if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(16));
-            else ic = ShellIcon.PathIcon(r.Node.Path, Px(16));
-            if (ic != null) g.DrawImage(ic, new Rectangle(x, r.Rect.Top + (r.Rect.Height - Px(16)) / 2, Px(16), Px(16)));
-            x += Px(20);
+            else if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(15));
+            else ic = ShellIcon.PathIcon(r.Node.Path, Px(15));
+            if (ic != null) g.DrawImage(ic, new Rectangle(x, r.Rect.Top + (r.Rect.Height - Px(15)) / 2, Px(15), Px(15)));
+            x += Px(19);
 
             string label = FavStore.NameOf(r.Node);
-            if (r.Node.Bar) label += "（收藏夹栏）";
+            // 栏根那行加个尾巴说清它是谁；名字本身已经叫「书签栏」时就不重复了
+            if (r.Node.Bar && label != "书签栏") label += "（书签栏）";
             TextRenderer.DrawText(g, label, font,
                 new Rectangle(x, r.Rect.Top, Math.Max(1, r.Rect.Right - x - Px(4)), r.Rect.Height),
                 isSel ? Theme.Text : (r.Node.IsFolder ? Theme.Text : Theme.TextDim),
@@ -378,10 +407,10 @@ namespace TabbedExplorer
             if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
 
             Image ic;
-            if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(18));
-            else ic = ShellIcon.PathIcon(r.Node.Path, Px(18));
+            if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(16));
+            else ic = ShellIcon.PathIcon(r.Node.Path, Px(16));
             if (ic != null)
-                g.DrawImage(ic, new Rectangle(r.Rect.Left + Px(4), r.Rect.Top + (r.Rect.Height - Px(18)) / 2, Px(18), Px(18)));
+                g.DrawImage(ic, new Rectangle(r.Rect.Left + Px(4), r.Rect.Top + (r.Rect.Height - Px(16)) / 2, Px(16), Px(16)));
 
             // 行尾的 ✕
             Rectangle close = CloseRect(r.Rect);
@@ -418,7 +447,7 @@ namespace TabbedExplorer
 
         private Rectangle CloseRect(Rectangle row)
         {
-            int s = Px(20);
+            int s = Px(18);
             return new Rectangle(row.Right - s - Px(6), row.Top + (row.Height - s) / 2, s, s);
         }
 
@@ -426,10 +455,10 @@ namespace TabbedExplorer
         private static Image BarStar()
         {
             if (barStar != null) return barStar;
-            int s = Px(16);
+            int s = Px(15);
             Bitmap b = new Bitmap(s, s);
             using (Graphics g = Graphics.FromImage(b))
-            using (Font f = new Font("Segoe MDL2 Assets", Px(16), FontStyle.Regular, GraphicsUnit.Pixel))
+            using (Font f = new Font("Segoe MDL2 Assets", Px(15), FontStyle.Regular, GraphicsUnit.Pixel))
                 TextRenderer.DrawText(g, "\uE735", f, new Rectangle(0, 0, s, s), Theme.Accent,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             barStar = b;
@@ -450,6 +479,25 @@ namespace TabbedExplorer
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+
+            // 拖动中：只更新落点与提示，数据留到 MouseUp 才动
+            // ⚠ 「左键还按着没」必须问 `Control.MouseButtons`（现读物理按键），不能用 `e.Button` ——
+            //   WinForms 的 MouseMove 里那个字段经常是 `None`，拿它判会一直判成「没按」，拖动永远不触发。
+            if (dragNode != null && (Control.MouseButtons & MouseButtons.Left) != 0)
+            {
+                if (!dragging &&
+                    (Math.Abs(e.X - dragStart.X) > Px(4) || Math.Abs(e.Y - dragStart.Y) > Px(4)))
+                {
+                    dragging = true;
+                    Diag.Step("书签管理器: 开始拖动「" + FavStore.NameOf(dragNode) + "」");
+                }
+                if (dragging)
+                {
+                    UpdateDrop(e.Location);
+                    return;
+                }
+            }
+
             Row r = RowAt(e.Location);
             FavNode t = (r != null && r.Depth >= 0 && treeRows.Contains(r)) ? r.Node : null;
             FavNode l = (r != null && listRows.Contains(r)) ? r.Node : null;
@@ -472,6 +520,10 @@ namespace TabbedExplorer
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
+
+            dragNode = null; dragStart = Point.Empty; dragging = false;
+            dropIntoNode = null; dropParentNode = null; dropAt = -1;
+
             for (int i = 0; i < treeRows.Count; i++)
             {
                 Row r = treeRows[i];
@@ -486,6 +538,8 @@ namespace TabbedExplorer
                 }
                 sel = r.Node.IsFolder ? r.Node : sel;
                 pressed = r;
+                dragNode = r.Node;
+                dragStart = e.Location;
                 Rebuild();
                 Invalidate();
                 return;
@@ -496,8 +550,126 @@ namespace TabbedExplorer
                 if (!r.Rect.Contains(e.Location)) continue;
                 pressed = r;
                 if (CloseRect(r.Rect).Contains(e.Location)) { DeleteNode(r.Node); return; }
+                dragNode = r.Node;
+                dragStart = e.Location;
                 Invalidate();
                 return;
+            }
+        }
+
+        /// <summary>
+        /// 拖动中：算出落点。两种落点（跟资源管理器一样）：
+        ///   · **行中间**（上下各留 1/4）= 放进这个文件夹；
+        ///   · **行的上/下边缘** = 插到这一项前/后（同一层里调顺序）。
+        /// 只算状态，不动数据。
+        /// </summary>
+        private void UpdateDrop(Point p)
+        {
+            FavNode into = null, parent = null;
+            int at = -1;
+            bool inList = false;
+
+            Row r = RowAt(p);
+            if (r != null && r.Node != dragNode)
+            {
+                inList = listRows.Contains(r);
+                int h = Math.Max(1, r.Rect.Height);
+                int dy = p.Y - r.Rect.Top;
+                bool intoZone = dy > h / 4 && dy < h * 3 / 4;
+
+                if (r.Node.IsFolder && intoZone && FavStore.CanDropInto(dragNode, r.Node))
+                {
+                    into = r.Node;
+                }
+                else if (r.Index >= 0 && !FavStore.InSubtree(r.Node, dragNode))
+                {
+                    parent = r.Parent;                    // null = 顶层
+                    at = (dy < h / 2) ? r.Index : r.Index + 1;
+                }
+            }
+            else if (r == null && sel != null && listRows.Count > 0 && p.X > LeftW)
+            {
+                // 右列最后一行下面的空白 = 追加到当前文件夹末尾
+                Rectangle last = listRows[listRows.Count - 1].Rect;
+                if (p.Y > last.Bottom)
+                {
+                    parent = sel;
+                    at = sel.Kids.Count;
+                    inList = true;
+                }
+            }
+
+            if (into != dropIntoNode || parent != dropParentNode || at != dropAt || inList != dropInList)
+            {
+                dropIntoNode = into;
+                dropParentNode = parent;
+                dropAt = at;
+                dropInList = inList;
+                Invalidate();
+            }
+        }
+
+        /// <summary>某个节点对应那一行的矩形（两列都找）。</summary>
+        private Rectangle RowRectOf(FavNode n)
+        {
+            if (n == null) return Rectangle.Empty;
+            for (int i = 0; i < treeRows.Count; i++) if (treeRows[i].Node == n) return treeRows[i].Rect;
+            for (int i = 0; i < listRows.Count; i++) if (listRows[i].Node == n) return listRows[i].Rect;
+            return Rectangle.Empty;
+        }
+
+        /// <summary>拖动时那条落点提示（放进文件夹 = 整行罩蓝；调顺序 = 一条蓝线）。</summary>
+        private void DrawDropHint(Graphics g)
+        {
+            if (dragNode == null || !dragging) return;
+
+            if (dropIntoNode != null)
+            {
+                Rectangle rr = RowRectOf(dropIntoNode);
+                if (rr != Rectangle.Empty)
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(70, Theme.Accent)))
+                        g.FillRectangle(b, rr);
+                return;
+            }
+            if (dropAt < 0) return;
+
+            List<Row> rows = dropInList ? listRows : treeRows;
+            Rectangle line = Rectangle.Empty;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                Row r = rows[i];
+                if (r.Parent != dropParentNode) continue;
+                if (r.Index == dropAt - 1)
+                    line = new Rectangle(r.Rect.Left, r.Rect.Bottom, r.Rect.Width, 0);
+                if (r.Index == dropAt)
+                {
+                    line = new Rectangle(r.Rect.Left, r.Rect.Top, r.Rect.Width, 0);
+                    break;
+                }
+            }
+            if (line == Rectangle.Empty) return;
+            using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
+                g.DrawLine(p, line.Left, line.Top, line.Right, line.Top);
+        }
+
+        /// <summary>「全部打开」—— 文件夹交给宿主开标签，文件交给系统（跟双击一条一个路子）。</summary>
+        private void OpenAll(FavNode folder)
+        {
+            FavNode[] items = FavStore.ItemsIn(folder);
+            Diag.Step("书签管理器: 全部打开「" + FavStore.NameOf(folder) + "」共 " + items.Length + " 项");
+            for (int i = 0; i < items.Length; i++)
+            {
+                string p = items[i] == null ? null : items[i].Path;
+                if (string.IsNullOrEmpty(p)) continue;
+                if (FavStore.IsFolder(p))
+                {
+                    if (OpenPath != null) OpenPath(p);
+                }
+                else
+                {
+                    try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
+                    catch (Exception ex) { Diag.Log("书签管理器: 全部打开，跳过 " + p + "：" + ex.Message); }
+                }
             }
         }
 
@@ -522,7 +694,7 @@ namespace TabbedExplorer
             if (FavStore.IsFolder(n.Path))
             {
                 if (OpenPath != null) OpenPath(n.Path);
-                Diag.Step("收藏夹管理器: 打开 " + n.Path);
+                Diag.Step("书签管理器: 打开 " + n.Path);
             }
             else
             {
@@ -534,6 +706,30 @@ namespace TabbedExplorer
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+
+            // 左键：拖动收尾（真挪动只在这一刻做一次）
+            if (e.Button == MouseButtons.Left)
+            {
+                bool wasDrag = dragging;
+                FavNode node = dragNode;
+                FavNode into = dropIntoNode, parent = dropParentNode;
+                int at = dropAt;
+                dragNode = null; dragging = false;
+                dropIntoNode = null; dropParentNode = null; dropAt = -1; dropInList = false;
+                if (!wasDrag) return;
+                Invalidate();
+
+                bool ok = false;
+                if (node != null)
+                {
+                    if (into != null) ok = FavStore.Move(node, into, -1);          // 放进文件夹
+                    else if (at >= 0) ok = FavStore.Move(node, parent, at);        // 同层调顺序（parent 可为 null = 顶层）
+                }
+                Diag.Step("书签管理器: 拖动落点 -> " + (ok ? ("已挪动「" + (node != null ? FavStore.NameOf(node) : "?") + "」")
+                                                             : "没动（落点无效）"));
+                return;
+            }
+
             if (e.Button != MouseButtons.Right) return;
             Row r = RowAt(e.Location);
             if (r == null) return;
@@ -552,6 +748,8 @@ namespace TabbedExplorer
             }
             else
             {
+                // 川 2026-09-22：文件夹（含子文件夹）能「全部打开」，超过 7 项先问一句
+                m.Add(FavActions.OpenAllItem(this, n, delegate(FavNode f) { OpenAll(f); }));
                 m.Add(Mi("在这个文件夹里新建文件夹", delegate { NewFolder(n); }));
                 m.Add(PopMenu.Split());
             }
@@ -567,7 +765,7 @@ namespace TabbedExplorer
             }));
 
             if (n.IsFolder && !n.Bar)
-                m.Add(Mi("设为收藏夹栏", delegate
+                m.Add(Mi("设为书签栏", delegate
                 {
                     FavNode oldBar = FavStore.BarFolder;
                     FavStore.Edit(delegate(List<FavNode> l)
@@ -575,14 +773,14 @@ namespace TabbedExplorer
                         if (oldBar != null) oldBar.Bar = false;
                         n.Bar = true;
                     });
-                    Toast.Show("收藏夹栏", "现在横着那条栏显示的是「" + FavStore.NameOf(n) + "」。");
+                    Toast.Show("书签栏", "现在横着那条栏显示的是「" + FavStore.NameOf(n) + "」。");
                     Rebuild();
                 }));
 
             if (!(n.Bar && n.IsFolder))
-                m.Add(Mi("从收藏夹移出", delegate { DeleteNode(n); }));
+                m.Add(Mi("从书签移出", delegate { DeleteNode(n); }));
 
-            PopMenu.Show(m.ToArray(), this, e.Location, "收藏夹管理器右键 " + FavStore.NameOf(n));
+            PopMenu.Show(m.ToArray(), this, e.Location, "书签管理器右键 " + FavStore.NameOf(n));
         }
 
         private PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
@@ -591,7 +789,7 @@ namespace TabbedExplorer
         private void DeleteNode(FavNode n)
         {
             if (n == null) return;
-            if (n.Bar && n.IsFolder) { Toast.Show("删不了", "「收藏夹栏」这一层是横向那条栏的根。"); return; }
+            if (n.Bar && n.IsFolder) { Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根。"); return; }
             FavNode tmp = n;
             FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
             if (sel == n) sel = FavStore.BarFolder;
@@ -668,12 +866,12 @@ namespace TabbedExplorer
                     string nm;
                     if (AddInto(parent, raw, out nm)) added++;
                 }
-                Diag.Step("收藏夹管理器: 拖入 " + paths.Length + " 项 -> 加进「" + FavStore.NameOf(parent) + "」" + added + " 项");
-                if (added > 0) Toast.Show("已加入收藏夹", added == 1 ? FavStore.NameOf(parent) : ("共 " + added + " 项"));
+                Diag.Step("书签管理器: 拖入 " + paths.Length + " 项 -> 加进「" + FavStore.NameOf(parent) + "」" + added + " 项");
+                if (added > 0) Toast.Show("已加入书签", added == 1 ? FavStore.NameOf(parent) : ("共 " + added + " 项"));
                 Rebuild();
                 Invalidate();
             }
-            catch (Exception ex) { Diag.Log("收藏夹管理器: 拖放失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("书签管理器: 拖放失败 " + ex.Message); }
         }
 
         /// <summary>把一个路径加进指定文件夹（重复的不再加）。</summary>

@@ -15,7 +15,7 @@ namespace TabbedExplorer
     ///   tabwidth   = &lt;逻辑像素&gt;            标签页宽度（开了 tabautowiden 时=单个标签最宽能到多少）
     ///   tabautowiden = 1 | 0                自适应宽度①：文件夹名过长时自动加宽
     ///   tabautofit = 1 | 0                  自适应宽度②：挤不下时自动缩窄
-    ///   favbar     = 1 | 0                  收藏夹栏显不显示（Ctrl+Shift+B）
+    ///   favbar     = 1 | 0                  书签栏显不显示（Ctrl+Shift+B）
     ///   captureall = 1 | 0                  是否把「从开始菜单/桌面打开的文件夹」也收成标签
     ///
     /// ⚠ 用 JSON 而不是 `key=value`（2026-09-22 川要求「配置项文件用 json 格式」）：
@@ -60,7 +60,7 @@ namespace TabbedExplorer
         /// 2026-09-22 川把这一个拆成了两项（原来只有这个「自适应宽度」）。
         /// </summary>
         public static bool TabAutoFit = true;
-        /// <summary>收藏夹栏是否显示（Ctrl+Shift+B）。</summary>
+        /// <summary>书签栏是否显示（Ctrl+Shift+B）。</summary>
         public static bool FavBar = false;
         /// <summary>
         /// 是否捕获**所有**打开的文件夹窗口（不只是 Win+E）。

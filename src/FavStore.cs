@@ -7,16 +7,16 @@ using System.Text;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 收藏夹里的一个节点：**要么是文件夹（有 Kids），要么是一项收藏（有 Path）**。
+    /// 书签里的一个节点：**要么是文件夹（有 Kids），要么是一项书签（有 Path）**。
     /// 文件夹可以无限层嵌套 —— 川 2026-09-22 要的「支持文件夹嵌套」。
     /// </summary>
     internal sealed class FavNode
     {
-        /// <summary>显示名。文件夹必填；收藏项留空就从路径末级算（`FavStore.NameOf`）。</summary>
+        /// <summary>显示名。文件夹必填；书签项留空就从路径末级算（`FavStore.NameOf`）。</summary>
         public string Name;
-        /// <summary>收藏的目标路径。**为 null = 这是个文件夹**。</summary>
+        /// <summary>书签的目标路径。**为 null = 这是个文件夹**。</summary>
         public string Path;
-        /// <summary>这个文件夹是不是「收藏夹栏」那一份（横向那条栏显示它下面的东西）。</summary>
+        /// <summary>这个文件夹是不是「书签栏」那一份（横向那条栏显示它下面的东西）。</summary>
         public bool Bar;
 
         public List<FavNode> Kids = new List<FavNode>();
@@ -27,7 +27,7 @@ namespace TabbedExplorer
     }
 
     /// <summary>
-    /// 收藏夹的**数据层**（川 2026-09-22：不再用系统那个 Links，程序自己记）。
+    /// 书签的**数据层**（川 2026-09-22：不再用系统那个 Links，程序自己记）。
     ///
     /// 存在 `&lt;程序目录&gt;\data\favorites.json`，结构就是**树**、缩进对齐，方便他手改：
     ///   <code>
@@ -35,8 +35,8 @@ namespace TabbedExplorer
     ///     "_note": "…",
     ///     "favorites": [
     ///       {
-    ///         "bar": true,                       ← 这个文件夹 = 横向那条收藏夹栏
-    ///         "name": "收藏夹栏",
+    ///         "bar": true,                       ← 这个文件夹 = 横向那条书签栏
+    ///         "name": "书签栏",
     ///         "children": [
     ///           { "path": "D:\\Server" },                       ← 只用路径，名字从末级算
     ///           { "name": "学习", "path": "D:\\Learn" },         ← 手改过名字
@@ -50,12 +50,12 @@ namespace TabbedExplorer
     ///   </code>
     ///
     /// ⚠ 老格式（`"favorites": ["D:\\A", "D:\\B"]` 一串纯路径）读进来会自动包成
-    ///   「收藏夹栏」文件夹 —— 川那一份十几项不用手动改。
+    ///   「书签栏」文件夹 —— 川那一份十几项不用手动改。
     ///
     /// 为什么不用系统那个 `%USERPROFILE%\Links`（原来就是这么干的）：
-    ///   · 那是**系统收藏夹**，他在别处往里塞东西我们这边跟着变，他管不住；
-    ///   · 往里加一项得写 .lnk（要 COM 的 IShellLink），而他要的是「拖进来就算收藏」。
-    /// 首次运行会**从系统收藏夹播种一次**，之后两边再没关系。
+    ///   · 那是**系统书签**，他在别处往里塞东西我们这边跟着变，他管不住；
+    ///   · 往里加一项得写 .lnk（要 COM 的 IShellLink），而他要的是「拖进来就算书签」。
+    /// 首次运行会**从系统书签播种一次**，之后两边再没关系。
     /// </summary>
     internal static class FavStore
     {
@@ -64,10 +64,10 @@ namespace TabbedExplorer
 
         public static string FileName { get { return AppPaths.File("favorites.json"); } }
 
-        /// <summary>树变了（增删改 / 换名）—— 收藏夹栏和已经开着的管理器窗口都听它刷新。</summary>
+        /// <summary>树变了（增删改 / 换名）—— 书签栏和已经开着的管理器窗口都听它刷新。</summary>
         public static event Action Changed;
 
-        /// <summary>系统收藏夹目录 —— 只在「首次播种」时读一次。</summary>
+        /// <summary>系统书签目录 —— 只在「首次播种」时读一次。</summary>
         public static string LegacyLinksDir
         {
             get
@@ -90,7 +90,7 @@ namespace TabbedExplorer
             get { lock (gate) { EnsureLoaded(); return roots.ToArray(); } }
         }
 
-        /// <summary>「收藏夹栏」那个文件夹（横向那条栏显示的就是它下面的东西）。</summary>
+        /// <summary>「书签栏」那个文件夹（横向那条栏显示的就是它下面的东西）。</summary>
         public static FavNode BarFolder
         {
             get
@@ -102,7 +102,7 @@ namespace TabbedExplorer
                         if (roots[i].Bar) return roots[i];
                     // 没有就现建一个（老 json / 手改坏了都不至于没栏可用）
                     FavNode b = new FavNode();
-                    b.Name = "收藏夹栏";
+                    b.Name = "书签栏";
                     b.Bar = true;
                     roots.Insert(0, b);
                     return b;
@@ -110,7 +110,7 @@ namespace TabbedExplorer
             }
         }
 
-        /// <summary>栏上要显示的那一排（收藏夹栏文件夹的直接孩子）。</summary>
+        /// <summary>栏上要显示的那一排（书签栏文件夹的直接孩子）。</summary>
         public static FavNode[] BarItems
         {
             get { lock (gate) { return BarFolder.Kids.ToArray(); } }
@@ -136,12 +136,12 @@ namespace TabbedExplorer
                     }
                     else
                     {
-                        // 老格式：一串纯路径 → 包成「收藏夹栏」
+                        // 老格式：一串纯路径 → 包成「书签栏」
                         List<string> flat = Json.Strings(Json.GetBlock(txt, "favorites"));
                         if (flat.Count > 0)
                         {
                             FavNode b = new FavNode();
-                            b.Name = "收藏夹栏";
+                            b.Name = "书签栏";
                             b.Bar = true;
                             for (int i = 0; i < flat.Count; i++)
                             {
@@ -153,23 +153,24 @@ namespace TabbedExplorer
                             }
                             roots.Add(b);
                             SaveLocked();
-                            Diag.Step("收藏夹: 老的纯路径格式已升级成树（" + b.Kids.Count + " 项）");
+                            Diag.Step("书签: 老的纯路径格式已升级成树（" + b.Kids.Count + " 项）");
                         }
                     }
+                    MigrateBarName();
                     if (roots.Count > 0 && BarFolder != null)
-                        Diag.Step("收藏夹: 读到 " + CountAll(roots) + " 项（树 " + roots.Count + " 个顶层文件夹）");
+                        Diag.Step("书签: 读到 " + CountAll(roots) + " 项（树 " + roots.Count + " 个顶层文件夹）");
                     return;
                 }
 
                 if (SeedFromLinks())
                 {
                     SaveLocked();
-                    Diag.Step("收藏夹: 首次运行，已从系统收藏夹播种 " + CountAll(roots) + " 项");
+                    Diag.Step("书签: 首次运行，已从系统书签播种 " + CountAll(roots) + " 项");
                     return;
                 }
                 SaveLocked();   // 生成一份空的（带说明），川打开就能看懂格式
             }
-            catch (Exception ex) { Diag.Log("收藏夹: 读失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("书签: 读失败 " + ex.Message); }
         }
 
         public static int Count { get { lock (gate) { return CountAll(Tree0()); } } }
@@ -193,7 +194,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 改树：`f` 拿到根列表，随便改（增删 / 换名 / 嵌套），返回后自动存盘 + 通知。
-        /// 管理器窗口和收藏夹栏的右键都走这一个口，免得两处各写一套存盘逻辑。
+        /// 管理器窗口和书签栏的右键都走这一个口，免得两处各写一套存盘逻辑。
         /// </summary>
         public static void Edit(Action<List<FavNode>> f)
         {
@@ -210,12 +211,12 @@ namespace TabbedExplorer
         private static void RaiseChanged()
         {
             try { Action h = Changed; if (h != null) h(); }
-            catch (Exception ex) { Diag.Log("收藏夹: 通知刷新失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("书签: 通知刷新失败 " + ex.Message); }
         }
 
         /// <summary>
-        /// 加一项到收藏夹栏。返回 false = 没加进去，此时 `name` 是「已经在里面的那一项的名字」
-        /// （空字符串表示这个位置根本不能收藏：没有真实路径）。
+        /// 加一项到书签栏。返回 false = 没加进去，此时 `name` 是「已经在里面的那一项的名字」
+        /// （空字符串表示这个位置根本不能加进书签：没有真实路径）。
         /// </summary>
         public static bool Add(string path, out string name)
         {
@@ -239,7 +240,7 @@ namespace TabbedExplorer
             return added;
         }
 
-        /// <summary>移除第一处匹配的收藏项（只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**）。</summary>
+        /// <summary>移除第一处匹配的书签项（只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**）。</summary>
         public static bool Remove(string path)
         {
             string p = NormalizePath(path);
@@ -304,7 +305,7 @@ namespace TabbedExplorer
             return null;
         }
 
-        /// <summary>整条清空（只留一个空的「收藏夹栏」）。</summary>
+        /// <summary>整条清空（只留一个空的「书签栏」）。</summary>
         public static void Clear()
         {
             Edit(delegate(List<FavNode> l)
@@ -312,10 +313,144 @@ namespace TabbedExplorer
                 EnsureLoaded();
                 roots.Clear();
                 FavNode b = new FavNode();
-                b.Name = "收藏夹栏";
+                b.Name = "书签栏";
                 b.Bar = true;
                 roots.Add(b);
             });
+        }
+
+        // ==================================================================
+        // 挪动（拖来拖去：调顺序 / 放进子文件夹）—— 川 2026-09-22 新增
+        // ==================================================================
+
+        /// <summary>
+        /// 把 <paramref name="node"/> 挪到 <paramref name="newParent"/> 的第 <paramref name="index"/> 位
+        /// （`index` 为负或越界 = 追加到末尾）。`newParent == null` = 挪回顶层。
+        ///
+        /// 挡掉三种非法移动（宁可不动，也不能把树搞坏）：
+        ///   · node 是「书签栏」那个根 —— 它必须留在顶层，不然那条栏就没根了；
+        ///   · 挪进自己 / 自己的后代 —— 会成环，之后连存盘都会无限递归；
+        ///   · node 已经不在树里（被别处删掉了）。
+        /// 返回有没有真的动。
+        /// </summary>
+        public static bool Move(FavNode node, FavNode newParent, int index)
+        {
+            if (node == null) return false;
+            bool moved = false;
+            Edit(delegate(List<FavNode> l)
+            {
+                EnsureLoaded();
+                if (node.Bar && newParent != null) return;         // 栏根必须留在顶层
+                if (IsDescendantOf(newParent, node)) return;       // 不能挪进自己 / 自己的后代
+
+                int from = -1;
+                List<FavNode> src = FindOwner(roots, node, out from);
+                if (src == null) return;
+
+                List<FavNode> dst = (newParent == null) ? roots : newParent.Kids;
+                int at = (index < 0 || index > dst.Count) ? dst.Count : index;
+
+                // 在同一个列表里往后挪：node 先被摘掉的话，插入点要跟着左移一位
+                if (ReferenceEquals(src, dst) && from < at) at--;
+
+                src.RemoveAt(from);
+                if (at < 0) at = 0;
+                if (at > dst.Count) at = dst.Count;
+                dst.Insert(at, node);
+                moved = true;
+            });
+            return moved;
+        }
+
+        /// <summary>找 node 挂在哪个列表里，顺便给出它的下标。找不到返回 null。</summary>
+        private static List<FavNode> FindOwner(List<FavNode> l, FavNode node, out int index)
+        {
+            index = -1;
+            for (int i = 0; i < l.Count; i++)
+            {
+                if (l[i] == node) { index = i; return l; }
+                if (l[i].IsFolder)
+                {
+                    int sub = -1;
+                    List<FavNode> r = FindOwner(l[i].Kids, node, out sub);
+                    if (r != null) { index = sub; return r; }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>`candidate` 是不是 `ancestor` 自己或它的后代。</summary>
+        private static bool IsDescendantOf(FavNode candidate, FavNode ancestor)
+        {
+            if (candidate == null || ancestor == null) return false;
+            if (candidate == ancestor) return true;
+            if (!ancestor.IsFolder) return false;
+            for (int i = 0; i < ancestor.Kids.Count; i++)
+                if (IsDescendantOf(candidate, ancestor.Kids[i])) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// `node` 能不能挪进 `folder`（给拖放的落点判定用）—— 不能挪进自己或自己的后代，
+        /// 也不能挪进一个不是文件夹的东西。「书签栏」那个根只准待在顶层。
+        /// </summary>
+        public static bool CanDropInto(FavNode node, FavNode folder)
+        {
+            if (node == null || folder == null || !folder.IsFolder) return false;
+            if (ReferenceEquals(node, folder)) return false;
+            if (node.Bar) return false;
+            lock (gate) { EnsureLoaded(); return !IsDescendantOf(folder, node); }
+        }
+
+        /// <summary>`candidate` 是不是在 `root` 这棵树里面（**含 root 自己**）—— 拖放落点判定用。</summary>
+        public static bool InSubtree(FavNode candidate, FavNode root)
+        {
+            if (candidate == null || root == null) return false;
+            lock (gate) { EnsureLoaded(); return IsDescendantOf(candidate, root); }
+        }
+
+        /// <summary>某个文件夹里有多少项书签（**递归**，含子文件夹里的）。</summary>
+        public static int CountIn(FavNode folder)
+        {
+            if (folder == null) return 0;
+            lock (gate) { EnsureLoaded(); return CountAll(folder.Kids); }
+        }
+
+        /// <summary>某个文件夹里所有书签项（递归、按显示顺序）—— 「全部打开」用它。</summary>
+        public static FavNode[] ItemsIn(FavNode folder)
+        {
+            List<FavNode> r = new List<FavNode>();
+            if (folder != null)
+                lock (gate) { EnsureLoaded(); CollectItems(folder.Kids, r); }
+            return r.ToArray();
+        }
+
+        private static void CollectItems(List<FavNode> l, List<FavNode> into)
+        {
+            for (int i = 0; i < l.Count; i++)
+            {
+                if (l[i].IsFolder) CollectItems(l[i].Kids, into);
+                else into.Add(l[i]);
+            }
+        }
+
+        /// <summary>
+        /// 老数据里那条栏的根名是「收藏夹栏」—— 川 2026-09-22 把「收藏夹」改叫「书签」之后名字跟着换。
+        /// 只有**正好等于旧默认名**才换；他自己改过的名字（或者已经是新名）一律不动。
+        /// </summary>
+        private static void MigrateBarName()
+        {
+            for (int i = 0; i < roots.Count; i++)
+            {
+                FavNode n = roots[i];
+                if (n.Bar && string.Equals(n.Name, "收藏夹栏", StringComparison.Ordinal))
+                {
+                    n.Name = "书签栏";
+                    SaveLocked();
+                    Diag.Step("书签: 栏根名「收藏夹栏」-> 「书签栏」");
+                    return;
+                }
+            }
         }
 
         // ==================================================================
@@ -356,7 +491,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 收进来的路径先归一：能收藏的只有「真实存在的文件/文件夹」和 shell 虚拟路径。
+        /// 收进来的路径先归一：能收进来的只有「真实存在的文件/文件夹」和 shell 虚拟路径。
         /// 库（视频 / 图片 这种）没有路径，收不了 —— 返回 null。
         /// </summary>
         private static string NormalizePath(string path)
@@ -385,8 +520,8 @@ namespace TabbedExplorer
                 Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
                 sb.Append("{\r\n");
-                sb.Append("  \"_note\": \"TabbedExplorer 的收藏夹。结构就是一棵树：文件夹带 name + children，收藏项带 path。\"\r\n");
-                sb.Append("  \"_hint\": \"bar=true 的那个文件夹就是标签条下面那条横向收藏夹栏。名字不写就按路径末级算；删一项不会动磁盘上的文件。\",\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 的书签。结构就是一棵树：文件夹带 name + children，书签项带 path。\"\r\n");
+                sb.Append("  \"_hint\": \"bar=true 的那个文件夹就是标签条下面那条横向书签栏。名字不写就按路径末级算；删一项不会动磁盘上的文件。\",\r\n");
                 sb.Append("  \"_edited\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\r\n");
                 sb.Append("  \"favorites\": [\r\n");
                 for (int i = 0; i < roots.Count; i++)
@@ -399,7 +534,7 @@ namespace TabbedExplorer
                 if (File.Exists(FileName)) File.Delete(FileName);
                 File.Move(tmp, FileName);
             }
-            catch (Exception ex) { Diag.Log("收藏夹: 写失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("书签: 写失败 " + ex.Message); }
         }
 
         private static void WriteNode(StringBuilder sb, FavNode n, int indent, bool comma)
@@ -425,7 +560,7 @@ namespace TabbedExplorer
             sb.Append(pad).Append("}").Append(comma ? ",\r\n" : "\r\n");
         }
 
-        /// <summary>存盘时的名字：文件夹一定写（手改坏了也得有个名字），收藏项只在改过名时写。</summary>
+        /// <summary>存盘时的名字：文件夹一定写（手改坏了也得有个名字），书签项只在改过名时写。</summary>
         private static string DisplayNameForSave(FavNode n)
         {
             if (n.IsFolder) return string.IsNullOrEmpty(n.Name) ? "文件夹" : n.Name;
@@ -486,7 +621,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 够用就行的 JSON：`{}` / `[]` / 字符串 / 裸字（true/false/数字）。
-        /// 读不了就返回空 —— 收藏夹读不出来不至于让程序起不来。
+        /// 读不了就返回空 —— 书签读不出来不至于让程序起不来。
         /// </summary>
         internal static class JsonLite
         {
@@ -499,7 +634,7 @@ namespace TabbedExplorer
                 if (i < 0) return r;
                 i++;
                 try { ParseArray(block, ref i, r); }
-                catch (Exception ex) { Diag.Log("收藏夹: json 读失败 " + ex.Message); r.Clear(); }
+                catch (Exception ex) { Diag.Log("书签: json 读失败 " + ex.Message); r.Clear(); }
                 return r;
             }
 
@@ -606,7 +741,7 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 首次播种：把系统收藏夹里的东西抄一份进来
+        // 首次播种：把系统书签里的东西抄一份进来
         // ==================================================================
 
         private static bool SeedFromLinks()
@@ -617,7 +752,7 @@ namespace TabbedExplorer
                 if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return false;
 
                 FavNode bar = new FavNode();
-                bar.Name = "收藏夹栏";
+                bar.Name = "书签栏";
                 bar.Bar = true;
 
                 List<string> entries = new List<string>(Directory.GetFileSystemEntries(dir));
@@ -647,13 +782,13 @@ namespace TabbedExplorer
             }
             catch (Exception ex)
             {
-                Diag.Log("收藏夹: 播种失败 " + ex.Message);
+                Diag.Log("书签: 播种失败 " + ex.Message);
                 return false;
             }
         }
 
         // ==================================================================
-        // .lnk → 真实目标（只在「从系统收藏夹播种」时用得上）
+        // .lnk → 真实目标（只在「从系统书签播种」时用得上）
         //
         // **不走 COM**（`IShellLink` 要自己声明 vtable，本机没法调试，接错就是进程级崩溃）：
         // `.lnk` 的 `LinkInfo` 段里存着目标的本地路径字符串（ANSI 和/或 UTF-16），
@@ -689,7 +824,7 @@ namespace TabbedExplorer
                     catch { }
                 }
             }
-            catch (Exception ex) { Diag.Log("收藏夹: 解析 " + raw + " 失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("书签: 解析 " + raw + " 失败 " + ex.Message); }
             return raw;
         }
 

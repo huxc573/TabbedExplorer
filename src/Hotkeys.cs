@@ -31,7 +31,7 @@ namespace TabbedExplorer
     /// <summary>
     /// 程序自有快捷键的解析 / 规范化 / 匹配。
     ///
-    /// 覆盖的命令就是 `Settings.HotkeyKeys` 那 7 条（新建/关闭/前后标签/历史/恢复/收藏夹栏）；
+    /// 覆盖的命令就是 `Settings.HotkeyKeys` 那 7 条（新建/关闭/前后标签/历史/恢复/书签栏）；
     /// **Ctrl+1..9 跳第 N 个标签是写死的**（没法绑「一串」键，见 WinEHook.Handle），文档里也是这么写的。
     ///
     /// 文本格式：`Ctrl+Shift+T`、`Alt+F4`、`Ctrl+Tab`、`F2`、`Ctrl+Alt+Delete`……
@@ -257,7 +257,7 @@ namespace TabbedExplorer
                 case "prevtab": return "上一个标签页";
                 case "history": return "历史记录";
                 case "reopen": return "恢复关闭的标签页";
-                case "favbar": return "显示/隐藏收藏夹栏";
+                case "favbar": return "显示/隐藏书签栏";
             }
             return cmd;
         }

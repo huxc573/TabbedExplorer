@@ -205,8 +205,8 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 打开（或提到前面）**收藏夹管理器**（川 2026-09-22 要的新窗口：仿浏览器那个收藏夹管理器）。
-        /// 跟设置窗口一样，全进程只开一个 —— 收藏夹栏左端的星标、栏上右键、菜单里都走这一个门。
+        /// 打开（或提到前面）**书签管理器**（川 2026-09-22 要的新窗口：仿浏览器那个书签管理器）。
+        /// 跟设置窗口一样，全进程只开一个 —— 书签栏左端的星标、栏上右键、菜单里都走这一个门。
         /// </summary>
         public void OpenFavManager()
         {
@@ -214,13 +214,13 @@ namespace TabbedExplorer
             {
                 if (favManager != null && !favManager.IsDisposed)
                 {
-                    Diag.Step("Hub: 收藏夹管理器已经开着 -> 提到前面");
+                    Diag.Step("Hub: 书签管理器已经开着 -> 提到前面");
                     if (favManager.WindowState == FormWindowState.Minimized)
                         favManager.WindowState = FormWindowState.Normal;
                     favManager.Activate();
                     return;
                 }
-                Diag.Step("Hub: 打开收藏夹管理器");
+                Diag.Step("Hub: 打开书签管理器");
                 favManager = new FavManagerForm(
                     delegate(bool on) { SetFavBar(on); },
                     delegate { return Settings.FavBar; });
@@ -235,12 +235,12 @@ namespace TabbedExplorer
                 if (owner != null && !owner.IsDisposed) favManager.Show(owner);
                 else favManager.Show();
             }
-            catch (Exception ex) { Diag.Log("Hub: 打开收藏夹管理器失败 " + ex); }
+            catch (Exception ex) { Diag.Log("Hub: 打开书签管理器失败 " + ex); }
         }
 
         /// <summary>
         /// 打开（或提到前面）**历史记录管理器**（川 2026-09-22：「打开历史记录文件」改成它，
-        /// 界面模仿收藏夹管理器）。跟设置窗口 / 收藏夹管理器一样，全进程只开一个。
+        /// 界面模仿书签管理器）。跟设置窗口 / 书签管理器一样，全进程只开一个。
         /// </summary>
         public void OpenHistoryManager()
         {
@@ -599,7 +599,7 @@ namespace TabbedExplorer
             forms[key] = nf;
             nf.FormClosed += delegate { OnFormGone(nf); };
             hook.MainWindow = nf.Handle;      // OursIsForeground 的兜底分支要用
-            nf.SetFavBarOn(Settings.FavBar);  // 新窗口要跟上当前的收藏夹栏开关（设置存在文件里，窗口自己不知道）
+            nf.SetFavBarOn(Settings.FavBar);  // 新窗口要跟上当前的书签栏开关（设置存在文件里，窗口自己不知道）
             return nf;
         }
 
@@ -740,8 +740,8 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 收藏夹栏开关（Ctrl+Shift+B）。**所有入口最终都汇到这儿**：热键、标签条上的按钮、
-        /// 设置菜单里那一项、标签条空白右键、收藏夹栏自己的右键 —— 免得像当初「托盘漏了设置项」那样漏一边。
+        /// 书签栏开关（Ctrl+Shift+B）。**所有入口最终都汇到这儿**：热键、标签条上的按钮、
+        /// 设置菜单里那一项、标签条空白右键、书签栏自己的右键 —— 免得像当初「托盘漏了设置项」那样漏一边。
         /// </summary>
         public void SetFavBar(bool on)
         {

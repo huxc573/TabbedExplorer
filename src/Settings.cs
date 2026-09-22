@@ -17,6 +17,7 @@ namespace TabbedExplorer
     ///   tabautofit = 1 | 0                  自适应宽度②：挤不下时自动缩窄
     ///   favbar     = 1 | 0                  书签栏显不显示（Ctrl+Shift+B）
     ///   captureall = 1 | 0                  是否把「从开始菜单/桌面打开的文件夹」也收成标签
+    ///   debug      = 1 | 0                  是否把详细过程写进 data\log.txt（默认关，见 Diag）
     ///
     /// ⚠ 用 JSON 而不是 `key=value`（2026-09-22 川要求「配置项文件用 json 格式」）：
     /// JSON 本体不支持注释，所以说明写在 `_` 开头的键里 —— 那既是**合法 JSON**（任何工具都读得动），
@@ -68,6 +69,14 @@ namespace TabbedExplorer
         /// 关：只接管 Win+E，其他照旧开原生窗口。
         /// </summary>
         public static bool CaptureAll = true;
+        /// <summary>
+        /// Debug 模式：把每一步的详细过程写进 `data\log.txt`。
+        ///
+        /// 川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
+        /// 默认关（普通用户不需要一个会一直变大的文件），本机自己那份 settings.json 里开着。
+        /// 它只影响 `Diag` 写不写盘，**不影响任何功能**。
+        /// </summary>
+        public static bool Debug = false;
 
         /// <summary>标签宽度的合法范围（逻辑像素）。太小就点不中了，太大一屏放不下两个。</summary>
         public const int TabWidthMin = 64;
@@ -153,6 +162,8 @@ namespace TabbedExplorer
                     TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
                     FavBar       = Json.GetBool(json, "favbar", false);
                     CaptureAll   = Json.GetBool(json, "captureall", true);
+                    Debug        = Json.GetBool(json, "debug", false);
+                    Diag.Enabled = Debug;        // 读完才是最终口径（见 Diag.Enabled 的说明）
                     hotkeys.Clear();
                     for (int i = 0; i < HotkeyKeys.Length; i++)
                     {
@@ -172,6 +183,7 @@ namespace TabbedExplorer
                 {
                     Diag.Step("设置: 发现老的 settings.txt，迁移到 settings.json");
                     LoadLegacyText();
+                    Diag.Enabled = Debug;
                     Save();
                     try { File.Move(LegacyFileName, LegacyFileName + ".migrated"); } catch { }
                     Diag.Step("设置: 迁移完成 " + Describe());
@@ -181,6 +193,7 @@ namespace TabbedExplorer
                 // 两样都没有 ⇒ 写一份默认的，川打开就能改
                 Diag.Step("设置: 还没有 " + FileName + "（写一份默认的）");
                 Save();
+                Diag.Enabled = Debug;
             }
             catch (Exception ex)
             {
@@ -209,6 +222,7 @@ namespace TabbedExplorer
                     case "tabautowiden": TabAutoWiden = ParseBool(v, true); break;
                     case "favbar":       FavBar = ParseBool(v, false); break;
                     case "captureall":   CaptureAll = ParseBool(v, true); break;
+                    case "debug":        Debug = ParseBool(v, false); break;
                 }
             }
         }
@@ -229,6 +243,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_tabautowiden\": \"true = 名字太长时这个标签自己加宽（最多 400 逻辑像素）；false = 所有标签一样宽\",\r\n");
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
+                sb.Append("  \"_debug\": \"true = 把每一步的详细过程写进 data\\\\log.txt（默认 false）。查问题时打开，平时关着不占地方。\",\r\n");
                 sb.Append("  \"_hotkeys\": \"程序自己的快捷键，格式 Ctrl+Shift+T / Alt+F4 这样；留空或删掉这一行 = 用默认。Ctrl+1..9 跳标签是固定的、不在这里。\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
@@ -238,6 +253,7 @@ namespace TabbedExplorer
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"debug\": ").Append(Debug ? "true" : "false").Append(",\r\n");
                 // 快捷键：只写「跟默认不一样」的那些（默认值不落文件，以后换默认值能跟着走）
                 StringBuilder hb = new StringBuilder();
                 for (int i = 0; i < HotkeyKeys.Length; i++)
@@ -271,10 +287,10 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} hotkeys={8}",
+            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} debug={8} hotkeys={9}",
                 Text(Capture), KeepTabs ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
-                hotkeys.Count);
+                Debug ? 1 : 0, hotkeys.Count);
         }
 
         // ==================================================================
@@ -356,5 +372,13 @@ namespace TabbedExplorer
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }
+
+        /// <summary>Debug 模式开关：改完立刻生效（`Diag` 每次写之前都看那个闸）。</summary>
+        public static void SetDebug(bool on)
+        {
+            Debug = on;
+            Diag.Enabled = on;
+            Save();
+        }
     }
 }

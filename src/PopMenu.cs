@@ -85,12 +85,48 @@ namespace TabbedExplorer
         /// <summary>
         /// 弹菜单。**不阻塞** —— 把要干的事记在菜单里，窗全关掉之后才执行。
         /// `at` 是 `owner` 的**客户区坐标**（内部换算成屏幕坐标）。
+        ///
+        /// ⚠⚠ 这里**一律推后一轮**（`BeginInvoke`）再真正开窗，别嫌多一跳 —— 这是
+        /// 「菜单弹出来了、可里面点不动」这一类毛病的**根治办法**，也是唯一一处需要修的地方：
+        ///
+        ///   调用方十有八九是在某个控件的 `MouseUp` / `MouseDown` 里弹菜单。那一刻 WinForms
+        ///   还攥着那个控件的鼠标捕获，而且**它会在事件处理返回之后才把捕获放掉** ——
+        ///   放的那一刻正好把刚弹出来那个菜单窗口的 `Capture = true` 抢走。菜单一没捕获，
+        ///   鼠标消息就散了：悬停不亮、点了不响应，看门狗过一会儿再把它收掉。
+        ///   日志里的证据很干净：走 `Defer` 的历史记录 / 齿轮那份菜单一直好使，
+        ///   而**同步弹**的那些（书签栏文件夹的子菜单 17 次弹出只命中 1 次）全都时好时坏。
+        ///
+        ///   推后一轮，这条鼠标消息（含那次捕获释放）已经走完，菜单的捕获就没人抢了。
+        ///   本来是要求「每个调用点自己在 MouseUp 里 `BeginInvoke`」，现在收在**这一个口**上，
+        ///   以后新增调用点不必再各自记这条规矩。
         /// </summary>
         public static void Show(PopItem[] items, Control owner, Point at, string what)
         {
             if (owner == null || items == null || items.Length == 0) return;
+
             try
             {
+                if (owner.IsHandleCreated && !owner.IsDisposed)
+                {
+                    PopItem[] its = items;
+                    Control o = owner;
+                    Point p = at;
+                    string w = what;
+                    owner.BeginInvoke((MethodInvoker)delegate { ShowNow(its, o, p, w); });
+                    return;
+                }
+            }
+            catch (Exception ex) { Diag.Log("菜单: Defer 失败 " + what + " " + ex.Message); }
+
+            ShowNow(items, owner, at, what);   // 拿不到窗口句柄（理论上不该走到）就同步弹，别干脆不弹
+        }
+
+        /// <summary>真正弹出来。只在 `Show` 里被调 —— 那里已经把「推后一轮」这步做完了。</summary>
+        private static void ShowNow(PopItem[] items, Control owner, Point at, string what)
+        {
+            try
+            {
+                if (owner == null || owner.IsDisposed || items == null || items.Length == 0) return;
                 Point screen;
                 try { screen = owner.PointToScreen(at); }
                 catch { screen = new Point(at.X, at.Y); }

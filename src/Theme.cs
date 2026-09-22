@@ -268,6 +268,36 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 把某个窗口（含**它自己那条滚动条**）的原生主题刷成跟当前颜色模式一致。
+        ///
+        /// 为什么单独要一个：`AutoScroll` / `ScrollableControl` 画出来的滚动条属于**非客户区**，
+        /// 它不吃我们自绘的配色，系统永远按浅色画 —— 深色模式下就是页面右边竖着的一条白
+        /// （川 2026-09-22 报的「设置中滚动条背景颜色未适配深色模式」就是它）。
+        /// Win10 1903+ 的 uxtheme 认 `DarkMode_Explorer` 这个子应用名，把它套在**拥有滚动条那个窗口**上，
+        /// 滚动条就跟着深了 —— 跟 shell 视图那条 `StyleShellWindow` 是同一个机制、同一个名字。
+        ///
+        /// ⚠ 主题在父子窗口之间是会**继承**的，所以调用方通常把里面的子控件也逐个调一遍
+        ///   （`SettingsForm.StylePageNative`）—— 免得出现「滚动条深了、勾选框还是浅的」这种半拉子状态。
+        /// </summary>
+        public static void StyleScrollBar(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                DarkMode.AllowWindow(hwnd, IsDark);
+                // 先设「反的那一边」再设目标 —— 同值重复设是**空操作**（连重画都不发生），
+                // 而「深色 → 跟随系统(深)」这种切法目标值恰好等于现状，光设一次等于什么都没做。
+                // 跟 `AllowAndTheme` 同一个理由，别省这一步。
+                NativeMethods.SetWindowTheme(hwnd, IsDark ? "Explorer" : "DarkMode_Explorer", null);
+                NativeMethods.SetWindowTheme(hwnd, IsDark ? "DarkMode_Explorer" : "Explorer", null);
+                NativeMethods.RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
+                    NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ERASE
+                    | NativeMethods.RDW_FRAME | NativeMethods.RDW_ALLCHILDREN);
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// 把 shell 视图整棵子窗口树带暗。顺序很重要：
         /// 先 AllowDarkModeForWindow（逐窗口授权），再 SetWindowTheme（它本身会触发
         /// WM_THEMECHANGED 重新取主题，不用我们手动发）。

@@ -72,6 +72,15 @@ namespace TabbedExplorer
         private readonly TextBox search;
         private readonly Font font, fontDim;
 
+        // ---- 多选（川 2026-09-22：「管理器没有多选功能」）----
+        // 跟资源管理器一套做法：点 = 只选它；Ctrl+点 = 把它加进去 / 拿出去；
+        // Shift+点 = 从上次点的那条到这条一整段；Ctrl+A = 全选。
+        // 存的是**路径**而不是下标 —— `view` 是过滤后的子集，一改搜索词下标全变了，
+        // 存路径才能在重排 / 重新过滤之后还对得上（比路径统一走 `PathRules.Same`）。
+        private readonly List<string> multi = new List<string>();
+        /// <summary>Shift 选范围的锚点（上次普通/Ctrl 点的那条）。</summary>
+        private string anchorPath;
+
         public HistoryManagerForm()
         {
             Text = "历史记录";
@@ -101,11 +110,18 @@ namespace TabbedExplorer
             bx = AddButton("打开", bx, y, delegate { OpenSelected(); });
             bx = AddButton("复制完整路径", bx, y, delegate
             {
-                string p = Current;
-                if (p == null) return;
-                try { Clipboard.SetText(p); Toast.Show("已复制", p); } catch { }
+                List<string> ps = TargetPaths();
+                if (ps.Count == 0) return;
+                try
+                {
+                    Clipboard.SetText(string.Join("\r\n", ps.ToArray()));
+                    // 复制是看不见的操作（不在页面上留任何痕迹），所以这一条**保留**右下角提示。
+                    Toast.Show(ps.Count == 1 ? "已复制" : ("已复制 " + ps.Count + " 条"),
+                               ps.Count == 1 ? ps[0] : "路径已按行拼好，直接粘就行。");
+                }
+                catch { }
             });
-            bx = AddButton("删除这一条", bx, y, delegate { DeleteSelected(); });
+            bx = AddButton("删除所选", bx, y, delegate { DeleteSelected(); });
             bx = AddButton("打开 json", bx, y, delegate
             {
                 try { Process.Start(History.FileName); }
@@ -115,9 +131,11 @@ namespace TabbedExplorer
             {
                 History.Clear();
                 sel = -1;
+                multi.Clear();
                 Rebuild();
                 Invalidate();
-                Toast.Show("历史记录", "已清空（只清记录，磁盘上的文件夹没动）。");
+                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 整张表当场就空了，这就是反馈，不再弹气泡。
             });
 
             Theme.Changed += OnTheme;
@@ -207,6 +225,88 @@ namespace TabbedExplorer
 
             if (sel >= view.Count) sel = view.Count - 1;
             if (sel < 0 && view.Count > 0) sel = 0;
+
+            // 多选里的路径可能已经不在 view 里了（改了搜索词 / 历史自己变了）—— 把掉队的清掉，
+            // 不然「已选 N 条」那个数字会越说越大，删的时候还删不到东西。
+            PruneMulti();
+        }
+
+        // ==================================================================
+        // 多选
+        // ==================================================================
+
+        private bool IsMulti(string p)
+        {
+            for (int i = 0; i < multi.Count; i++) if (PathRules.Same(multi[i], p)) return true;
+            return false;
+        }
+
+        private void ToggleMulti(string p)
+        {
+            for (int i = 0; i < multi.Count; i++)
+            {
+                if (!PathRules.Same(multi[i], p)) continue;
+                multi.RemoveAt(i);
+                return;
+            }
+            multi.Add(p);
+        }
+
+        /// <summary>把从 anchorPath 到第 idx 条（按 view 的顺序）整段加进多选。</summary>
+        private void AddRangeTo(int idx)
+        {
+            int from = -1;
+            if (anchorPath != null)
+            {
+                for (int i = 0; i < view.Count; i++)
+                {
+                    if (PathRules.Same(view[i].Path, anchorPath)) { from = i; break; }
+                }
+            }
+            if (from < 0) { from = idx; anchorPath = view[idx].Path; }
+            int a = Math.Min(from, idx), b = Math.Max(from, idx);
+            for (int i = a; i <= b && i < view.Count; i++)
+                if (!IsMulti(view[i].Path)) multi.Add(view[i].Path);
+        }
+
+        /// <summary>整组选中（点日期分堆标题）。</summary>
+        private void SelectDay(string day)
+        {
+            for (int i = 0; i < view.Count; i++)
+            {
+                if (!string.Equals(History.DayLabel(view[i].At), day, StringComparison.Ordinal)) continue;
+                if (!IsMulti(view[i].Path)) multi.Add(view[i].Path);
+            }
+        }
+
+        private void SelectAll()
+        {
+            for (int i = 0; i < view.Count; i++)
+                if (!IsMulti(view[i].Path)) multi.Add(view[i].Path);
+        }
+
+        private void PruneMulti()
+        {
+            for (int i = multi.Count - 1; i >= 0; i--)
+            {
+                bool found = false;
+                for (int k = 0; k < view.Count; k++)
+                {
+                    if (!PathRules.Same(view[k].Path, multi[i])) continue;
+                    found = true; break;
+                }
+                if (!found) multi.RemoveAt(i);
+            }
+        }
+
+        /// <summary>这次动作要作用于哪些条目 —— 多选非空就用多选，否则就是当前选中那一条。</summary>
+        private List<string> TargetPaths()
+        {
+            List<string> r = new List<string>();
+            if (multi.Count > 0) { r.AddRange(multi); return r; }
+            string p = Current;
+            if (p != null) r.Add(p);
+            return r;
         }
 
         private string Current
@@ -238,7 +338,8 @@ namespace TabbedExplorer
 
             DrawCaption(g, filter.Length > 0
                 ? ("历史记录（筛出 " + view.Count + " 条）")
-                : ("历史记录（" + view.Count + " 条）"), Px(12), TopH + Px(3));
+                : ("历史记录（" + view.Count + " 条）" + (multi.Count > 1 ? ("　·　已选 " + multi.Count + " 条") : "")),
+                Px(12), TopH + Px(3));
             DrawCaption(g, "详情", LeftW + Px(12), TopH + Px(3), true);
 
             for (int i = 0; i < rows.Count; i++) DrawRow(g, i);
@@ -274,6 +375,16 @@ namespace TabbedExplorer
 
             if (row.Index == sel) g.FillRectangle(new SolidBrush(Theme.Hover), r);
             else if (i == hover) g.FillRectangle(new SolidBrush(Theme.Hover), r);
+
+            // 多选中的一行：左边加一条强调色短竖条（选中色跟 `sel` 一样用 Hover，
+            // 靠这条竖条区分「刚点的那一个」和「一起被选上的那几个」）。
+            if (IsMulti(row.Item.Path))
+            {
+                g.FillRectangle(new SolidBrush(Theme.Hover), r);
+                using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    g.FillRectangle(b, new Rectangle(Px(10), r.Top + Px(3),
+                        Math.Max(2, Px(3)), Math.Max(1, r.Height - Px(6))));
+            }
 
             // 行尾的 ✕
             Rectangle close = CloseRect(r);
@@ -339,9 +450,11 @@ namespace TabbedExplorer
             Line(g, "去过时间：", string.IsNullOrEmpty(it.At) ? "（老记录，时间未知）" : it.At, x, ref y, w);
             Line(g, "在历史里的位置：", ("第 " + (sel + 1) + " 条，共 " + view.Count + " 条（越靠前越近）"),
                 x, ref y, w);
+            if (multi.Count > 1)
+                Line(g, "已选：", multi.Count + " 条（删除 / 复制都会作用于这几条）", x, ref y, w);
 
             y += Px(6);
-            TextRenderer.DrawText(g, "双击左边一行 = 在当前窗口开成新标签。",
+            TextRenderer.DrawText(g, "双击左边一行 = 在当前窗口开成新标签；Ctrl / Shift 点 = 多选。",
                 fontDim, new Point(x, y), Theme.TextDim, TextFormatFlags.NoPadding);
         }
 
@@ -423,10 +536,56 @@ namespace TabbedExplorer
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
             int i = RowAt(e.Location);
-            if (i < 0 || rows[i].Item == null) return;      // 日期标题行点了没反应
-            if (CloseRect(rows[i].Rect).Contains(e.Location)) { History.Remove(rows[i].Item.Path); Reload(); return; }
-            sel = rows[i].Index;
+            if (i < 0) { if (multi.Count > 0) { multi.Clear(); Invalidate(); } return; }
+            Row row = rows[i];
+
+            // ---- 日期分堆标题：点一下 = 这一组全选上（想整组删就是这个入口）----
+            if (row.Item == null)
+            {
+                SelectDay(row.Head);
+                anchorPath = null;
+                Invalidate();
+                return;
+            }
+
+            if (CloseRect(row.Rect).Contains(e.Location)) { History.Remove(row.Item.Path); Reload(); return; }
+
+            // ---- 多选：Ctrl 加减、Shift 选一段、光点只选它自己 ----
+            Keys mod = Control.ModifierKeys;
+            if ((mod & Keys.Shift) != 0 && anchorPath != null)
+            {
+                AddRangeTo(row.Index);
+            }
+            else if ((mod & Keys.Control) != 0)
+            {
+                ToggleMulti(row.Item.Path);
+                anchorPath = row.Item.Path;
+            }
+            else
+            {
+                multi.Clear();
+                anchorPath = row.Item.Path;
+            }
+            sel = row.Index;
             Invalidate();
+        }
+
+        /// <summary>Ctrl+A 全选 / Esc 取消多选（列表里没焦点时才会到这儿，搜索框里的 Ctrl+A 归搜索框）。</summary>
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.A))
+            {
+                SelectAll();
+                Invalidate();
+                return true;
+            }
+            if (keyData == Keys.Escape && multi.Count > 0)
+            {
+                multi.Clear();
+                Invalidate();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)
@@ -449,9 +608,11 @@ namespace TabbedExplorer
 
         private void DeleteSelected()
         {
-            string p = Current;
-            if (p == null) return;
-            History.Remove(p);
+            List<string> ps = TargetPaths();
+            if (ps.Count == 0) return;
+            int gone = History.RemoveMany(ps);
+            multi.Clear();
+            if (gone > 0) sel = -1;
             Reload();
         }
 
@@ -467,18 +628,53 @@ namespace TabbedExplorer
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Right) return;
             int i = RowAt(e.Location);
-            if (i < 0 || rows[i].Item == null) return;
-            sel = rows[i].Index;
+            if (i < 0) return;
+            Row row = rows[i];
 
-            string p = rows[i].Item.Path;
+            // ---- 日期分堆标题上右键 = 整组删（川 2026-09-22 要的）----
+            if (row.Item == null)
+            {
+                string day = row.Head;
+                List<string> all = History.PathsOfDay(day);
+                if (all.Count == 0) return;
+                List<PopItem> hm = new List<PopItem>();
+                hm.Add(PopMenu.It("选中「" + day + "」这一组（" + all.Count + " 条）",
+                    delegate { SelectDay(day); anchorPath = null; Invalidate(); }));
+                hm.Add(PopMenu.Split());
+                hm.Add(PopMenu.It("删除「" + day + "」这一组（" + all.Count + " 条）", delegate
+                {
+                    int gone = History.RemoveMany(all);
+                    multi.Clear();
+                    sel = -1;
+                    Reload();
+                    Diag.Step("历史管理器: 按日期删掉「" + day + "」" + gone + " 条");
+                }));
+                PopMenu.Show(hm.ToArray(), this, e.Location, "历史管理器日期右键 " + day);
+                return;
+            }
+
+            // 右键落在一条**没在多选里**的条目上 = 把选择收成只有它（跟资源管理器一样）；
+            // 落在已选中的条目上 = 保留整份多选，菜单动作作用于全部。
+            if (!IsMulti(row.Item.Path))
+            {
+                multi.Clear();
+                multi.Add(row.Item.Path);
+                anchorPath = row.Item.Path;
+            }
+            sel = row.Index;
+
+            string p = row.Item.Path;
+            int n = multi.Count;
+            string tail = n > 1 ? ("（共 " + n + " 条）") : "";
             List<PopItem> m = new List<PopItem>();
             m.Add(PopMenu.It("打开（新标签）", delegate { OpenSelected(); }));
-            m.Add(PopMenu.It("复制完整路径", delegate
+            m.Add(PopMenu.It("复制完整路径" + tail, delegate
             {
-                try { Clipboard.SetText(p); } catch { }
+                List<string> ps = TargetPaths();
+                try { Clipboard.SetText(string.Join("\r\n", ps.ToArray())); } catch { }
             }));
             m.Add(PopMenu.Split());
-            m.Add(PopMenu.It("从历史里删掉这一条", delegate { History.Remove(p); Reload(); }));
+            m.Add(PopMenu.It("从历史里删掉" + tail, delegate { DeleteSelected(); }));
 
             PopMenu.Show(m.ToArray(), this, e.Location, "历史管理器右键");
             Invalidate();

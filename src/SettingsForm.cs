@@ -94,6 +94,8 @@ namespace TabbedExplorer
         /// <summary>正在程序化地改控件值 —— 期间别把事件当成「用户点的」。</summary>
         private bool syncing;
         private bool rebuilding;
+        /// <summary>重建之后要补的那句提示（见 ApplyNode —— 重建会把提示行一起重建掉）。</summary>
+        private string pendingNotice;
         /// <summary>订阅 Theme.Changed 的那个处理器（关窗时要退订，否则静态事件会把窗口吊着不放）。</summary>
         private EventHandler themeHandler;
 
@@ -188,6 +190,8 @@ namespace TabbedExplorer
                 BackColor = Theme.Chrome;
                 ForeColor = Theme.Text;
                 Build();
+                // 重建会把提示行一并重建掉，所以「点完要说一句」的那种提示得等建完再说
+                if (pendingNotice != null) { string s = pendingNotice; pendingNotice = null; SetNotice(s); }
             }
             catch (Exception ex) { Diag.Log("设置窗口: 重建失败 " + ex.Message); }
             finally { rebuilding = false; syncing = false; }
@@ -317,6 +321,13 @@ namespace TabbedExplorer
             keys.AutoScroll = true;
             tabs.SetBounds(pad, y, w - pad * 2, tabsH);
             Controls.Add(tabs);
+
+            // 页内那条滚动条是**系统画的**（`TabPage.AutoScroll`），永远按浅色画 ——
+            // 深色模式下就是页面右边竖着的一条白（川 2026-09-22 截图里那个）。
+            // 唯一能让它跟着我们颜色模式走的地方是 uxtheme 的子应用名，见 `Theme.StyleScrollBar`。
+            StylePageNative(general);
+            StylePageNative(keys);
+
             if (keepPage >= 0 && keepPage < tabs.TabCount) tabs.SelectedIndex = keepPage;
             y += tabsH + Px(8);
 
@@ -345,6 +356,24 @@ namespace TabbedExplorer
             p.ForeColor = ForeColor;
             p.UseVisualStyleBackColor = false;
             return p;
+        }
+
+        /// <summary>
+        /// 把这一页（连里面的控件）的原生主题刷成跟当前颜色模式一致 —— 页内滚动条就靠它。
+        ///
+        /// 为什么要连子控件一起：主题是会在父子窗口之间继承的，既然父级已经转成深色一套，
+        /// 干脆把子控件也显式设上，免得出现「滚动条深了、勾选框还是浅的」这种半拉子状态。
+        /// 调完系统主题会让窗口重画，所以这一步只放在 `Build()` 末尾（建完才刷，不重复刷）。
+        /// </summary>
+        private static void StylePageNative(Control c)
+        {
+            if (c == null) return;
+            try
+            {
+                Theme.StyleScrollBar(c.Handle);
+                foreach (Control k in c.Controls) StylePageNative(k);
+            }
+            catch { }
         }
 
         /// <summary>Tab 头自绘（平底 + 选中时底下一条强调色，跟浏览器那种一样）。</summary>
@@ -691,6 +720,17 @@ namespace TabbedExplorer
 
             // 值可能连带改了别的项（比如切捕获方式会把记忆搬家），所以整窗刷一遍
             SyncAll();
+
+            // 点完给一句反馈（「清理日志」那种干完什么都不说的动作，不说一句看不出来做过）
+            if (nd.RebuildAfter)
+            {
+                // 文字里带实时数字的项（「日志文件：…（现在 546 KB）」）得重建才看得到新值。
+                // 用 BeginInvoke 推后一轮 —— 这一跳就在某个控件的 Click 处理里，
+                // 当场把它 Dispose 掉不安全（见 `Rebuild` 上方那段）。
+                pendingNotice = nd.Notice;
+                try { BeginInvoke(new Action(Rebuild)); } catch { }
+            }
+            else if (nd.Notice != null) SetNotice(nd.Notice);
         }
 
         private void SyncAll()

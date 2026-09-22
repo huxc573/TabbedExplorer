@@ -430,7 +430,9 @@ namespace TabbedExplorer
                 if (added > 0)
                 {
                     Reload();
-                    Toast.Show("已加入书签", added == 1 ? last : ("共 " + added + " 项"));
+                    // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                    // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
+                    // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
                 }
                 else if (dup > 0 && bad == 0) Toast.Show("书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
                 else Toast.Show("书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
@@ -590,11 +592,16 @@ namespace TabbedExplorer
         /// <summary>把子文件夹里的东西列出来（支持继续往下嵌套）。</summary>
         private void ShowSubMenu(int index)
         {
+            if (index < 0 || index >= items.Count) return;
             FavNode nd = items[index].Node;
             PopItem[] kids = ItemsOf(nd);
             if (kids.Length == 0) { Toast.Show(nd.Display, "这个文件夹里还没有书签。"); return; }
             Rectangle r = BoundsOf(index);
-            PopMenu.Show(kids, this, new Point(r.Left, r.Bottom + Px(1)), "书签子文件夹 " + nd.Display);
+            Point at = new Point(r.Left, r.Bottom + Px(1));
+            string what = "书签子文件夹 " + nd.Display;
+            // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（川报的「点书签栏文件夹，
+            //   里面的子项点不动」的根就在那儿）—— 这里不用自己 Defer。
+            PopMenu.Show(kids, this, at, what);
         }
 
         /// <summary>把一个节点的孩子变成菜单项（文件夹继续往下嵌套一层）。</summary>
@@ -689,10 +696,10 @@ namespace TabbedExplorer
             m.Add(PopMenu.It("隐藏书签栏（" + Hotkeys.Combo("favbar") + "）",
                 delegate { if (HideRequested != null) HideRequested(this, EventArgs.Empty); }));
 
-            PopMenu.Show(m.ToArray(), this, at,
-                i >= 0 ? ("书签项右键 " + items[i].Name) : "书签栏右键");
+            PopItem[] menu = m.ToArray();
+            string title = i >= 0 ? ("书签项右键 " + items[i].Name) : "书签栏右键";
+            PopMenu.Show(menu, this, at, title);   // 「推后一轮」在 PopMenu.Show 里做
         }
-
         /// <summary>按节点删除（文件夹连里面的东西一起删，磁盘上不动）。</summary>
         private static void RemoveFrom(List<FavNode> l, FavNode node)
         {

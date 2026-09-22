@@ -83,6 +83,13 @@ namespace TabbedExplorer
         private Row pressed;                 // 双击判定用
         private string filter = "";
 
+        // ---- 多选（川 2026-09-22：「管理器没有多选功能」）----
+        // 只作用于**右列**（左树选中哪个文件夹是另一件事，`sel`）。
+        // 统一走 `FavNode` 引用比（树上的节点本来就是同一批对象，不像历史那边存路径）。
+        private readonly List<FavNode> multi = new List<FavNode>();
+        /// <summary>Shift 选范围的锚点。</summary>
+        private FavNode anchorNode;
+
         // ---- 拖动（川 2026-09-22：管理器和书签栏都要能拖）----
         // 跟书签栏一套做法：按下只记状态，MouseMove 超阈值才算拖动，MouseUp 才真改数据。
         private FavNode dragNode;
@@ -139,18 +146,13 @@ namespace TabbedExplorer
                 string p = InputBox.Ask(this, "添加书签", "文件夹或文件的完整路径", "");
                 if (string.IsNullOrEmpty(p)) return;
                 string name;
-                if (FavStore.Add(p, out name)) Toast.Show("已加入书签", name);
-                else Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
+                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 加成功了新项**当场就出现在右边这一列里**，那就是反馈，所以成功这条路什么都不弹；
+                // 只有没加进去（重复 / 没有真实路径）才说一句。
+                if (!FavStore.Add(p, out name))
+                    Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
             });
-            bx = AddButton("删除这一项", bx, y, delegate
-            {
-                if (sel == null) return;
-                if (FavStore.BarFolder == sel) { Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根，先换个文件夹当栏。"); return; }
-                FavNode tmp = sel;
-                FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
-                sel = null;
-                favBarChanged();
-            });
+            bx = AddButton("删除所选", bx, y, delegate { DeleteTargets(); });
             bx = AddButton("打开 json", bx, y, delegate
             {
                 try { Process.Start(FavStore.FileName); }
@@ -270,6 +272,22 @@ namespace TabbedExplorer
 
             // 选中项如果被删了/移走了，退回书签栏
             if (sel != null && !InTree(sel)) sel = FavStore.BarFolder;
+
+            // 多选里的东西可能已经不在当前这一列里了（换了文件夹 / 搜索词变了 / 被删了）——
+            // 把掉队的清掉，不然「已选 N」那个数字会越说越大，删的时候还删不到东西。
+            if (multi.Count > 0)
+            {
+                for (int i = multi.Count - 1; i >= 0; i--)
+                {
+                    bool found = false;
+                    for (int k = 0; k < listRows.Count; k++)
+                    {
+                        if (listRows[k].Node != multi[i]) continue;
+                        found = true; break;
+                    }
+                    if (!found) multi.RemoveAt(i);
+                }
+            }
         }
 
         private void Flatten(FavNode n, FavNode parent, int indexInParent, int depth, ref int y)
@@ -340,8 +358,10 @@ namespace TabbedExplorer
             // 左树 / 右列的标题
             DrawCaption(g, "书签", Px(12), TopH + Px(3));
             string right = filter.Length > 0
-                ? ("搜索结果（" + listRows.Count + "）")
-                : (sel != null ? FavStore.NameOf(sel) : "");
+                ? ("搜索结果（" + listRows.Count + "）" + (multi.Count > 1 ? ("　·　已选 " + multi.Count) : ""))
+                : (sel != null ? FavStore.NameOf(sel) + "（" + listRows.Count + " 项）"
+                                        + (multi.Count > 1 ? ("　·　已选 " + multi.Count) : "")
+                               : "");
             DrawCaption(g, right, LeftW + Px(12), TopH + Px(3), true);
 
             for (int i = 0; i < treeRows.Count; i++) DrawTreeRow(g, treeRows[i]);
@@ -353,6 +373,102 @@ namespace TabbedExplorer
                 TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的书签" : "这个文件夹里还没有书签（拖文件夹进来，或点上面的「添加」）",
                     fontDim, new Rectangle(LeftW + Px(14), TopH + CaptionH + Px(6), Math.Max(1, Width - LeftW - Px(30)), Px(24)),
                     Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.NoPadding);
+        }
+
+        // ==================================================================
+        // 多选（右列）
+        // ==================================================================
+
+        private bool IsMulti(FavNode n)
+        {
+            return n != null && multi.Contains(n);
+        }
+
+        private void ToggleMulti(FavNode n)
+        {
+            if (n == null) return;
+            if (!multi.Remove(n)) multi.Add(n);
+        }
+
+        /// <summary>把从 anchorNode 到 n 这一段（按右列的顺序）加进多选。</summary>
+        private void AddRangeTo(FavNode n)
+        {
+            int from = -1, to = -1;
+            for (int i = 0; i < listRows.Count; i++)
+            {
+                if (listRows[i].Node == anchorNode) from = i;
+                if (listRows[i].Node == n) to = i;
+            }
+            if (to < 0) return;
+            if (from < 0) { from = to; anchorNode = n; }
+            int a = Math.Min(from, to), b = Math.Max(from, to);
+            for (int i = a; i <= b && i < listRows.Count; i++)
+                if (!multi.Contains(listRows[i].Node)) multi.Add(listRows[i].Node);
+        }
+
+        private void SelectAllList()
+        {
+            for (int i = 0; i < listRows.Count; i++)
+                if (!multi.Contains(listRows[i].Node)) multi.Add(listRows[i].Node);
+        }
+
+        /// <summary>Ctrl+A / Esc（列表里没焦点时才会到这儿）。</summary>
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.A))
+            {
+                SelectAllList();
+                Invalidate();
+                return true;
+            }
+            if (keyData == Keys.Escape && multi.Count > 0)
+            {
+                multi.Clear();
+                Invalidate();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        /// <summary>
+        /// 「删除」这个动作要删哪些：**多选了就删多选**，没多选就还是删左树选中那个文件夹（老行为）。
+        /// </summary>
+        private void DeleteTargets()
+        {
+            List<FavNode> ns = new List<FavNode>();
+            if (multi.Count > 0) ns.AddRange(multi);
+            else if (sel != null) ns.Add(sel);
+            DeleteNodes(ns);
+        }
+
+        /// <summary>
+        /// 一次删一批（**一次 Edit、一次落盘**）。
+        /// 「书签栏」那一层是横着那条栏的根，删了栏就空了 —— 那一项跳过并说一声，其余的照删。
+        /// </summary>
+        private void DeleteNodes(List<FavNode> ns)
+        {
+            if (ns == null || ns.Count == 0) return;
+            List<FavNode> ok = new List<FavNode>();
+            bool blocked = false;
+            for (int i = 0; i < ns.Count; i++)
+            {
+                FavNode n = ns[i];
+                if (n == null) continue;
+                if (n.Bar && n.IsFolder) { blocked = true; continue; }
+                ok.Add(n);
+            }
+            if (blocked) Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根，它没被删。");
+            if (ok.Count == 0) return;
+
+            FavNode[] arr = ok.ToArray();
+            FavStore.Edit(delegate(List<FavNode> l)
+            {
+                for (int i = 0; i < arr.Length; i++) RemoveNode(l, arr[i]);
+            });
+            for (int i = 0; i < arr.Length; i++) if (sel == arr[i]) sel = FavStore.BarFolder;
+            multi.Clear();
+            Diag.Step("书签管理器: 删掉 " + arr.Length + " 项");
+            favBarChanged();
         }
 
         private void DrawCaption(Graphics g, string text, int x, int y)
@@ -405,6 +521,15 @@ namespace TabbedExplorer
         {
             bool hov = (r.Node == hoverList);
             if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+
+            // 多选中的一行：左边一条强调色短竖条（底色跟悬停一样用 Hover，靠竖条区分）
+            if (IsMulti(r.Node))
+            {
+                g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+                using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    g.FillRectangle(b, new Rectangle(r.Rect.Left - Px(2), r.Rect.Top + Px(3),
+                        Math.Max(2, Px(3)), Math.Max(1, r.Rect.Height - Px(6))));
+            }
 
             Image ic;
             if (r.Node.IsFolder) ic = ShellIcon.FolderIcon(Px(16));
@@ -549,7 +674,14 @@ namespace TabbedExplorer
                 Row r = listRows[i];
                 if (!r.Rect.Contains(e.Location)) continue;
                 pressed = r;
-                if (CloseRect(r.Rect).Contains(e.Location)) { DeleteNode(r.Node); return; }
+                if (CloseRect(r.Rect).Contains(e.Location)) { DeleteOne(r.Node); return; }
+
+                // ---- 多选：Ctrl 加减、Shift 选一段、光点只选它自己 ----
+                Keys mod = Control.ModifierKeys;
+                if ((mod & Keys.Shift) != 0 && anchorNode != null) AddRangeTo(r.Node);
+                else if ((mod & Keys.Control) != 0) { ToggleMulti(r.Node); anchorNode = r.Node; }
+                else { multi.Clear(); anchorNode = r.Node; }
+
                 dragNode = r.Node;
                 dragStart = e.Location;
                 Invalidate();
@@ -734,6 +866,19 @@ namespace TabbedExplorer
             Row r = RowAt(e.Location);
             if (r == null) return;
 
+            // 右键落在一条**没在多选里**的项上 = 把选择收成只有它（跟资源管理器一样）；
+            // 落在已选中的项上 = 保留整份多选，菜单动作作用于全部。
+            if (listRows.Contains(r) && !IsMulti(r.Node))
+            {
+                multi.Clear();
+                multi.Add(r.Node);
+                anchorNode = r.Node;
+            }
+            else if (listRows.Contains(r))
+            {
+                anchorNode = r.Node;
+            }
+
             List<PopItem> m = new List<PopItem>();
             FavNode n = r.Node;
 
@@ -745,8 +890,7 @@ namespace TabbedExplorer
                     try { Clipboard.SetText(n.Path); } catch { }
                 }));
                 m.Add(PopMenu.Split());
-            }
-            else
+            }            else
             {
                 // 川 2026-09-22：文件夹（含子文件夹）能「全部打开」，超过 7 项先问一句
                 m.Add(FavActions.OpenAllItem(this, n, delegate(FavNode f) { OpenAll(f); }));
@@ -778,7 +922,8 @@ namespace TabbedExplorer
                 }));
 
             if (!(n.Bar && n.IsFolder))
-                m.Add(Mi("从书签移出", delegate { DeleteNode(n); }));
+                m.Add(Mi("从书签移出" + (multi.Count > 1 ? ("（共 " + multi.Count + " 项）") : ""),
+                         delegate { DeleteTargets(); }));
 
             PopMenu.Show(m.ToArray(), this, e.Location, "书签管理器右键 " + FavStore.NameOf(n));
         }
@@ -786,15 +931,10 @@ namespace TabbedExplorer
         private PopItem Mi(string text, Action a) { return PopMenu.It(text, a); }
 
         /// <summary>删一个节点（文件夹连里面的东西一起，**磁盘上不动**）。</summary>
-        private void DeleteNode(FavNode n)
+        private void DeleteOne(FavNode n)
         {
             if (n == null) return;
-            if (n.Bar && n.IsFolder) { Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根。"); return; }
-            FavNode tmp = n;
-            FavStore.Edit(delegate(List<FavNode> l) { RemoveNode(l, tmp); });
-            if (sel == n) sel = FavStore.BarFolder;
-            Rebuild();
-            Invalidate();
+            DeleteNodes(new List<FavNode>(new FavNode[] { n }));
         }
 
         private static void RemoveNode(List<FavNode> l, FavNode target)
@@ -867,7 +1007,8 @@ namespace TabbedExplorer
                     if (AddInto(parent, raw, out nm)) added++;
                 }
                 Diag.Step("书签管理器: 拖入 " + paths.Length + " 项 -> 加进「" + FavStore.NameOf(parent) + "」" + added + " 项");
-                if (added > 0) Toast.Show("已加入书签", added == 1 ? FavStore.NameOf(parent) : ("共 " + added + " 项"));
+                // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 新项**当场就出现在右边这一列里**了，那就是反馈，不再弹气泡。
                 Rebuild();
                 Invalidate();
             }

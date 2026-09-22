@@ -520,7 +520,7 @@ namespace TabbedExplorer
                 Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
                 sb.Append("{\r\n");
-                sb.Append("  \"_note\": \"TabbedExplorer 的书签。结构就是一棵树：文件夹带 name + children，书签项带 path。\"\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 的书签。结构就是一棵树：文件夹带 name + children，书签项带 path。\",\r\n");
                 sb.Append("  \"_hint\": \"bar=true 的那个文件夹就是标签条下面那条横向书签栏。名字不写就按路径末级算；删一项不会动磁盘上的文件。\",\r\n");
                 sb.Append("  \"_edited\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\r\n");
                 sb.Append("  \"favorites\": [\r\n");

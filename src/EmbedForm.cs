@@ -697,6 +697,8 @@ namespace TabbedExplorer
             Diag.Step("EmbedForm: 收进托盘（进程常驻，继续接 Win+E）");
             Visible = false;
             MarkDirty();
+            // 窗口都收起来了，正是收本进程驻留内存的好时候（川 2026-09-22 的优化 5）
+            ExplorerHost.TrimSelf();
             if (!trayTipShown)
             {
                 trayTipShown = true;
@@ -1202,9 +1204,18 @@ namespace TabbedExplorer
                 n++;
             }
             if (n > 0) Diag.Step("EmbedForm: 收了 " + n + " 个非激活标签的内存");
+            // 标签那边收完，把我们自己这一份也收一收（见 ExplorerHost.TrimSelf）。
+            // 不放在 `if (n > 0)` 里 —— 只有一个标签的时候本进程照样会涨（图标、历史、重绘的位图）。
+            ExplorerHost.TrimSelf();
         }
 
-        private void CloseTab(int idx)
+        private void CloseTab(int idx) { CloseTab(idx, true); }
+
+        /// <summary>
+        /// 关一个标签。<paramref name="activate"/> = false 时**不**做收尾的 `Activate`
+        /// （批量关要走这条，见 `CloseTabsQuiet`——中间那几次 Activate 就是「闪一下」的来源）。
+        /// </summary>
+        private void CloseTab(int idx, bool activate)
         {
             if (idx < 0 || idx >= hosts.Count) return;
             ExplorerHost h = hosts[idx];
@@ -1250,7 +1261,7 @@ namespace TabbedExplorer
                 HideToTray();
                 return;
             }
-            Activate(Math.Min(idx, hosts.Count - 1));
+            if (activate || !closingBatch) Activate(Math.Min(idx, hosts.Count - 1));
         }
 
         // ==================================================================
@@ -1464,10 +1475,14 @@ namespace TabbedExplorer
             if (keep < 0 || keep >= hosts.Count || hosts.Count <= 1) return;
             ExplorerHost k = hosts[keep];
             Diag.Step("EmbedForm: 关闭其它标签页（保留 idx=" + keep + "）");
-            for (int i = hosts.Count - 1; i >= 0; i--)
+            // ⚠ 批量关的时候**中间那一堆 Activate 全不要**（见 CloseTabsQuiet 的注释）。
+            CloseTabsQuiet(delegate
             {
-                if (hosts[i] != k && i < hosts.Count) CloseTab(i);
-            }
+                for (int i = hosts.Count - 1; i >= 0; i--)
+                {
+                    if (hosts[i] != k && i < hosts.Count) CloseTab(i, false);
+                }
+            });
             int n = IndexOfHost(k);
             if (n >= 0) Activate(n);
         }
@@ -1477,8 +1492,12 @@ namespace TabbedExplorer
         {
             if (idx <= 0 || idx >= hosts.Count) return;
             Diag.Step("EmbedForm: 关闭左边标签页（idx=" + idx + " 左边共 " + idx + " 个）");
-            for (int i = idx - 1; i >= 0; i--) CloseTab(i);
-            Activate(0);
+            int from = idx - 1;
+            CloseTabsQuiet(delegate
+            {
+                for (int i = from; i >= 0; i--) CloseTab(i, false);
+            });
+            if (hosts.Count > 0) Activate(0);
         }
 
         /// <summary>关闭 idx 右边（不含）的所有标签。</summary>
@@ -1486,9 +1505,34 @@ namespace TabbedExplorer
         {
             if (idx < 0 || idx >= hosts.Count - 1) return;
             Diag.Step("EmbedForm: 关闭右边标签页（idx=" + idx + " 右边共 " + (hosts.Count - 1 - idx) + " 个）");
-            for (int i = hosts.Count - 1; i > idx; i--) CloseTab(i);
-            Activate(Math.Min(idx, hosts.Count - 1));
+            CloseTabsQuiet(delegate
+            {
+                for (int i = hosts.Count - 1; i > idx; i--) CloseTab(i, false);
+            });
+            if (hosts.Count > 0) Activate(Math.Min(idx, hosts.Count - 1));
         }
+
+        /// <summary>
+        /// 批量关标签：
+        ///
+        /// ⚠ 川 2026-09-22：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」。
+        /// 两个原因，这一个是主要的：`CloseTab` 本来**每关一个就 `Activate` 一次**，
+        /// 批量关时就变成「关张三 → 显示李四 → 关李四 → 显示王五 → …」——
+        /// 每一下都是把一个**真 explorer 窗口**现出来再藏掉，屏幕上看到的就是整个内容区在闪。
+        /// 现在批量这条路把中间的 Activate 全按掉，循环跑完只定一次最终那个。
+        /// （另一个原因在 `ExplorerHost.Close`：还回桌面之前忘了先 `SW_HIDE`。）
+        /// </summary>
+        private void CloseTabsQuiet(Action body)
+        {
+            if (body == null) return;
+            bool old = closingBatch;
+            closingBatch = true;
+            try { body(); }
+            finally { closingBatch = old; }
+        }
+
+        /// <summary>批量关标签期间为 true —— 这时候 `CloseTab` 不做收尾的 `Activate`。</summary>
+        private bool closingBatch;
 
         /// <summary>把这个位置加进书签栏（书签是我们自己那份 data\favorites.json，见 FavStore）。</summary>
         private void AddToFavorites(string path)
@@ -1502,7 +1546,10 @@ namespace TabbedExplorer
                 return;
             }
             Diag.Step("EmbedForm: 加入书签 -> " + path);
-            Toast.Show("已加入书签", name);   // 用户主动做的动作，值得回一句
+            // 川 2026-09-22：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+            // 书签栏开着的话，那一项会**立刻出现在标签条下面那条栏上**，那就够了，不再弹气泡。
+            // 只有书签栏是关着的时候才提示一句（那时界面上真的什么都没发生，不说一声就成了「点了没反应」）。
+            if (favBar == null || !favBar.Visible) Toast.Show("已加入书签", name);
         }
 
         /// <summary>
@@ -1673,6 +1720,9 @@ namespace TabbedExplorer
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             Diag.Step("EmbedForm: OnFormClosed reason=" + e.CloseReason + " 桌面=" + DesktopKey);
+            // 滚轮登记表要摘掉 —— 不摘的话 `WheelRouter` 会一直攥着这个窗口句柄，
+            // 句柄被复用时新窗口的滚轮会走错门。
+            try { WheelRouter.Unregister(Handle); } catch { }
             // 设置窗口现在归 Hub 管（它会在自己 Dispose 时收）—— 这里不再碰。
             try { trimTimer.Stop(); trimTimer.Dispose(); } catch { }
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）

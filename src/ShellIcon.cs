@@ -67,6 +67,41 @@ namespace TabbedExplorer
                 Environment.GetFolderPath(Environment.SpecialFolder.System), file);
         }
 
+        // ==================================================================
+        // 图标缓存（川 2026-09-22：「程序本身运行时内存占用高，尝试优化下」——
+        //   这是里面最实在的一刀，而且同时省的是**磁盘查询 + 内存**两样东西）
+        //
+        // 为什么非加不可：`PathIcon` 每一次调用都是 **SHGetFileInfo（要碰磁盘 / 问 shell）
+        //   + new Bitmap**，而两个管理器（书签 / 历史）是在 `OnPaint` 里**逐行**调它的 ——
+        //   窗口一动、鼠标一划、拖一下大小，就是几十次磁盘查询 + 几十张新位图，
+        //   全堆在 GC 堆上等着收。原先唯一的缓存是文件夹图标，而且是**单槽**的
+        //   （`folderCache.Width == target` 才算命中）——标签用 16、管理器用 15/16，
+        //   几个尺寸来回一套就把它顶掉，等于没有。
+        //
+        // 现在一张表按「尺寸 + 路径」缓存，上限 `CacheMax`，超了整表丢掉重来
+        // （不做 LRU —— 命中的永远是眼前这几行，一刀切最省事）。
+        // ⚠ 缓存里的位图**一律不 Dispose**：谁要用谁自己留着引用（`FavBar.Item.Icon` 就是），
+        //   真没人引用了 GC 会收掉（Bitmap 有自己的终结器去释放 GDI+ 那一份）。
+        //   反过来说：**调用方拿到缓存里的那张就别 Dispose**，不然会把别人的图标一起干掉。
+        // ==================================================================
+
+        private const int CacheMax = 400;
+        private static readonly System.Collections.Generic.Dictionary<string, Bitmap> cache =
+            new System.Collections.Generic.Dictionary<string, Bitmap>(StringComparer.OrdinalIgnoreCase);
+
+        private static Bitmap CacheGet(string key)
+        {
+            Bitmap b;
+            return cache.TryGetValue(key, out b) ? b : null;
+        }
+
+        private static void CachePut(string key, Bitmap b)
+        {
+            if (b == null) return;
+            if (cache.Count >= CacheMax) cache.Clear();
+            cache[key] = b;
+        }
+
         /// <summary>标准灰度（ITU-R 601-2，和 PIL 的 convert("L") 同权重）。</summary>
         private static ImageAttributes GrayAttributes()
         {
@@ -129,7 +164,9 @@ namespace TabbedExplorer
         /// </summary>
         public static Bitmap FolderIcon(int target)
         {
-            if (folderCache != null && folderCache.Width == target) return folderCache;
+            string key = "folder|" + target;
+            Bitmap hit = CacheGet(key);
+            if (hit != null) return hit;
             try
             {
                 uint sizeFlag = target > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON;
@@ -139,15 +176,15 @@ namespace TabbedExplorer
                     SHGFI_ICON | sizeFlag | SHGFI_USEFILEATTRIBUTES);
                 if (r != IntPtr.Zero && fi.hIcon != IntPtr.Zero)
                 {
-                    try { folderCache = RenderIcon(fi.hIcon, target, false); }
+                    Bitmap b = null;
+                    try { b = RenderIcon(fi.hIcon, target, false); }
                     finally { DestroyIcon(fi.hIcon); }
+                    if (b != null) { CachePut(key, b); return b; }
                 }
             }
             catch (Exception ex) { Diag.Log("ShellIcon: 取文件夹图标失败 " + ex.Message); }
-            return folderCache;
+            return null;
         }
-
-        private static Bitmap folderCache;
 
         /// <summary>
         /// 取「某个具体东西长什么样」的图标 —— 书签栏那一排用。
@@ -160,6 +197,9 @@ namespace TabbedExplorer
         public static Bitmap PathIcon(string path, int target)
         {
             if (string.IsNullOrEmpty(path)) return FolderIcon(target);
+            string key = target + "|" + path;
+            Bitmap hit = CacheGet(key);
+            if (hit != null) return hit;
             try
             {
                 uint sizeFlag = target > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON;
@@ -168,8 +208,10 @@ namespace TabbedExplorer
                     (uint)Marshal.SizeOf(typeof(SHFILEINFO)), SHGFI_ICON | sizeFlag);
                 if (r != IntPtr.Zero && fi.hIcon != IntPtr.Zero)
                 {
-                    try { return RenderIcon(fi.hIcon, target, false); }
+                    Bitmap b = null;
+                    try { b = RenderIcon(fi.hIcon, target, false); }
                     finally { DestroyIcon(fi.hIcon); }
+                    if (b != null) { CachePut(key, b); return b; }
                 }
             }
             catch (Exception ex) { Diag.Log("ShellIcon: 取路径图标失败 " + path + " " + ex.Message); }

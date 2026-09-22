@@ -53,6 +53,17 @@ namespace TabbedExplorer
             public Func<int> NumGet;
             /// <summary>数值项改一下要干什么。</summary>
             public Action<int> NumSet;
+            /// <summary>
+            /// 点完要在**设置窗口底部那行提示**里说一句（纯动作项用，托盘菜单不看这个）。
+            /// null = 不说话。见 `SettingsForm.ApplyNode`。
+            /// </summary>
+            public string Notice;
+            /// <summary>
+            /// 点完把设置窗口**整窗重建**一遍。
+            /// 「清理日志（当前 546 KB）」这种文字里带着实时数字的项必须重建才看得到新值 ——
+            /// 重建本身是个正常的公开动作（切颜色模式就是这么做的），只是会推后一轮跑。
+            /// </summary>
+            public bool RebuildAfter;
         }
 
         private static Node Sep() { return new Node(); }
@@ -89,6 +100,16 @@ namespace TabbedExplorer
         private static Node Info(string text)
         {
             return new Node { Text = text, WindowOnly = true };
+        }
+
+        /// <summary>
+        /// 纯动作项（没有勾选状态，点了就干活）—— 设置窗口里画成一个按钮，托盘菜单里是一条正常可点的项。
+        /// `notice` 会给点完的界面一句反馈（设置窗口底部提示行），并且顺带把窗口重建一遍
+        /// （文字里带实时数字的项要）。
+        /// </summary>
+        private static Node Act(string text, Action a, string notice)
+        {
+            return new Node { Text = text, Click = a, Notice = notice, RebuildAfter = true };
         }
 
         // ==================================================================
@@ -166,7 +187,17 @@ namespace TabbedExplorer
                        () => hub.SetAutoStart(!AutoStart.IsEnabled())));
             n.Add(Sep());
 
-            // ⑨ 常用动作 + 说明
+            // ⑨ 诊断（川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
+            //    不过我们要开。增加清理日志按钮。」）
+            //    日志本身也归到 Spec 里 —— 否则又是「托盘菜单和设置窗口各写一遍」那个老毛病。
+            n.Add(Leaf("Debug 模式（把详细过程写进 data\\log.txt）",
+                       () => Settings.Debug,
+                       () => hub.SetDebug(!Settings.Debug)));
+            n.Add(Info("日志文件：data\\log.txt（现在 " + Diag.HumanSize() + "）"));
+            n.Add(Act("清理日志", delegate { Diag.Clear(); }, "日志已清空。"));
+            n.Add(Sep());
+
+            // ⑩ 常用动作 + 说明
             // 川 2026-09-22 问「记住当前标签功能是干嘛的」—— 说明这个标签没讲清自己。
             // 它跟上面「保留标签页」不是一回事：那个是**开关**（开=以后才记），
             // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有

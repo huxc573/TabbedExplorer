@@ -218,6 +218,49 @@ namespace TabbedExplorer
             return false;
         }
 
+        /// <summary>
+        /// 一次删掉一批（管理器里多选 / 按日期分组删都用它）。返回真删掉了几条。
+        ///
+        /// 为什么不一件事调一次 `Remove`：那样每删一条就写一次盘，删 30 条写 30 次。
+        /// 这里只落一次盘，而且**按路径比**（不是按下标）——`view` 是过滤后的子集，
+        /// 下标跟 `items` 对不上，只能比路径。
+        /// </summary>
+        public static int RemoveMany(IList<string> paths)
+        {
+            if (paths == null || paths.Count == 0) return 0;
+            EnsureLoaded();
+            int gone = 0;
+            for (int k = 0; k < paths.Count; k++)
+            {
+                string p = paths[k];
+                if (string.IsNullOrEmpty(p)) continue;
+                for (int i = items.Count - 1; i >= 0; i--)
+                {
+                    if (!PathRules.Same(items[i].Path, p)) continue;
+                    items.RemoveAt(i);
+                    gone++;
+                    break;                       // 同一个路径只有一条
+                }
+            }
+            if (gone == 0) return 0;
+            Save();
+            Diag.Step("历史: 一次删掉 " + gone + " 条");
+            return gone;
+        }
+
+        /// <summary>某一堆日期里的全部路径（历史管理器按日期分组删时用）。</summary>
+        public static List<string> PathsOfDay(string day)
+        {
+            EnsureLoaded();
+            List<string> r = new List<string>();
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (string.Equals(DayLabel(items[i].At), day, StringComparison.Ordinal))
+                    r.Add(items[i].Path);
+            }
+            return r;
+        }
+
         // ==================================================================
         // 按日期归类（川 2026-09-22：历史记录按日期归类）
         // ==================================================================

@@ -47,6 +47,15 @@ namespace TabbedExplorer
 
         private NotifyIcon tray;
         private WinEHook hook;
+        /// <summary>
+        /// 全局滚轮钩子（按钮区横滚标签条 / 内容区 Shift+滚轮）。
+        ///
+        /// ⚠ 2026-09-22 川报「按钮和内容区以及 Shift 滚轮都没生效」—— 根因就是这个类**全项目
+        /// 谁都没 new 过**：`WheelRouter` 的登记表、`TabStrip` 的判定、`EmbedForm` 的回调
+        /// 全都写好了，就是没把它装起来，所以失效得很彻底（三个入口一起不动）。
+        /// 现在在 Hub 里装一次，全进程共用（`EmbedForm` 只管往 `WheelRouter` 登记）。
+        /// </summary>
+        private MouseWheelHook wheelHook;
         /// <summary>「谁被显示出来了」的系统广播 —— 用来抓川自己打开的文件夹窗口（Bug 1）。</summary>
         private WinShowWatcher captureWatch;
         /// <summary>看见了、但还没到点去收的候选窗口（值 = 第一次看见的时刻 + 用来写日志的事件号）。见 TryCapture。</summary>
@@ -84,6 +93,7 @@ namespace TabbedExplorer
 
             SetupTray();
             SetupHook();
+            SetupWheel();
             SetupCapture();
 
             try { VirtualDesktop.WarmUp(); } catch (Exception ex) { Diag.Log("虚拟桌面: 预热异常 " + ex.Message); }
@@ -166,6 +176,24 @@ namespace TabbedExplorer
                     delegate { Post(delegate { Quit("--quit"); }); }, null, -1, false);
             }
             catch (Exception ex) { Diag.Log("Hub: 注册退出事件失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 装全局滚轮钩子。
+        ///
+        /// 为什么得用低级钩子而不是控件的 `OnMouseWheel`：**内容区是跨进程嵌进来的真 explorer 窗口**，
+        /// 滚轮消息直接投给它（鼠标在谁身上就归谁），我们的窗体根本收不到。
+        /// `WH_MOUSE_LL` 是唯一能在消息派发**之前**看到滚轮、并且决定吞不吞的地方。
+        /// 钩子自己跑在一个独立线程上（不占 UI 线程，也不写日志 —— 超时会被系统默默摘掉）。
+        /// </summary>
+        private void SetupWheel()
+        {
+            try
+            {
+                wheelHook = new MouseWheelHook();
+                wheelHook.Start();
+            }
+            catch (Exception ex) { Diag.Log("Hub: 装滚轮钩子失败 " + ex.Message); }
         }
 
         // ==================================================================
@@ -773,6 +801,19 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// Debug 模式（川 2026-09-22：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
+        /// 不过我们要开」）。改了立刻生效 —— `Diag` 每次写之前都现看那个闸，不用重启。
+        /// </summary>
+        public void SetDebug(bool on)
+        {
+            if (Settings.Debug == on) return;
+            Settings.SetDebug(on);
+            RefreshTrayMenu();
+            // 这一句要在开关**生效之后**记：打开时会落盘；关掉时它自己也写不进去 —— 本来就该如此。
+            Diag.Step("Hub: Debug 模式 -> " + (on ? "开（后面每一步都写 data\\log.txt）" : "关"));
+        }
+
+        /// <summary>
         /// 开机自启（川 2026-09-22 要的设置项）。
         ///
         /// 实现的**唯一真相在注册表**：`HKCU\...\Run` 里的 `TabbedExplorer` 值（见 AutoStart），
@@ -958,6 +999,7 @@ namespace TabbedExplorer
             if (favManager != null) { try { favManager.Close(); } catch { } favManager = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
+            if (wheelHook != null) { try { wheelHook.Dispose(); } catch { } wheelHook = null; }
             if (tray != null)
             {
                 try { tray.Visible = false; tray.Dispose(); } catch { }

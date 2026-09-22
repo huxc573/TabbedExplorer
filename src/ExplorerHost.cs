@@ -701,6 +701,17 @@ namespace TabbedExplorer
             {
                 try
                 {
+                    // ★★ 关之前**先藏**（川 2026-09-22：「有多个其它标签页关闭时，当前标签页整个画面会闪烁」）。
+                    //
+                    //   为什么非得藏：嵌进来的时候 `AttachWindow` 对它做过 `ShowWindow(SW_SHOW)`，
+                    //   所以它一直带着 `WS_VISIBLE`；而非当前标签是靠**父面板** `Host.Visible = false`
+                    //   藏起来的 —— 那动的是 WinForms 的 Panel，**清不掉子窗口自己的 WS_VISIBLE 位**。
+                    //   于是下面那一句 `SetParent(cab, NULL)` 把它交还给桌面时，一个「看不见但
+                    //   位是可见」的顶层窗口立刻在屏幕上现身一瞬（就摆在原矩形那儿），然后才被
+                    //   关掉/杀掉 —— 一次是闪一下，批量关就是连闪好几下。
+                    //   先清了 WS_VISIBLE，回到桌面也还是藏着的。
+                    EmbedApi.ShowWindow(CabWindow, SW_HIDE);
+
                     EmbedApi.SetStyle(CabWindow, origStyle);
                     EmbedApi.SetParent(CabWindow, IntPtr.Zero);
                     EmbedApi.ClearTransparent(CabWindow);   // 还它本来面目：别带着防闪那层透明回桌面
@@ -732,6 +743,33 @@ namespace TabbedExplorer
             addressBand = IntPtr.Zero;
             currentPath = null;
             KillOwnExplorer();
+        }
+
+        /// <summary>
+        /// 把**我们自己这个进程**的驻留内存也收一收（川 2026-09-22：「程序本身运行时内存占用高」）。
+        ///
+        /// 做法跟标签那一条一样是 `EmptyWorkingSet` —— 只是目标是本进程。
+        /// 它**不释放任何托管对象**，只是把当前用不到的物理页换到 standby 列表，
+        /// 下次访问再缺页读回（所以任务管理器里那个数会明显掉下来，慢的只是极短的重新缺页）。
+        /// 正因为有这点代价，调用点只挑「刚干完一轮活、用户没在等结果」的时候：
+        /// 切完标签停留 3 秒之后、以及窗口收进托盘的时候（见 `EmbedForm.TrimInactiveTabs` / `HideToTray`）。
+        /// </summary>
+        public static void TrimSelf()
+        {
+            IntPtr h = IntPtr.Zero;
+            try
+            {
+                int pid = Process.GetCurrentProcess().Id;
+                h = NativeMethods.OpenProcess(
+                    NativeMethods.PROCESS_QUERY_INFORMATION | NativeMethods.PROCESS_SET_QUOTA, false, pid);
+                if (h == IntPtr.Zero) return;
+                if (NativeMethods.EmptyWorkingSet(h)) Diag.Log("Embed: 已收本进程内存");
+            }
+            catch { }
+            finally
+            {
+                if (h != IntPtr.Zero) { try { NativeMethods.CloseHandle(h); } catch { } }
+            }
         }
 
         /// <summary>

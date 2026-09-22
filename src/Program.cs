@@ -95,6 +95,11 @@ namespace TabbedExplorer
             // 数据全部在**程序目录的 data\** 下（绿色便携，见 AppPaths）；
             // 第一次跑先把老位置（%APPDATA%）的设置/记忆搬过来，别让川觉得「记忆丢了」。
             AppPaths.MigrateFromLegacy();
+
+            // 上一轮日志攒得太大就先挪走一份（常年开着 Debug 时它会一直长）。
+            // 必须在 `Settings.Load()` **之前** —— Load 会把日志闸按设置定稿（见 Diag.Enabled）。
+            Diag.Rotate();
+
             Settings.Load();
 
             // 开机自启开着的话，把启动项里的 exe 路径刷成现在这个（程序目录被挪过也能对上）。

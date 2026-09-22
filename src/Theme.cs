@@ -67,6 +67,22 @@ namespace TabbedExplorer
             Reload();
         }
 
+        /// <summary>逻辑像素 → 设备像素（提示框尺寸那几个数字要按 DPI 放大，跟自绘控件一个口径）。</summary>
+        private static readonly float DpiScale = ReadDpiScale();
+
+        private static float ReadDpiScale()
+        {
+            try
+            {
+                uint d = NativeMethods.GetDpiForSystem();
+                if (d >= 96) return d / 96f;
+            }
+            catch { }
+            return 1f;
+        }
+
+        private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
+
         /// <summary>模式 + 系统状态 ⇒ 到底用不用深色。</summary>
         private static bool ReadDark()
         {
@@ -338,24 +354,31 @@ namespace TabbedExplorer
         ///
         /// ⚠ 只对「普通提示」成立：气泡（balloon）样式下 comctl 不叫 OwnerDraw。
         /// </summary>
-        public static void StyleTip(ToolTip t) { StyleTip(t, null); }
+        public static void StyleTip(ToolTip t) { StyleTip(t, null, null); }
+
+        /// <summary>同上（保留旧签名，别处还在用）。</summary>
+        public static void StyleTip(ToolTip t, Font firstLineFont) { StyleTip(t, firstLineFont, null); }
 
         /// <summary>
-        /// 同上，但可以指定**第一行**用哪套字体（川 2026-09-22：悬停提示里文件夹名加粗、路径不加粗）。
+        /// 同上，但可以指定字体：**第一行**用 `firstLineFont`（文件夹名，粗体）、
+        /// 其余用 `bodyFont`（路径，常规）—— 川 2026-09-22 要的。
         ///
-        /// 两个细节：
+        /// 三个坑：
         ///   · `ToolTip` **没有 `Font` 属性**（跟 Label 那些控件不一样），改不了系统那套字体，
-        ///     所以尺寸也得自己量、自己交回去 —— 见 `OnTipPopup`。不然粗体那一行会被截掉。
+        ///     所以**尺寸也得自己量、自己交回去** —— 见 `OnTipPopup`。不然粗体那行会被截。
+        ///   · 尺寸得**按会换行的样子**量：路径那一行是 `WordBreak` 画的，一条长路径会折成好几行，
+        ///     只按一行算高度 ⇒ 提示框太矮 ⇒ 下半截被切（川报的「悬停显示不全」就是这个）。
         ///   · 字体是按 ToolTip 实例记的（`OnTipDraw` / `OnTipPopup` 都是静态处理器，
         ///     得知道这次是哪个提示在画）。
         /// </summary>
-        public static void StyleTip(ToolTip t, Font firstLineFont)
+        public static void StyleTip(ToolTip t, Font firstLineFont, Font bodyFont)
         {
             if (t == null) return;
             t.OwnerDraw = true;
             t.BackColor = MenuBack;
             t.ForeColor = Text;
             if (firstLineFont != null) tipFirstLine[t] = firstLineFont;
+            if (bodyFont != null) tipBody[t] = bodyFont;
             t.Draw -= OnTipDraw;        // 幂等：重复 Style 同一个对象不会挂两遍
             t.Draw += OnTipDraw;
             t.Popup -= OnTipPopup;
@@ -363,11 +386,29 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 自己量两行提示的尺寸（`ToolTip` 没有 `Font`，comctl 那套尺寸是照系统字体算的，
-        /// 我们第一行是粗体、比系统宽，不改尺寸会被截掉）。
-        /// 宽 = 两行里更宽的那个 + 左右内缩；高 = 两行行高 + 行距 + 上下内缩。
-        /// 数字要跟 `OnTipDraw` 里的内缩保持一致（左右 6、上下 4、行距 2）。
-        /// 单行提示不插手 —— 交给系统自己量。
+        /// 本次要弹的提示文字（**在 `Show(...)` 之前调用**）。
+        ///
+        /// 为什么不直接用 `ToolTip.GetToolTip(control)`：标签条是走 `tips.Show(text, ...)` 弹的，
+        /// 那个短路里读到的未必是我们正要显示的那串字 —— 量错尺寸就又被截。
+        /// 干脆由调用方把「马上要显示的原文」递进来，量的一定是同一份。
+        /// </summary>
+        public static void TipText(ToolTip t, string text)
+        {
+            if (t != null) tipText[t] = text ?? "";
+        }
+
+        // 内缩那几个数字：量尺寸（OnTipPopup）和画（OnTipDraw）**必须用同一套**。
+        private const int InsetX = 6;
+        private const int InsetY = 4;
+        private const int LineGap = 2;
+        /// <summary>量文字用的「足够大」的提议尺寸。别用 int.MaxValue —— 会溢出量出怪值。</summary>
+        private const int MeasureMax = 4096;
+
+        /// <summary>
+        /// 自己量提示框尺寸。
+        /// 宽：两行里更宽的那个 + 左右内缩，再夹到「允许的最大宽度」（不然长路径会顶到屏幕外）；
+        /// 高：**按夹好之后的宽度重新量第二行**（`WordBreak`，长路径会折行），别只按一行算。
+        /// 单行提示也走这儿 —— 第一行是粗体，系统按常规字体量的宽度会差几个像素、把最后一个字切掉。
         /// </summary>
         private static void OnTipPopup(object sender, PopupEventArgs e)
         {
@@ -378,34 +419,57 @@ namespace TabbedExplorer
 
                 Font first;
                 if (!tipFirstLine.TryGetValue(src, out first) || first == null) return;
+                Font body;
+                if (!tipBody.TryGetValue(src, out body) || body == null) body = e.AssociatedControl.Font;
 
-                string text = src.GetToolTip(e.AssociatedControl);
-                if (string.IsNullOrEmpty(text)) return;
+                string text;
+                if (!tipText.TryGetValue(src, out text) || string.IsNullOrEmpty(text)) return;
+
                 int br = text.IndexOf("\r\n", StringComparison.Ordinal);
-                if (br < 0) return;
+                string line1 = br < 0 ? text : text.Substring(0, br);
+                string line2 = br < 0 ? null : text.Substring(br + 2);
 
-                Font body = e.AssociatedControl.Font;
-                if (body == null) body = first;
+                int cap = MaxTipWidth(e.AssociatedControl);
+                int inner = Math.Max(Px(80), cap - InsetX * 2);
 
-                string line1 = text.Substring(0, br);
-                string line2 = text.Substring(br + 2);
+                Size s1 = TextRenderer.MeasureText(line1, first, new Size(MeasureMax, MeasureMax),
+                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                Size s2 = new Size(0, 0);
+                if (!string.IsNullOrEmpty(line2))
+                {
+                    s2 = TextRenderer.MeasureText(line2, body, new Size(inner, MeasureMax),
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.WordBreak);
+                }
 
-                TextFormatFlags mf = TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding
-                                   | TextFormatFlags.SingleLine;
-                Size s1 = TextRenderer.MeasureText(line1, first,
-                    new Size(int.MaxValue, int.MaxValue), mf);
-                Size s2 = TextRenderer.MeasureText(line2, body,
-                    new Size(int.MaxValue, int.MaxValue), mf);
+                int w = Math.Min(Math.Max(s1.Width, s2.Width) + InsetX * 2, cap);
+                int h = s1.Height + (line2 == null ? 0 : LineGap) + s2.Height + InsetY * 2;
+                // +2：给边框和取整留一点余量，宁可略大不可略小（略大只是难看，略小就是被切）
+                e.ToolTipSize = new Size(w + 2, h + 2);
 
-                e.ToolTipSize = new Size(
-                    Math.Max(s1.Width, s2.Width) + 12,
-                    s1.Height + s2.Height + 2 + 8);
+                Diag.Log("提示: 量到 \"" + line1 + "\" = " + (w + 2) + "x" + (h + 2)
+                         + "（首行 " + s1.Width + "x" + s1.Height
+                         + "，次行 " + s2.Width + "x" + s2.Height + "，上限 " + cap + "）");
             }
-            catch { }
+            catch (Exception ex) { Diag.Log("提示: 量尺寸失败 " + ex.Message); }
         }
 
-        /// <summary>哪个提示的第一行该用粗体（没登记的就整块用 `e.Font`）。</summary>
+        /// <summary>提示框允许的最大宽度：屏幕放得下、也别长得过分（路径太长的部分靠折行）。</summary>
+        private static int MaxTipWidth(Control c)
+        {
+            int cap = Px(560);
+            try
+            {
+                Screen s = c == null ? null : Screen.FromControl(c);
+                if (s != null) cap = Math.Min(cap, s.WorkingArea.Width - Px(60));
+            }
+            catch { }
+            return Math.Max(Px(200), cap);
+        }
+
+        /// <summary>哪个提示的第一行该用粗体 / 第二行用哪套字体（没登记的就整块用 `e.Font`）。</summary>
         private static readonly Dictionary<ToolTip, Font> tipFirstLine = new Dictionary<ToolTip, Font>();
+        private static readonly Dictionary<ToolTip, Font> tipBody = new Dictionary<ToolTip, Font>();
+        private static readonly Dictionary<ToolTip, string> tipText = new Dictionary<ToolTip, string>();
 
         private static void OnTipDraw(object sender, DrawToolTipEventArgs e)
         {
@@ -418,19 +482,25 @@ namespace TabbedExplorer
                 using (Pen p = new Pen(border))
                     e.Graphics.DrawRectangle(p, r.Left, r.Top, r.Width - 1, r.Height - 1);
 
-                // 文字贴着边框内缩几个像素，别顶到线上
-                Rectangle tr = new Rectangle(r.Left + 6, r.Top + 4,
-                                             Math.Max(1, r.Width - 12), Math.Max(1, r.Height - 8));
+                // 文字贴着边框内缩几个像素，别顶到线上（数字和 OnTipPopup 里那套必须一致）
+                Rectangle tr = new Rectangle(r.Left + InsetX, r.Top + InsetY,
+                                             Math.Max(1, r.Width - InsetX * 2),
+                                             Math.Max(1, r.Height - InsetY * 2));
 
                 string text = e.ToolTipText ?? "";
                 ToolTip src = sender as ToolTip;
-                Font first = null;
-                if (src != null) tipFirstLine.TryGetValue(src, out first);
+                Font first = null, body = null;
+                if (src != null)
+                {
+                    tipFirstLine.TryGetValue(src, out first);
+                    tipBody.TryGetValue(src, out body);
+                }
+                if (body == null) body = e.Font;
 
                 int br = text.IndexOf("\r\n", StringComparison.Ordinal);
                 if (first == null || br < 0)
                 {
-                    TextRenderer.DrawText(e.Graphics, text, first ?? e.Font, tr, fore,
+                    TextRenderer.DrawText(e.Graphics, text, first ?? body, tr, fore,
                         TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
                         TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
                     return;
@@ -439,15 +509,16 @@ namespace TabbedExplorer
                 // 两行：第一行（文件夹名）用粗体，后面（完整路径）用细体
                 string line1 = text.Substring(0, br);
                 string line2 = text.Substring(br + 2);
-                Size s1 = TextRenderer.MeasureText(line1, first, new Size(tr.Width, 0),
+                Size s1 = TextRenderer.MeasureText(line1, first, new Size(tr.Width, MeasureMax),
                     TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                // 名字特别长（超过我们给的上限）用省略号收尾，别硬切一半看着像坏了
                 TextRenderer.DrawText(e.Graphics, line1, first,
                     new Rectangle(tr.Left, tr.Top, tr.Width, Math.Max(1, s1.Height)), fore,
                     TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
-                    TextFormatFlags.NoPadding);
-                TextRenderer.DrawText(e.Graphics, line2, e.Font,
-                    new Rectangle(tr.Left, tr.Top + s1.Height + 2,
-                                  tr.Width, Math.Max(1, tr.Height - s1.Height - 2)), fore,
+                    TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+                TextRenderer.DrawText(e.Graphics, line2, body,
+                    new Rectangle(tr.Left, tr.Top + s1.Height + LineGap,
+                                  tr.Width, Math.Max(1, tr.Height - s1.Height - LineGap)), fore,
                     TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix |
                     TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
             }

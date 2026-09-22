@@ -193,7 +193,7 @@ namespace TabbedExplorer
             tips.ReshowDelay = 80;
             tips.AutoPopDelay = 8000;
             tips.ShowAlways = true;     // 见字段注释：不开的话窗口没激活就不弹
-            Theme.StyleTip(tips, tipTitleFont);   // 背景 / 字体跟着颜色模式；名字那行加粗
+            Theme.StyleTip(tips, tipTitleFont, titleFont);   // 名字那行粗体、路径行常规（量尺寸也要按粗体量）
             Theme.Changed += delegate { BackColor = BarBack; tips.BackColor = Theme.MenuBack; tips.ForeColor = Theme.Text; Invalidate(); };
         }
 
@@ -717,6 +717,8 @@ namespace TabbedExplorer
             tipKey = key;
             if (key == null) { tips.Hide(this); return; }
             if (anchor.Right > Width) anchor.X = Math.Max(0, Width - anchor.Width - Px(40));
+            // 先把「马上要显示的原文」交给 Theme（它自己量尺寸得知道原文，见 Theme.TipText）
+            Theme.TipText(tips, text);
             tips.Show(text, this, anchor.Left, anchor.Bottom + Px(2), 8000);
         }
 

@@ -72,15 +72,74 @@ namespace TabbedExplorer
             for (int i = 0; i < mi.MenuItems.Count; i++) Hook(mi.MenuItems[i]);
         }
 
+        /// <summary>
+        /// 量菜单项。
+        ///
+        /// ⚠⚠ **宽度也必须自己给** —— 这是川 2026-09-22 报的「所有右键菜单显示不全」的根因。
+        /// WinForms 拿 `ItemWidth` / `ItemHeight` 去定菜单尺寸，而 `MeasureItemEventArgs` 的初值是 **0**；
+        /// 只填高度、宽度留 0 ⇒ 菜单项窄成一条 ⇒ 文字被截。
+        /// （老版本没自绘、由系统量，所以不会 —— 自绘是这一批新加的。）
+        ///
+        /// 宽度**整张菜单取同一个值**（取最宽那一项）而不是各算各的：
+        /// 自绘项的矩形就是它自己报的宽度，各不相同的话选中/hover 那块底色会一块宽一块窄，很难看。
+        /// </summary>
         private static void OnMeasure(object sender, MeasureItemEventArgs e)
         {
             try
             {
                 MenuItem mi = sender as MenuItem;
-                bool sep = (mi != null && IsSeparator(mi));
-                e.ItemHeight = sep ? Px(9) : Px(24);
+                if (mi == null) return;
+                e.ItemWidth = MenuWidth(mi);
+                e.ItemHeight = IsSeparator(mi) ? Px(9) : Px(24);
             }
             catch { }
+        }
+
+        /// <summary>这张菜单该多宽：固定勾选列 + 最宽的文字 + （有子菜单时的箭头位）+ 右边距。</summary>
+        private static int MenuWidth(MenuItem mi)
+        {
+            Menu m = mi.Parent;
+            int textW = 0;
+            bool anyKids = false;
+
+            if (m != null)
+            {
+                for (int i = 0; i < m.MenuItems.Count; i++)
+                {
+                    MenuItem it = m.MenuItems[i];
+                    if (it == null || IsSeparator(it)) continue;
+                    if (it.MenuItems.Count > 0) anyKids = true;
+                    int w = TextW(it.Text);
+                    if (w > textW) textW = w;
+                }
+            }
+            else
+            {
+                anyKids = mi.MenuItems.Count > 0;
+                textW = TextW(mi.Text);
+            }
+
+            return Px(CheckCol) + textW + (anyKids ? Px(18) : Px(6)) + Px(10);
+        }
+
+        private static int TextW(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return 0;
+            Size s = TextRenderer.MeasureText(text, MenuFont(), new Size(4096, 4096),
+                TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            return s.Width;
+        }
+
+        /// <summary>
+        /// 菜单文字用的字体 —— **量的时候和画的时候必须是同一套**，
+        /// 所以不用 `DrawItemEventArgs.Font`（那是系统/父控件的字体，跟我们对不上就会量少了 ⇒ 又被截）。
+        /// </summary>
+        private static Font menuFont;
+        private static Font MenuFont()
+        {
+            if (menuFont == null)
+                menuFont = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
+            return menuFont;
         }
 
         private static bool IsSeparator(MenuItem mi)
@@ -130,7 +189,7 @@ namespace TabbedExplorer
                 int arrowW = hasKids ? Px(18) : Px(6);
                 Rectangle tr = new Rectangle(r.Left + col, r.Top,
                                              Math.Max(1, r.Width - col - arrowW), r.Height);
-                TextRenderer.DrawText(g, mi.Text, e.Font, tr,
+                TextRenderer.DrawText(g, mi.Text, MenuFont(), tr,
                     dis ? Theme.TextDim : Theme.Text,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);

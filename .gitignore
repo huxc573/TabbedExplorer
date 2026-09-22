@@ -1,0 +1,18 @@
+# 构建产物
+TabbedExplorer.exe
+TabbedExplorer.new.exe
+build.log
+build.log.prev
+*.pdb
+*.user
+.vs/
+bin/
+obj/
+
+# 探针留下的截图 / 记录（源码 probe/*.py 要进库，图不进）
+*.png
+probe/*.log
+probe/*.txt
+
+# 本机临时
+*.tmp

@@ -1,0 +1,241 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace TabbedExplorer
+{
+    /// <summary>
+    /// 深浅色：跟随系统「设置 - 个性化 - 颜色 - 应用模式」。
+    /// 我们自己的绘制全部按这里的调色板来；
+    /// shell 那一块（文件列表）用 SetWindowTheme("DarkMode_Explorer") 尽量带暗，
+    /// Win10 没给第三方宿主公开的变暗接口，带不动就保持原样、不报错。
+    /// </summary>
+    internal static class Theme
+    {
+        public static bool IsDark;
+
+        // ---- 外壳 ----
+        public static Color TabBar;      // 标签条底
+        public static Color TabActive;   // 选中标签底
+        public static Color RibbonBack;  // 功能区底
+        public static Color RibbonGroup; // 命令区底（与标签条区分）
+        public static Color Text;
+        public static Color TextDim;
+        public static Color Border;
+        public static Color Hover;
+        public static Color Press;
+        public static Color Accent;      // Win10 蓝
+        public static Color Pane;        // 地址栏/内容底
+        public static Color InputBack;   // 输入框底
+        public static Color StatusBack;
+        public static Color NavBack;
+        public static Color MenuBack;
+        public static Color MenuHover;
+        public static Color MenuBorder;
+
+        public static event EventHandler Changed;
+
+        static Theme()
+        {
+            Reload();
+        }
+
+        /// <summary>读注册表决定深浅，并重算调色板。返回是否发生了变化。</summary>
+        public static bool Reload()
+        {
+            bool dark = ReadSystemDark();
+            bool changed = (dark != IsDark) || !initialized;
+            IsDark = dark;
+            initialized = true;
+
+            if (dark)
+            {
+                // 参照 Win10 深色资源管理器
+                // 标签条底 = 纯黑：和 explorer 自己的功能区（命令栏那一行，「文件/主页/共享/查看」）
+                // 取同一个色，两块拼起来才是连续的一整片（川：标签也不够黑，要和查看那一页一样黑）。
+                TabBar = Color.FromArgb(0, 0, 0);
+                TabActive = Color.FromArgb(51, 51, 51);
+                RibbonBack = Color.FromArgb(43, 43, 43);
+                RibbonGroup = Color.FromArgb(51, 51, 51);
+                Text = Color.FromArgb(240, 240, 240);
+                TextDim = Color.FromArgb(165, 165, 165);
+                Border = Color.FromArgb(70, 70, 70);
+                Hover = Color.FromArgb(66, 66, 66);
+                Press = Color.FromArgb(82, 82, 82);
+                Accent = Color.FromArgb(76, 194, 255);
+                Pane = Color.FromArgb(32, 32, 32);
+                InputBack = Color.FromArgb(43, 43, 43);
+                StatusBack = Color.FromArgb(32, 32, 32);
+                NavBack = Color.FromArgb(43, 43, 43);
+                MenuBack = Color.FromArgb(43, 43, 43);
+                MenuHover = Color.FromArgb(62, 62, 62);
+                MenuBorder = Color.FromArgb(70, 70, 70);
+            }
+            else
+            {
+                TabBar = Color.FromArgb(243, 243, 243);
+                TabActive = Color.FromArgb(249, 249, 249);
+                RibbonBack = Color.FromArgb(243, 243, 243);
+                RibbonGroup = Color.FromArgb(249, 249, 249);
+                Text = Color.FromArgb(30, 30, 30);
+                TextDim = Color.FromArgb(108, 108, 108);
+                Border = Color.FromArgb(219, 219, 219);
+                Hover = Color.FromArgb(229, 229, 229);
+                Press = Color.FromArgb(213, 213, 213);
+                Accent = Color.FromArgb(0, 120, 212);
+                Pane = Color.White;
+                InputBack = Color.White;
+                StatusBack = Color.FromArgb(243, 243, 243);
+                NavBack = Color.FromArgb(243, 243, 243);
+                MenuBack = Color.FromArgb(249, 249, 249);
+                MenuHover = Color.FromArgb(225, 235, 245);
+                MenuBorder = Color.FromArgb(200, 200, 200);
+            }
+            return changed;
+        }
+
+        private static bool initialized;
+
+        public static void RaiseChanged()
+        {
+            EventHandler h = Changed;
+            if (h != null) h(null, EventArgs.Empty);
+        }
+
+        private static bool ReadSystemDark()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    if (k == null)
+                    {
+                        Diag.Log("Theme: Personalize 子键打不开，按浅色处理");
+                        return false;
+                    }
+                    object v = k.GetValue("AppsUseLightTheme");
+                    if (v == null)
+                    {
+                        Diag.Log("Theme: AppsUseLightTheme 值不存在，按浅色处理");
+                        return false;
+                    }
+                    // 值类型不一定是 int（也可能是 string / long），统一转一下再判，
+                    // 之前用 `v is int` 一旦类型不符就静默退化成浅色，很难查。
+                    int n = Convert.ToInt32(v.ToString());
+                    Diag.Log("Theme: AppsUseLightTheme=" + n
+                             + " (CLR 类型 " + v.GetType().Name + ") -> dark=" + (n == 0));
+                    return n == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("Theme: 读注册表失败 " + ex.Message);
+            }
+            return false;
+        }
+
+        // ==================================================================
+        // 深色标题栏
+        // ==================================================================
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        public static void ApplyTitleBar(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                int v = IsDark ? 1 : 0;
+                // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE（1809+）；老版本用 19
+                if (DwmSetWindowAttribute(hwnd, 20, ref v, 4) != 0)
+                    DwmSetWindowAttribute(hwnd, 19, ref v, 4);
+            }
+            catch { }
+        }
+
+        // ==================================================================
+        // 尽量把 shell 自己的窗口带暗
+        // ==================================================================
+        public static void StyleShellWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                string sub = IsDark ? "DarkMode_Explorer" : "Explorer";
+                NativeMethods.SetWindowTheme(hwnd, sub, null);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 把 shell 视图整棵子窗口树带暗。顺序很重要：
+        /// 先 AllowDarkModeForWindow（逐窗口授权），再 SetWindowTheme（它本身会触发
+        /// WM_THEMECHANGED 重新取主题，不用我们手动发）。
+        ///
+        /// 只对最外层 SetWindowTheme 的话，真正画文件列表的 DirectUIHWND 那一层
+        /// 仍按浅色画 —— 表现就是「外框/导航窗格变深了、文件列表还是白的」，
+        /// 也就是用户截图里那个现象。
+        /// </summary>
+        public static void StyleShellTree(IntPtr root)
+        {
+            if (root == IntPtr.Zero) return;
+            try
+            {
+                AllowAndTheme(root);
+                List<IntPtr> all = WinFind.All(root);
+                for (int i = 0; i < all.Count; i++) AllowAndTheme(all[i]);
+                Diag.Log("Theme: shell 子窗口上色 " + (all.Count + 1) + " 个，dark=" + IsDark);
+            }
+            catch { }
+        }
+
+        private static void AllowAndTheme(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            DarkMode.AllowWindow(h);
+            StyleShellWindow(h);
+        }
+
+        // ==================================================================
+        // 弹出菜单配色
+        // ==================================================================
+        private sealed class Palette : ProfessionalColorTable
+        {
+            public override Color ToolStripDropDownBackground { get { return MenuBack; } }
+            public override Color MenuItemSelected { get { return MenuHover; } }
+            public override Color MenuItemSelectedGradientBegin { get { return MenuHover; } }
+            public override Color MenuItemSelectedGradientEnd { get { return MenuHover; } }
+            public override Color MenuItemBorder { get { return MenuBorder; } }
+            public override Color MenuBorder { get { return MenuBorder; } }
+            public override Color ImageMarginGradientBegin { get { return MenuBack; } }
+            public override Color ImageMarginGradientMiddle { get { return MenuBack; } }
+            public override Color ImageMarginGradientEnd { get { return MenuBack; } }
+            public override Color SeparatorDark { get { return Border; } }
+            public override Color SeparatorLight { get { return Border; } }
+        }
+
+        public static void StyleMenu(ContextMenuStrip menu)
+        {
+            if (menu == null) return;
+            menu.Renderer = new ToolStripProfessionalRenderer(new Palette());
+            menu.BackColor = MenuBack;
+            menu.ForeColor = Text;
+            for (int i = 0; i < menu.Items.Count; i++) StyleMenuItem(menu.Items[i]);
+        }
+
+        private static void StyleMenuItem(ToolStripItem it)
+        {
+            if (it == null) return;
+            it.ForeColor = Text;
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi != null && mi.DropDownItems.Count > 0)
+            {
+                for (int i = 0; i < mi.DropDownItems.Count; i++) StyleMenuItem(mi.DropDownItems[i]);
+            }
+        }
+    }
+}

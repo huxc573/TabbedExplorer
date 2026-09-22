@@ -140,13 +140,33 @@ namespace TabbedExplorer
             Diag.Step("历史: 已清空");
         }
 
+        /// <summary>删掉一条（历史管理器里用）。返回有没有删到。只动 json，磁盘上不碰。</summary>
+        public static bool Remove(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            EnsureLoaded();
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (PathRules.Same(items[i], path))
+                {
+                    items.RemoveAt(i);
+                    Save();
+                    Diag.Step("历史: 删掉一条 " + path);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /// <summary>
         /// 拼出「历史记录」那份菜单 —— 走 `PopMenu`。
         /// 2026-09-22 从老的 `ContextMenu`/`MenuItem` 换过来：那条路上**点条目不触发 Click**
         /// （川报的「历史记录点开后所有功能都不可用」），原因见 `PopMenu` 类注释。
         /// `open == null` 的条目就是灰着的标题/说明行。
+        /// `openManager` = 「打开历史记录管理器」（川 2026-09-22 把原来那条「打开历史记录文件」换成了它 ——
+        /// 直接把 json 丢给记事本太糙，管理器里能搜、能挑、能手删）。
         /// </summary>
-        public static PopItem[] BuildMenu(Action<string> open)
+        public static PopItem[] BuildMenu(Action<string> open, Action openManager)
         {
             List<PopItem> r = new List<PopItem>();
             List<string> list = Recent;
@@ -173,13 +193,8 @@ namespace TabbedExplorer
             }
 
             r.Add(PopMenu.Split());
-            // 直接打开那个 json（系统默认程序），比弹一个「在资源管理器里定位」省事，
-            // 也避免我们自己又去起一个 explorer 窗口被自己的捕获逻辑再抓一遍。
-            r.Add(PopMenu.It("打开历史记录文件", delegate
-            {
-                try { System.Diagnostics.Process.Start(FileName); }
-                catch (Exception ex) { Toast.Show("打不开历史文件", ex.Message); }
-            }));
+            // 川 2026-09-22：「打开历史记录文件」改成「打开历史记录管理器」（界面模仿书签管理器）。
+            r.Add(PopMenu.It("打开历史记录管理器", openManager));
             r.Add(PopMenu.It("清空历史记录", delegate
             {
                 Clear();

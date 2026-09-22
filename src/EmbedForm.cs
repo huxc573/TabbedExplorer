@@ -1295,7 +1295,10 @@ namespace TabbedExplorer
         private void ShowHistoryMenu()
         {
             if (IsDisposed || Disposing) return;
-            ShowPopupAtTool(TabStrip.Tool.History, History.BuildMenu(OpenFromHistory), "历史记录");
+            ShowPopupAtTool(TabStrip.Tool.History,
+                History.BuildMenu(OpenFromHistory,
+                    delegate { if (hub != null) hub.OpenHistoryManager(); }),
+                "历史记录");
         }
 
         /// <summary>

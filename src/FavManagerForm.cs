@@ -49,10 +49,19 @@ namespace TabbedExplorer
 
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
-        private const int TopH = 40;         // 顶部动作条
-        private const int LeftW = 250;       // 左树宽度
-        private const int TreeRowH = 26;
-        private const int ListRowH = 30;
+        // ⚠ 这几个原来是**裸像素**（没乘 DPI）—— 150% 下整张窗口挤成一团：
+        //   顶部动作条（TopH=40 设备像素 = 26 逻辑像素）装不下高 Px(26)=39 的按钮，按钮溢到标题行上；
+        //   行高 26/30 设备像素也只有 17/20 逻辑像素，文字上下贴边。
+        //   2026-09-22 川报的「无图标 + 文字堆叠错位」是两个毛病叠在一起：
+        //   ① 小标题（“收藏夹” / 选中文件夹名）画在 `TopH + Px(4)`，第一行却从 `TopH + Px(6)` 开始
+        //      ⇒ 两者**同一行**，字压字（截图里“收藏夹收藏夹栏（收藏…”、“新建文件夹新建文件夹”）；
+        //   ② 行离谱地矮。现在一律走 Px()，并给小标题留出 CaptionH。
+        private static int TopH { get { return Px(40); } }        // 顶部动作条
+        private static int LeftW { get { return Px(250); } }      // 左树宽度
+        private static int TreeRowH { get { return Px(26); } }
+        private static int ListRowH { get { return Px(30); } }
+        /// <summary>小标题（左树 / 右列各一条）占的高度 —— 行必须从它下面开始，不然字压字。</summary>
+        private static int CaptionH { get { return Px(26); } }
 
         private readonly List<Row> treeRows = new List<Row>();
         private readonly List<Row> listRows = new List<Row>();
@@ -75,6 +84,7 @@ namespace TabbedExplorer
             this.getFavBar = getFavBar;
 
             Text = "管理收藏夹";
+            Icon = ShellIcon.AppIcon(false);   // 标题栏 / Alt+Tab 用程序自己的图标（原来这里是空的）
             FormBorderStyle = FormBorderStyle.Sizable;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(Px(880), Px(560));
@@ -203,12 +213,12 @@ namespace TabbedExplorer
             if (sel == null) sel = FavStore.BarFolder;
 
             // 左树：拍平（收起来的文件夹不展开）
-            int y = TopH + Px(6);
+            int y = TopH + CaptionH;
             FavNode[] roots = FavStore.Tree;
             for (int i = 0; i < roots.Length; i++) Flatten(roots[i], 0, ref y);
 
             // 右列：某个文件夹的孩子，或者（搜索时）全树的过滤结果
-            y = TopH + Px(6);
+            y = TopH + CaptionH;
             if (filter.Length > 0)
             {
                 List<FavNode> hits = new List<FavNode>();
@@ -313,7 +323,7 @@ namespace TabbedExplorer
 
             if (listRows.Count == 0)
                 TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的收藏" : "这个文件夹里还没有收藏（拖文件夹进来，或点上面的「添加」）",
-                    fontDim, new Rectangle(LeftW + Px(14), TopH + Px(40), Math.Max(1, Width - LeftW - Px(30)), Px(24)),
+                    fontDim, new Rectangle(LeftW + Px(14), TopH + CaptionH + Px(6), Math.Max(1, Width - LeftW - Px(30)), Px(24)),
                     Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.NoPadding);
         }
 

@@ -19,6 +19,7 @@ namespace TabbedExplorer
             using (Form f = new Form())
             {
                 f.Text = title;
+                f.Icon = ShellIcon.AppIcon(false);   // 也带上程序图标（原来标题栏是空的）
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.MinimizeBox = false;
                 f.MaximizeBox = false;

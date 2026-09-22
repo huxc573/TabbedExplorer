@@ -273,6 +273,7 @@ namespace TabbedExplorer
             Location = new Point(x, y);
         }
 
+        /// <summary>抢鼠标捕获 + 挂看门狗。可以重复调用（自愈时会再调一次）。</summary>
         private void BeginCapture()
         {
             try
@@ -286,10 +287,57 @@ namespace TabbedExplorer
 
             // 看门狗：捕获被别人抢走（外来子窗口、输入法、别的程序）我们就收摊 ——
             // 没有它的话，一旦丢了捕获，这份菜单就永远关不掉了（「菜单粘在屏幕上」的经典死法）。
-            watch = new Timer();
-            watch.Interval = 250;
-            watch.Tick += delegate { if (root == this && !Capture) CloseAll(true); };
-            watch.Start();
+            if (watch == null)
+            {
+                watch = new Timer();
+                watch.Interval = 250;
+                watch.Tick += delegate { Watchdog(); };
+                watch.Start();
+            }
+        }
+
+        /// <summary>自愈次数（只抢回来几次，真抢不到就别死循环）。</summary>
+        private int healTries;
+
+        /// <summary>
+        /// 看门狗：捕获没了就收摊（不然菜单关不掉 = 粘在屏幕上）。
+        ///
+        /// ⚠ 但「捕获没了」有两种，得分清（2026-09-22 川报「点历史图标，菜单闪一下就没了」）：
+        ///   · **真的被别的窗口抢走了** → 该关（这时鼠标通常已经不在菜单上）。
+        ///   · **系统在松开按键的那一瞬间收走的** —— 我们的菜单窗口不是前台窗口，
+        ///     Windows 只允许「有按键按着的时候」抓着鼠标捕获；在「按着按钮弹菜单」的那条路上，
+        ///     松手会把捕获带走，但**鼠标还在菜单里、用户正要挑条目**。这种不能关，得抢回来。
+        /// （根治还是得让调用方「松手之后再弹菜单」，但看门狗这里也要宽容一点，
+        ///   否则以后再有别的入口在按下时弹，会以一模一样的症状再发作一次。）
+        /// </summary>
+        private void Watchdog()
+        {
+            if (root != this) return;
+            if (Capture) return;
+
+            Point m;
+            try { m = Cursor.Position; } catch { m = new Point(int.MinValue, int.MinValue); }
+
+            if (ContainsScreen(m) && healTries < 3)
+            {
+                healTries++;
+                Diag.Log("菜单: 捕获被收走，鼠标还在菜单里 -> 抢回来（第 " + healTries + " 次）");
+                BeginCapture();
+                return;
+            }
+
+            Diag.Log("菜单: 捕获丢了且鼠标不在菜单里，收摊（" + (openWhat ?? "") + "）");
+            CloseAll(true);
+        }
+
+        /// <summary>屏幕坐标是不是落在这一摞菜单的任意一层里。</summary>
+        private static bool ContainsScreen(Point p)
+        {
+            for (PopMenuWindow w = root; w != null; w = w.child)
+            {
+                try { if (w.Bounds.Contains(p)) return true; } catch { }
+            }
+            return false;
         }
 
         /// <summary>关掉整摞菜单。<paramref name="runPending"/> = 关完要不要执行选中那项的动作。</summary>

@@ -82,6 +82,11 @@ namespace TabbedExplorer
         private bool blankDrag;
         /// <summary>空白处按下的位置（拖窗口前要比一下走了多远）。</summary>
         private Point blankFrom;
+        /// <summary>
+        /// 按在右侧功能按钮上、但**还没松手**的那一颗。
+        /// 功能按钮的事件只在松手时发（见 OnMouseUp 里那段「为什么不能在这一刻响应」）。
+        /// </summary>
+        private int pendingTool = -1;
 
         // 位置全部由 EnsureLayout 算（标签数 / 窗口宽 / 右侧那排按钮都会变）。
         private Rectangle newRect;
@@ -674,7 +679,8 @@ namespace TabbedExplorer
                 TextRenderer.DrawText(g, tabs[i].Title, titleFont,
                     new Rectangle(textLeft, tab.Top, textW, tab.Height), c1,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding |
+                    TextFormatFlags.PreserveGraphicsClipping);
 
                 if (showClose && roomForClose)
                 {
@@ -764,18 +770,23 @@ namespace TabbedExplorer
         /// <summary>
         /// 算滚动条的**轨道 / 滑块**矩形（没溢出就返回 false）。
         /// ⚠ 画和命中判定都走这一份 —— 两处各算一次的话，看到的滑块和点得着的滑块迟早会差几个像素。
-        /// 轨道 = 标签区宽度，滑块宽 = 「看得见的那一段 / 全部」的比例，滑块位置 = 滚到哪儿了。
+        /// 轨道 = **整条标签条的宽度、贴在最顶上**（川 2026-09-22 指定），
+        /// 滑块宽 = 「看得见的那一段 / 全部」的比例，滑块位置 = 滚到哪儿了。
         /// </summary>
         private bool LayoutScrollBar(out Rectangle track, out Rectangle thumb)
         {
             track = Rectangle.Empty; thumb = Rectangle.Empty;
             if (maxScroll <= 0 || tabs.Count < 2) return false;
-            int x0 = Px(2);
-            int w = tabsClipRight - x0 - Px(2);
+
+            // 川 2026-09-22：挪到**顶部**、并且**拉满整条标签条的宽度**
+            // （原来是压在标签底下、只占标签区）。平时不显示（`DrawScrollBar` 里判 `pointerIn`），
+            // 所以压住选中标签那条蓝线不影响观感。
+            int x0 = 0;
+            int w = Width;
             if (w < Px(24)) return false;
 
-            int h = Math.Max(3, Px(5));
-            int y = Height - h - Math.Max(0, Px(1));
+            int h = Math.Max(3, Px(4));
+            int y = 0;
             track = new Rectangle(x0, y, w, h);
 
             int content = w + maxScroll;
@@ -792,7 +803,7 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 画标签溢出时那条横向滚动条（川 2026-09-22：**平时隐藏**，鼠标进标签条才显示；
-        /// 参考浏览器那个「细条压在内容底边」的做法）。
+        /// 位置在标签条**最顶上、拉满整条宽度** —— 川后来指定的，放底下不好找）。
         /// 没溢出 / 鼠标不在条里就不画 —— 没超出屏幕时画一条只会是干扰。
         /// </summary>
         private void DrawScrollBar(Graphics g)
@@ -997,7 +1008,9 @@ namespace TabbedExplorer
             base.OnMouseDown(e);
             ShowTip(null, null, Rectangle.Empty);
 
-            // ---- 滚动条优先：它压在标签底下那一条上，命中判定必须排在标签前面 ----
+            // ---- 滚动条优先：它现在是贴顶那一整条，命中判定必须排在标签 / 按钮前面 ----
+            // ⚠ 轨道拉满整宽之后，「窗口按钮顶上那 4 逻辑像素」也会被它吃掉（拖滚动 vs 点关闭）。
+            //   只有标签真的溢出（overflow）时才存在，代价可接受；不想吃就把轨道改成到 wbtn 左边为止。
             if (e.Button == MouseButtons.Left && overflow)
             {
                 Rectangle tr, th;
@@ -1038,8 +1051,10 @@ namespace TabbedExplorer
                 int t = ToolAt(e.Location);
                 if (t >= 0)
                 {
+                    // ⚠ **只记下来**，事件推迟到 OnMouseUp 再发 —— 见 OnMouseUp 里
+                    //   「为什么功能按钮不能在这一刻响应」。齿轮 / 历史 / 恢复 / 收藏夹栏都走这条路。
                     dragFromIndex = -1;
-                    if (ToolClicked != null) ToolClicked((Tool)t);
+                    pendingTool = t;
                     return;
                 }
             }
@@ -1083,6 +1098,23 @@ namespace TabbedExplorer
             {
                 barDrag = false;
                 Capture = false;
+                Invalidate();
+                return;
+            }
+
+            // ---- 功能按钮：**松手才发**（松手时鼠标还在同一颗按钮上才算一次点击）----
+            // ⚠ 2026-09-22 川报「点击历史记录图标，出菜单后闪一下就没了；按快捷键不会」。
+            //   根因：按钮原来在 **MouseDown** 里就发事件，菜单紧接着就弹出来了 —— 那一刻
+            //   **左键还按着**。我们的菜单窗口不是前台窗口，Windows 只允许「有按键按着的时候」
+            //   抓着鼠标捕获；用户一松手，捕获当场被系统收走，菜单的看门狗（250ms）以为捕获被
+            //   外人抢了，就把菜单收了（日志里每次都是 ~294ms 后一行「菜单: 关闭」，而快捷键
+            //   那条路没有按键参与，活得好好的）。
+            //   修法：跟右键那条一样，**等松手再弹** —— 松手时没有按键按着，捕获不会被收走。
+            if (pendingTool >= 0)
+            {
+                int t = pendingTool;
+                pendingTool = -1;
+                if (ToolAt(e.Location) == t && ToolClicked != null) ToolClicked((Tool)t);
                 Invalidate();
                 return;
             }

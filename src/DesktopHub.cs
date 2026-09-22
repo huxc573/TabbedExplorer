@@ -177,6 +177,7 @@ namespace TabbedExplorer
 
         private SettingsForm settingsForm;
         private FavManagerForm favManager;
+        private HistoryManagerForm historyManager;
 
         /// <summary>打开（或提到前面）设置窗口。齿轮、标签条空白右键、托盘菜单「更多选项」都走这儿。</summary>
         public void OpenSettings()
@@ -235,6 +236,38 @@ namespace TabbedExplorer
                 else favManager.Show();
             }
             catch (Exception ex) { Diag.Log("Hub: 打开收藏夹管理器失败 " + ex); }
+        }
+
+        /// <summary>
+        /// 打开（或提到前面）**历史记录管理器**（川 2026-09-22：「打开历史记录文件」改成它，
+        /// 界面模仿收藏夹管理器）。跟设置窗口 / 收藏夹管理器一样，全进程只开一个。
+        /// </summary>
+        public void OpenHistoryManager()
+        {
+            try
+            {
+                if (historyManager != null && !historyManager.IsDisposed)
+                {
+                    Diag.Step("Hub: 历史记录管理器已经开着 -> 提到前面");
+                    if (historyManager.WindowState == FormWindowState.Minimized)
+                        historyManager.WindowState = FormWindowState.Normal;
+                    historyManager.Activate();
+                    return;
+                }
+                Diag.Step("Hub: 打开历史记录管理器");
+                historyManager = new HistoryManagerForm();
+                // 管理器里双击一条 = 在当前窗口开一个新标签
+                historyManager.OpenPath += delegate(string p)
+                {
+                    EmbedForm f = ForegroundForm();
+                    if (f != null && !f.IsDisposed) f.OpenPathAsTab(p);
+                };
+                historyManager.FormClosed += delegate { historyManager = null; };
+                EmbedForm owner = ForegroundForm();
+                if (owner != null && !owner.IsDisposed) historyManager.Show(owner);
+                else historyManager.Show();
+            }
+            catch (Exception ex) { Diag.Log("Hub: 打开历史记录管理器失败 " + ex); }
         }
 
         // ==================================================================

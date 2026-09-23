@@ -80,10 +80,11 @@ namespace TabbedExplorer
         /// <summary>候选窗口要「晾」多久才收。够短，用户感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
         /// <summary>
-        /// shell 窗口「等地址栏填好」的上限：新窗口是先建出来再导航的，刚看见时地址栏还是空的。
-        /// 到点还读不出真路径就把它还回去（见 ReleaseIfAbandoned）—— 宁可保持原样，不能把它晾成隐形的。
+        /// shell 窗口「等地址栏填好」的上限。shell 通常是**先导航、再显示**，所以 SHOW 那一刻地址栏
+        /// 往往已经填好了（RegisterShellCandidate 里会当场试一次）。到点还读不出就当没这回事 ——
+        /// 我们本来就没碰过它，它还是那个正常窗口，用户自己关。
         /// </summary>
-        private const int ShellResolveMs = 2500;
+        private const int ShellResolveMs = 1200;
         private RegisteredWaitHandle sigWait;
         private RegisteredWaitHandle quitWait;
         private EventWaitHandle quitEvent;
@@ -421,9 +422,9 @@ namespace TabbedExplorer
                 if (quitting || h == IntPtr.Zero) return;
                 if (!Settings.CaptureAll) return;
                 // 桌面 shell 进程自己开的窗口：默认（v1.13.1 起）一个都不碰；
-                // 只有开了「接管 shell 打开的文件夹」才走另一条路 —— **不 SetParent 它**，
-                // 而是读出它要去哪个目录、把它关掉、用我们自己的 explorer 重开成标签（见 TakeOverShellWindow）。
-                // 这条路绕开了 v1.13.1 那个坑（收编 shell 的窗口会弄坏 Win+E / 开始菜单那条入口）。
+                // 只有开了「接管 shell 打开的文件夹」才走另一条路 —— **不 SetParent、也不改它的样式**，
+                // 只是读出它要去哪个目录、像用户点 × 一样关掉它，再用我们自己的 explorer 重开成标签
+                // （见 TakeOverShellWindow）。
                 bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
                 if (!shellTake && !IsHideCandidate(h)) return;
 
@@ -431,16 +432,33 @@ namespace TabbedExplorer
                 bool wasVisible = EmbedApi.IsWindowVisible(h);
                 bool isShow = (evt == WinShowWatcher.EVENT_OBJECT_SHOW);
 
-                // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE
-                EmbedApi.MakeTransparent(h);
-                bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
-                if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
+                if (shellTake)
+                {
+                    // ★ 实测教训（2026-09-24，川报「退出程序后 Win+E / 开始菜单打不开资源管理器」）：
+                    //   对 shell 的窗口**一个字节都不能改** —— 不置透明、不 SW_HIDE。
+                    //   shell 会预建一些浏览器窗口备着而根本不显示（探针实测到 `vis=0` 的 CabinetWClass），
+                    //   而防闪那层透明是在 CREATE 那一刻就上的；那个窗口永远不会 SHOW ⇒ 永远走不到「撕透明」，
+                    //   等于在 shell 进程里留了一个**隐形窗口**。Win+E 与开始菜单那条入口只去「激活」
+                    //   它自己的窗口、不新建 ⇒ 激活到一个隐形的就是「按下去毫无反应」，而且透明是加在
+                    //   shell 的窗口上的，退程序也不恢复。
+                    //   ⇒ shell 这条路上我们只读、只关，不碰样式；代价是那扇窗会可见一小会儿（见 TakeOverShellWindow）。
+                    Diag.Step(string.Format(
+                        "Hub: 新窗口 -> shell 自己的（不碰样式）（{0}，事件后 {1}ms）cab=0x{2:X}",
+                        isShow ? "SHOW" : "CREATE", react, h.ToInt64()));
+                }
+                else
+                {
+                    // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE
+                    EmbedApi.MakeTransparent(h);
+                    bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                    if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
 
-                Diag.Step(string.Format(
-                    "Hub: 新窗口 -> {0}（{1}，事件后 {2}ms，当时{3}）cab=0x{4:X}",
-                    hid ? "藏起来" : "SW_HIDE 没生效但已置为透明",
-                    isShow ? "SHOW" : "CREATE", react,
-                    wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
+                    Diag.Step(string.Format(
+                        "Hub: 新窗口 -> {0}（{1}，事件后 {2}ms，当时{3}）cab=0x{4:X}",
+                        hid ? "藏起来" : "SW_HIDE 没生效但已置为透明",
+                        isShow ? "SHOW" : "CREATE", react,
+                        wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
+                }
 
                 // 后面的账（pendingCapture / 起定时器）回 UI 线程做 —— 那两个是 UI 线程的状态
                 if (isShow) Post(delegate { if (shellTake) RegisterShellCandidate(h, react); else RegisterCandidate(h, react); });
@@ -545,9 +563,13 @@ namespace TabbedExplorer
         /// <summary>登记一个「等地址栏」的 shell 窗口（UI 线程）。</summary>
         private void RegisterShellCandidate(IntPtr h, int react)
         {
-            if (quitting || !Settings.CaptureAll || !Settings.CaptureShell) { ReleaseIfAbandoned(h); return; }
+            if (quitting || !Settings.CaptureAll || !Settings.CaptureShell) return;
             if (pendingShell.ContainsKey(h)) return;
-            if (!NativeMethods.IsWindow(h)) { ReleaseIfAbandoned(h); return; }
+            if (!NativeMethods.IsWindow(h)) return;
+            // 先当场试一次：shell 是先导航后显示，这一刻地址栏多半已经填好了 ——
+            // 能读出来就直线收，那扇窗在屏幕上只短暂露一下。
+            string now = EmbedApi.AddressPathOf(h);
+            if (now != null) { TakeOverShellWindow(h, now, react); return; }
             pendingShell[h] = new ShellCandidate { SeenAt = DateTime.Now, ReactMs = react };
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
         }
@@ -566,18 +588,16 @@ namespace TabbedExplorer
                 if (!NativeMethods.IsWindow(h))
                 {
                     pendingShell.Remove(h);
-                    UnmarkHidden(h);                    // 它自己没了（被关掉）——不用还
-                    continue;
+                    continue;                                 // 它自己没了（被关掉）——没什么可做的
                 }
                 string path = EmbedApi.AddressPathOf(h);
                 if (path == null)
                 {
-                    // 刚建出来的窗口地址栏还是空的（先建窗、后导航）—— 再看看，到点就放手
+                    // 还没填好地址栏（少见：正常是 SHOW 之前就填好了）—— 再看看，到点就不管它了
                     if ((now - kv.Value.SeenAt).TotalMilliseconds >= ShellResolveMs)
                     {
                         pendingShell.Remove(h);
-                        Diag.Step(string.Format("Hub: shell 开的窗口读不出路径，还给它 cab=0x{0:X}", h.ToInt64()));
-                        ReleaseIfAbandoned(h);
+                        Diag.Step(string.Format("Hub: shell 开的窗口读不出路径，不接管 cab=0x{0:X}", h.ToInt64()));
                     }
                     continue;
                 }
@@ -587,12 +607,15 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 「转生」：shell 进程开的文件夹窗口不归我们（不能 SetParent），但它的目标是我们的。
-        /// 读出目标目录 → 把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录开成标签。
-        /// 这样既拿到了标签，又没碰 shell 的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
+        /// 「转生」：shell 进程开的文件夹窗口不归我们（不能 SetParent、也不能改它的样式），但它的目标是我们的。
+        /// 读出目标目录 → **像用户点 × 一样**把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录
+        /// 开成标签。这样既拿到了标签，又没碰过它的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
         ///
-        /// ⚠ 先 `ClearTransparent` 再 `WM_CLOSE`：万一它不吃这一套（没关掉），界面上留下的是个**正常窗口**，
-        /// 而不是一个隐形窗口 —— 隐形窗口是最坏的结果（用户眼里就是「窗口没了，任务栏还留着」）。
+        /// 关它用 `WM_SYSCOMMAND`/`SC_CLOSE`（点 × 走的就是这条），不用手写 `WM_CLOSE` ——
+        /// 关一个**别人的**窗口，越接近正常操作越好（shell 那边可能还有它自己的账要结）。
+        ///
+        /// ⚠ 我们**没有**藏过它 / 置过透明（见 OnWindowShown 里那段教训），所以这里不需要任何还原动作；
+        ///   万一它没关掉，留在屏幕上的也是一个**正常窗口**，而不是隐形窗口。
         /// </summary>
         private void TakeOverShellWindow(IntPtr h, string path, int react)
         {
@@ -603,9 +626,7 @@ namespace TabbedExplorer
                 Diag.Step(string.Format(
                     "Hub: shell 开的文件夹 -> {0}（pid={1}，反应 {2}ms）=> 关掉它、用自己的标签重开",
                     path, EmbedApi.ProcessIdOf(h).ToInt32(), react));
-                try { EmbedApi.ClearTransparent(h); } catch { }
-                UnmarkHidden(h);
-                EmbedApi.PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);     // WM_CLOSE
+                EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);      // WM_SYSCOMMAND / SC_CLOSE
                 EmbedForm f = EnsureForm(d);
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
                 f.OpenPathAsTab(path);

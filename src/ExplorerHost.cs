@@ -205,6 +205,20 @@ namespace TabbedExplorer
         {
             if (disposed || embedded || pendingCab != IntPtr.Zero || cab == IntPtr.Zero) return;
 
+            // 兜底：桌面 shell 进程的窗口一律不接（理由见 EmbedApi.IsShellOwned）。
+            // Hub 那边已经在 IsHideCandidate / IsCapturable 挡了一道，这里再挡一次是因为
+            // 一旦漏过去，代价是「Win+E 和开始菜单那条打不开、退程序也不恢复」。
+            if (EmbedApi.IsShellOwned(cab))
+            {
+                Diag.Step("Embed: 属于 shell 进程的窗口，不接管 cab=0x" + cab.ToInt64().ToString("X"));
+                if (!EmbedApi.IsWindowVisible(cab))
+                {
+                    EmbedApi.ClearTransparent(cab);      // 万一已经被置成防闪透明，还它本来面目
+                    EmbedApi.ShowWindow(cab, EmbedApi.SW_SHOW);
+                }
+                return;
+            }
+
             // ⚠⚠ 这一步是**安全底线**，顺序不能动：
             // 接管的窗口多半属于**桌面那个 shell explorer 进程**。`KillOwnExplorer` 判「该不该杀」
             // 靠的就是 pidsBefore —— 先把当前所有 explorer pid 快照进来，那个 pid 就绝不会被列进
@@ -355,6 +369,10 @@ namespace TabbedExplorer
 
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return;
+
+            // shell 进程自己的窗口不能藏（见 EmbedApi.IsShellOwned）：藏一下就可能让它的
+            // 「打开资源管理器」（Win+E / 开始菜单那条）去激活一扇永远不会现身的窗口。
+            if (EmbedApi.IsShellOwned(h)) return;
 
             // 先藏再写日志（日志是文件 IO，虽然只有零点几毫秒，但防闪这种事越早越好）
             EmbedApi.ShowWindow(h, SW_HIDE);
@@ -692,8 +710,8 @@ namespace TabbedExplorer
         // ==================================================================
         public void Close(string why = "")
         {
-            Diag.Step(string.Format("Embed: Close({0}) cab=0x{1:X} pid={2} embedded={3}",
-                string.IsNullOrEmpty(why) ? "未说明" : why, CabWindow.ToInt64(), ExplorerPid, embedded));
+            Diag.Step(string.Format("Embed: Close({0}) cab=0x{1:X} pid={2} embedded={3} adopted={4}",
+                string.IsNullOrEmpty(why) ? "未说明" : why, CabWindow.ToInt64(), ExplorerPid, embedded, adopted));
             try { poll.Stop(); } catch { }
             try { titlePoll.Stop(); } catch { }
             try { settle.Stop(); } catch { }
@@ -703,6 +721,11 @@ namespace TabbedExplorer
             if (CabWindow != IntPtr.Zero) EmbedApi.Release(CabWindow);
             if (pendingCab != IntPtr.Zero) EmbedApi.Release(pendingCab);
             pendingCab = IntPtr.Zero;   // 还没嵌进来就被关掉：下面 KillOwnExplorer 用 ExplorerPid 收进程
+
+            // 关这条标签时「能不能把它的 explorer 进程也一起结束」。
+            // 这里只给个兜底值（还没嵌进来就被关掉的那种）；下面那个 if 里会按
+            // 「这个进程除了这个窗口还剩什么」重算 —— 见 EmbedApi.ExplorerHasOtherWindows 的注释。
+            bool killSafe = ExplorerPid != 0 && !pidsBefore.Contains(ExplorerPid);
 
             // 先还原成顶层窗口，再结束进程 —— 避免窗口还挂在我们容器里就被销毁
             if (embedded && CabWindow != IntPtr.Zero)
@@ -735,8 +758,13 @@ namespace TabbedExplorer
                 //     有时会落在**启动前就存在的 explorer 进程**里（很可能就是桌面那个 shell）。
                 //     之前这种情况只把窗口还原成顶层就完事，结果是：关掉标签，桌面上留一个孤零零的
                 //     资源管理器窗口（累积下来还会进下一次启动的「基线」，看着莫名其妙）。
-                bool willKill = !adopted && ExplorerPid != 0 && !pidsBefore.Contains(ExplorerPid);
-                if (!willKill)
+                // 窗口刚被交还给桌面，所以判「还剩什么窗口」时要把它自己排除掉（except 传 CabWindow）。
+                // ⚠ 判据从「这个 pid 是不是我启动前就有的」换成「它除了这个窗口还剩什么」：
+                //   `explorer.exe /n,/separate` 起窗口时系统会把请求**转交给已存在的 explorer 进程**，
+                //   那种老进程按老判据永远判「不能杀」⇒ 窗口关了、进程留着 ⇒ 下次又被复用、越积越多，
+                //   最后让 Win+E / 开始菜单那条「文件资源管理器」按下去没反应。
+                killSafe = ExplorerPid != 0 && !EmbedApi.ExplorerHasOtherWindows(ExplorerPid, CabWindow);
+                if (!killSafe)
                 {
                     try
                     {
@@ -750,7 +778,7 @@ namespace TabbedExplorer
             CabWindow = IntPtr.Zero;
             addressBand = IntPtr.Zero;
             currentPath = null;
-            KillOwnExplorer();
+            KillOwnExplorer(killSafe);
         }
 
         /// <summary>
@@ -781,15 +809,19 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 只结束「我们自己起的、且不在启动前列表里」的 explorer 进程。
-        /// 这个判断是**安全底线**：万一 /separate 没生效、窗口是主 explorer 进程的，
-        /// 杀了它整个桌面都会重启。
+        /// 结束这条标签的 explorer 进程。能不能杀由调用方算好（`Close` 里的 `killSafe`，判据见
+        /// <see cref="EmbedApi.ExplorerHasOtherWindows"/>），这里只管杀。
+        ///
+        /// **安全底线**：万一 `/separate` 没生效、窗口其实落在**桌面那个 shell 进程**里，
+        /// 杀了它整个桌面（任务栏、图标）都会重启 —— 所以判据是「这个进程有没有
+        /// `Shell_TrayWnd` / `Progman`、有没有别的 `CabinetWClass`」，而不是「这个 pid
+        /// 是不是我启动前就存在的」（老判据对 `/separate` 转交到的老进程会永远判成不能杀）。
         /// </summary>
-        private void KillOwnExplorer()
+        private void KillOwnExplorer(bool safe)
         {
             int pid = ExplorerPid;
             ExplorerPid = 0;
-            if (pid == 0 || pidsBefore.Contains(pid)) return;
+            if (pid == 0 || !safe) return;
             try
             {
                 Process p = Process.GetProcessById(pid);

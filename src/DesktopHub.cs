@@ -317,7 +317,8 @@ namespace TabbedExplorer
 
         private void SetupCapture()
         {
-            EmbedApi.SnapshotBaseline();          // 先记下「现在就已经开着的」，这些不算新开
+            SweepStrayExplorers();                // 先把上次没退干净留下的 explorer 进程清掉（见方法注释）
+            EmbedApi.SnapshotBaseline();          // 再记下「现在就已经开着的」，这些不算新开
 
             // 候选窗口先搁一下再收 —— 见 TryCapture 里那段说明。
             captureTimer = new System.Windows.Forms.Timer();
@@ -330,6 +331,39 @@ namespace TabbedExplorer
             //   详见 WinShowWatcher 类注释里那段「为什么 Hub 那条非要另起线程」。
             captureWatch.StartDedicated("TabbedExplorer.CaptureWatch");
             Diag.Step("Hub: 已开始监听「新打开的文件夹窗口」（专用线程，延迟 " + CaptureDelayMs + "ms 接收）");
+        }
+
+        /// <summary>
+        /// 清一次「上次没退干净」留下的 explorer 进程。
+        ///
+        /// 正常退出时每个标签都会在 `ExplorerHost.Close` 里收掉自己的进程，只有**闪退**
+        /// （未处理异常 / 被强杀）来不及收。留下的那些进程「活着但一个窗口都没有」，
+        /// 会让 shell 的「打开资源管理器」（Win+E、开始菜单里那条）去**激活一个不存在的窗口**
+        /// —— 表现就是按下去什么都没发生（开始菜单里点别的文件夹是好的，那走的是另一条路）。
+        ///
+        /// 判据只认「有进程、但既不是桌面 shell、也没有任何浏览窗口」：
+        ///   · 有 `Shell_TrayWnd` / `Progman` ⇒ 桌面 shell 本体，不碰；
+        ///   · 有 `CabinetWClass` ⇒ 用户或别的程序正在用，不碰；
+        ///   · 刚起来不到几秒的也放过 —— 别和「正在启动、窗口还没建出来」的抢时间。
+        /// Win10 的虚拟桌面共用同一个窗口站，别的虚拟桌面上的窗口照样数得到，所以不会误杀。
+        /// </summary>
+        private void SweepStrayExplorers()
+        {
+            int n = 0;
+            foreach (Process p in Process.GetProcessesByName("explorer"))
+            {
+                try
+                {
+                    if ((DateTime.Now - p.StartTime).TotalSeconds < 5) continue;
+                    if (EmbedApi.ExplorerHasOtherWindows(p.Id, IntPtr.Zero)) continue;
+                    Diag.Step("Hub: 清掉没有窗口的 explorer pid=" + p.Id);
+                    p.Kill();
+                    n++;
+                }
+                catch { }
+                finally { try { p.Dispose(); } catch { } }
+            }
+            if (n > 0) Diag.Step("Hub: 本次启动清掉 " + n + " 个残留 explorer 进程");
         }
 
         /// <summary>候选窗口：看见的时刻 + 收到事件时它已经可见了多久（诊断用，见 OnWindowShown）。</summary>
@@ -409,6 +443,10 @@ namespace TabbedExplorer
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return false;
             if (pid == ourPid) return false;
+            // 桌面 shell 进程自己开的文件夹窗口**完全不碰**（连藏都不藏）—— 理由见
+            // EmbedApi.IsShellOwned：碰了会让 Win+E / 开始菜单那条「文件资源管理器」失灵，
+            // 而且退程序也不恢复。
+            if (EmbedApi.IsShellOwned(h)) return false;
             return true;
         }
 
@@ -459,6 +497,7 @@ namespace TabbedExplorer
             int pid = EmbedApi.ProcessIdOf(h).ToInt32();
             if (pid == 0) return false;
             if (pid == ourPid) return false;
+            if (EmbedApi.IsShellOwned(h)) return false;     // 见 IsHideCandidate 那条注释
             return true;
         }
 

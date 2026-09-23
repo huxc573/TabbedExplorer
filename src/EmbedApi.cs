@@ -288,6 +288,76 @@ namespace TabbedExplorer
             GC.KeepAlive(cb);
         }
 
+        /// <summary>
+        /// 这个 explorer 进程除了 <paramref name="except"/> 那个窗口之外，还有没有「别的靠山」？
+        /// 用来回答一件事：关掉这个标签时，能不能把它的 explorer 进程一起结束。
+        ///
+        /// 认两种「不能动」的：
+        ///   · `Shell_TrayWnd` / `Progman` —— 桌面 shell 本体（任务栏、桌面图标都归它），杀了整个外壳都要重启；
+        ///   · 还有别的 `CabinetWClass` —— 用户或别的程序还在用它开着文件夹。
+        /// 都没有 ⇒ 这个进程就是**我们这一个标签在撑着**，可以收掉。
+        ///
+        /// ⚠ 判据**不能**用「这个 pid 是不是我启动前就存在的」（老办法 `pidsBefore`）：
+        ///   `explorer.exe /n,/separate` 起窗口时，系统**会把请求转交给已存在的 explorer 进程** ——
+        ///   那种老进程照样只有我们这一个标签在用。按老办法会判成「不能杀」，于是它留在系统里
+        ///   （窗口关了、进程活着），下次启动又被复用，越积越多；而这些「没有窗口的 explorer 进程」
+        ///   会让 shell 的「打开资源管理器」（Win+E、开始菜单里那条）去激活一个不存在的窗口
+        ///   ⇒ 表现就是按下去什么都没发生。
+        /// </summary>
+        public static bool ExplorerHasOtherWindows(int pid, IntPtr except)
+        {
+            if (pid == 0) return true;      // 问不出来就当成「有」，宁可不杀
+            bool found = false;
+            EnumWindowsProc cb = null;
+            cb = delegate(IntPtr h, IntPtr l)
+            {
+                if (found) return true;
+                if (h == except) return true;
+                if (ProcessIdOf(h).ToInt32() != pid) return true;
+                string c = ClassOf(h);
+                if (c == "Shell_TrayWnd" || c == "Progman" ||
+                    c == "CabinetWClass" || c == "ExploreWClass")
+                {
+                    found = true;
+                    return false;
+                }
+                return true;
+            };
+            EnumWindows(cb, IntPtr.Zero);
+            GC.KeepAlive(cb);
+            return found;
+        }
+
+        /// <summary>桌面 shell 进程的 pid —— 拥有任务栏（`Shell_TrayWnd`）的那个 explorer。</summary>
+        public static int ShellExplorerPid()
+        {
+            IntPtr tray = NativeMethods.FindWindow("Shell_TrayWnd", null);
+            if (tray == IntPtr.Zero) tray = NativeMethods.FindWindow("Progman", null);
+            if (tray == IntPtr.Zero) return 0;
+            return ProcessIdOf(tray).ToInt32();
+        }
+
+        /// <summary>
+        /// 这个窗口是不是**桌面 shell 进程**开的。是的话，我们什么都不能对它做。
+        ///
+        /// 为什么要单独挡这一刀（踩过）：shell 进程自己也会开文件夹窗口 —— 用户从开始菜单/
+        /// 任务栏/桌面打开的路径，窗口可能就是这个进程建的。这种窗口一旦被我们
+        /// `SetParent` 进自己的窗口（或先藏一下），shell 那边「打开资源管理器」那条路
+        /// （Win+E、开始菜单里的「文件资源管理器」，两者都走 shell 的同一个入口）就会去
+        /// 复用/激活它自己那扇已经不正常的窗口 ⇒ **按下去毫无反应**；
+        /// 而按具体路径新开一个窗口不受影响，所以表现是「Win+E 和开始菜单那条打不开，
+        /// 开始菜单里点别的文件夹却没事」。
+        /// ⚠ 这个损坏**留在 shell 进程里**，我们的程序退了也不会自己恢复，只能重启
+        ///   那个 explorer 进程才好 —— 所以必须在动手之前就挡住，不能指望善后。
+        /// </summary>
+        public static bool IsShellOwned(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            int shell = ShellExplorerPid();
+            if (shell == 0) return false;          // 问不出 shell 是谁：按「不是」放行（FindWindow 基本不会失败）
+            return ProcessIdOf(h).ToInt32() == shell;
+        }
+
         // ==================================================================
         // 「启动时就存在的文件夹窗口」基线（加）
         //
@@ -371,6 +441,10 @@ namespace TabbedExplorer
                 if (cabsBefore.Contains(h)) return true;
                 if (IsBaseline(h)) return true;
                 if (IsClaimed(h)) return true;
+                // shell 进程自己的窗口绝不能被当成「我们要嵌的那个」——理由见 IsShellOwned。
+                // 代价是这种窗口撑不起标签（那一条会超时失败，桌面上留一个原生窗口），
+                // 比把桌面外壳弄坏强得多。
+                if (IsShellOwned(h)) return true;
                 int p = ProcessIdOf(h).ToInt32();
                 if (p == 0) return true;
                 found = h; foundPid = p;

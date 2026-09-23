@@ -3,6 +3,23 @@
 版本号唯一来源 = 仓库根 `VERSION` 文件（单行），标签 `v<X.Y.Z>`（附注标签）。
 口径：新功能抬 MINOR，修 bug 只走 PATCH，不兼容才抬 MAJOR。
 
+## [v1.13.1] - 2026-09-23 18:25
+
+**主题：修「关掉程序后 Win+E / 开始菜单那条『文件资源管理器』按下去没反应」**
+
+- **根因**：开着「捕获所有打开的文件夹」时，被收编的窗口**可能是桌面 shell 进程自己建的**
+  （用户从开始菜单 / 任务栏 / 桌面打开的路径就会这样）。把一个 shell 自己的窗口 `SetParent` 成我们的子窗口
+  （而且之前先把它藏过）之后，shell 那条「打开资源管理器」入口 —— Win+E 与开始菜单里的
+  「文件资源管理器」**共用同一个入口** —— 会去激活一扇已经不正常的窗口，于是按下去毫无反应；
+  而按具体路径新开一个窗口走的是另一条路，所以「开始菜单里点别的文件夹却没事」。
+  ⚠ 这个损坏**留在 shell 进程里**，程序退了也不会自己恢复，只有重启 shell 才好。
+- 新增 `EmbedApi.ShellExplorerPid()` / `IsShellOwned(h)`（判据 = 该窗口的 pid 拥有 `Shell_TrayWnd` / `Progman`），
+  并挡在五处：`DesktopHub.IsHideCandidate` / `IsCapturable`、`ExplorerHost.Adopt` / `OnAnyWindowShown`、
+  `EmbedApi.FindNewCab` —— **宁可不收这个窗口，也绝不碰 shell**。
+- `ExplorerHost.Adopt` 撞上 shell 的窗口时把它还原成可见，不再吞掉。
+- `tools/build_task.bat` 加了一个可选的构建后钩子位（`tools\post_build.local.bat`，被 `.gitignore` 挡住）：
+  本机可以挂自己的镜像 / 部署步骤，仓库本身保持干净。
+
 ## [v1.13.0] - 2026-09-23 17:00
 
 **主题：垂直侧边栏（新布局 / 折叠态精简 / 半透明）+ 两个管理器滚动条 + 书签子菜单卡顿修复 + 记住窗口位置大小 + 标签置顶**

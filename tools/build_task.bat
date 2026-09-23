@@ -18,6 +18,10 @@ move /y "TabbedExplorer.new.exe" "TabbedExplorer.exe" >> build.log 2>&1
 if errorlevel 1 goto locked
 
 echo BUILD_OK>> build.log
+
+rem Optional machine-local post-build hook (e.g. mirroring the build somewhere).
+rem tools\*.local.bat is git-ignored, so the repo stays clean. Missing -> skip silently.
+if exist "tools\post_build.local.bat" call "tools\post_build.local.bat" >> build.log 2>&1
 exit /b 0
 
 :locked

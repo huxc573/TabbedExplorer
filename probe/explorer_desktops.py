@@ -34,6 +34,11 @@ class THREADENTRY32(ctypes.Structure):
 
 k = ctypes.windll.kernel32
 u32 = ctypes.windll.user32
+# ⚠ 不声明 DPI 感知时 Windows 会按缩放比把坐标虚拟化（本机 150%：2880×1800 读成 1920×1200）
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
 k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 k.OpenThread.restype = wintypes.HANDLE   # 不声明 restype 会按 32 位收，句柄被截断
 u32.GetThreadDesktop.restype = wintypes.HANDLE

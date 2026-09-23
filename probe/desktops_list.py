@@ -7,6 +7,11 @@ import ctypes
 from ctypes import wintypes
 
 u32 = ctypes.windll.user32
+# ⚠ 不声明 DPI 感知时 Windows 会按缩放比把坐标虚拟化（本机 150%：2880×1800 读成 1920×1200）
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
 u32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
 u32.OpenWindowStationW.restype = wintypes.HANDLE
 u32.EnumDesktopsW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]

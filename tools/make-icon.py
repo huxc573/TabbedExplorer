@@ -5,9 +5,14 @@
 只能靠「缩小了看」验证（见文件末尾的预览输出）。
 
 跑法：python tools/make-icon.py     （需要 Pillow）
-产出：app.ico（按尺寸内嵌 16/20/24/32/40/48/64/128/256）、app-icon-1024.png（源图，便于以后再调）
+产出：assets/app.ico（按尺寸内嵌 16/20/24/32/40/48/64/128/256）、assets/app-icon-1024.png（源图，便于以后再调）
 """
+import os
 from PIL import Image, ImageDraw
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, "assets")
+os.makedirs(OUT, exist_ok=True)
 
 S = 1024
 MANILA = (246, 214, 124, 255)
@@ -29,9 +34,9 @@ rr((72, 330, 952, 900), 64, DK)                 # 后片
 rr((72, 398, 952, 952), 64, MANILA, EDGE, 18)   # 前片（描边让 16px 立得住）
 rr((134, 452, 890, 548), 34, HI)                # 前片顶部高光
 
-im.save("app-icon-1024.png")
+im.save(os.path.join(OUT, "app-icon-1024.png"))
 im.resize((256, 256), Image.LANCZOS).save(
-    "app.ico", sizes=[(16,16),(20,20),(24,24),(32,32),(40,40),(48,48),(64,64),(128,128),(256,256)])
+    os.path.join(OUT, "app.ico"), sizes=[(16,16),(20,20),(24,24),(32,32),(40,40),(48,48),(64,64),(128,128),(256,256)])
 
 # 预览：16/20/24/32/48/64 并排（托盘是 16~20，一定要看得清）
 W = 16+20+24+32+48+64 + 6*22
@@ -40,5 +45,5 @@ x = 12
 for s in (16, 20, 24, 32, 48, 64):
     prev.alpha_composite(im.resize((s, s), Image.LANCZOS), (x, max(0, (64 - s) // 2 - 8) if s < 48 else 0))
     x += s + 22
-prev.resize((prev.width * 3, prev.height * 3), Image.NEAREST).save("probe/app_icon_preview.png")
-print("ok: app.ico + app-icon-1024.png + probe/app_icon_preview.png")
+prev.resize((prev.width * 3, prev.height * 3), Image.NEAREST).save(os.path.join(ROOT, "probe", "app_icon_preview.png"))
+print("ok: assets/app.ico + assets/app-icon-1024.png + probe/app_icon_preview.png")

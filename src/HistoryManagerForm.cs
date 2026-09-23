@@ -35,6 +35,10 @@ namespace TabbedExplorer
             public string Head;
             public int Index = -1;        // 在 view 里的下标（标题行是 -1）
             public Rectangle Rect;
+            /// <summary>标题行专用：这一堆被收起了（收起后只留标题，不列条目）。</summary>
+            public bool Collapsed;
+            /// <summary>标题行专用：这一堆有几条（收起时也让人知道里面有多少）。</summary>
+            public int Count;
         }
 
         private static readonly float DpiScale = ReadDpi();
@@ -68,6 +72,15 @@ namespace TabbedExplorer
         private int hover = -1;               // 悬停那一行的下标（rows 的下标）
         private bool hoverClose;
         private string filter = "";
+
+        // ---- 滚动 + 日期分堆收起（用户：「管理器左侧没有滚动条」「历史不能按日期展开、收缩」）----
+        /// <summary>内容往上滚了多少像素（0 = 顶部）。行坐标按「内容坐标」存，画/命中时才加偏移。</summary>
+        private int scroll;
+        /// <summary>整块内容（含分堆标题）有多高 —— 用来决定要不要出滚动条。</summary>
+        private int contentH;
+        /// <summary>被收起的日期分堆（存标题文字）。</summary>
+        private readonly List<string> collapsed = new List<string>();
+        private VScrollBar vbar;
 
         private readonly TextBox search;
         private readonly Font font, fontDim;
@@ -105,6 +118,18 @@ namespace TabbedExplorer
             search.SetBounds(x, y + Px(1), Px(220), Px(22));
             search.TextChanged += delegate { filter = search.Text.Trim(); Rebuild(); Invalidate(); };
             Controls.Add(search);
+
+            // 左边那条列表是**自绘**的（不是 ListBox），系统不会替我们出滚动条 —— 自己挂一个。
+            // 颜色跟着颜色模式走：原生滚动条属非客户区、不吃自绘配色，得走 Theme.StyleScrollBar。
+            vbar = new VScrollBar();
+            vbar.Visible = false;
+            vbar.Scroll += delegate
+            {
+                if (scroll == vbar.Value) return;
+                scroll = vbar.Value;
+                Invalidate();
+            };
+            Controls.Add(vbar);
 
             int bx = x + Px(232);
             bx = AddButton("打开", bx, y, delegate { OpenSelected(); });
@@ -147,6 +172,7 @@ namespace TabbedExplorer
             BackColor = Theme.Chrome;
             ForeColor = Theme.Text;
             if (search != null) { search.BackColor = Theme.InputBack; search.ForeColor = Theme.Text; }
+            if (vbar != null && vbar.IsHandleCreated) Theme.StyleScrollBar(vbar.Handle);
             Invalidate(true);
         }
 
@@ -179,6 +205,7 @@ namespace TabbedExplorer
         {
             base.OnShown(e);
             Theme.ApplyTitleBar(Handle);
+            if (vbar != null && vbar.IsHandleCreated) Theme.StyleScrollBar(vbar.Handle);
             Rebuild();
             Invalidate();
         }
@@ -199,29 +226,39 @@ namespace TabbedExplorer
                     view.Add(all[i]);
             }
 
+            // 右边给滚动条留出宽度 —— 不然行尾的 ✕ / 时间会被压到滚动条底下。
+            int avail = Math.Max(1, LeftW - ScrollBarW);
+
+            // 行坐标一律用**内容坐标**（y 从 0 起）；真正画/命中时再加 TopH+CaptionH 并减 scroll。
             rows.Clear();
-            int y = TopH + CaptionH;
+            int y = 0;
             string lastDay = null;
+            bool skip = false;
             for (int i = 0; i < view.Count; i++)
             {
-                // 用户：按日期归类 —— 换了一天就插一条灰标题
+                // 用户：按日期归类 —— 换了一天就插一条灰标题；标题可点，收起后这堆的条目就不列了
                 string day = History.DayLabel(view[i].At);
                 if (day != lastDay)
                 {
                     Row hr = new Row();
                     hr.Head = day;
-                    hr.Rect = new Rectangle(Px(8), y, Math.Max(1, LeftW - Px(18)), HeadRowH);
+                    hr.Collapsed = IsCollapsed(day);
+                    hr.Count = CountOfDay(i, day);
+                    hr.Rect = new Rectangle(Px(8), y, Math.Max(1, avail - Px(10)), HeadRowH);
                     rows.Add(hr);
                     y += HeadRowH;
                     lastDay = day;
+                    skip = hr.Collapsed;
                 }
+                if (skip) continue;
                 Row r = new Row();
                 r.Item = view[i];
                 r.Index = i;
-                r.Rect = new Rectangle(Px(16), y, Math.Max(1, LeftW - Px(26)), ListRowH);
+                r.Rect = new Rectangle(Px(16), y, Math.Max(1, avail - Px(18)), ListRowH);
                 rows.Add(r);
                 y += ListRowH;
             }
+            contentH = y + Px(6);
 
             if (sel >= view.Count) sel = view.Count - 1;
             if (sel < 0 && view.Count > 0) sel = 0;
@@ -229,6 +266,98 @@ namespace TabbedExplorer
             // 多选里的路径可能已经不在 view 里了（改了搜索词 / 历史自己变了）—— 把掉队的清掉，
             // 不然「已选 N 条」那个数字会越说越大，删的时候还删不到东西。
             PruneMulti();
+
+            LayoutScrollBar();
+        }
+
+        /// <summary>view 里从第 i 条起、连着同一个日期分堆的一共几条。</summary>
+        private int CountOfDay(int i, string day)
+        {
+            int n = 0;
+            for (int k = i; k < view.Count; k++)
+            {
+                if (!string.Equals(History.DayLabel(view[k].At), day, StringComparison.Ordinal)) break;
+                n++;
+            }
+            return n;
+        }
+
+        private bool IsCollapsed(string day)
+        {
+            for (int i = 0; i < collapsed.Count; i++)
+                if (string.Equals(collapsed[i], day, StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        private void ToggleCollapsed(string day)
+        {
+            for (int i = 0; i < collapsed.Count; i++)
+            {
+                if (!string.Equals(collapsed[i], day, StringComparison.Ordinal)) continue;
+                collapsed.RemoveAt(i);
+                Rebuild();
+                Invalidate();
+                return;
+            }
+            collapsed.Add(day);
+            Rebuild();
+            Invalidate();
+        }
+
+        private static int ScrollBarW { get { return SystemInformation.VerticalScrollBarWidth; } }
+
+        /// <summary>左边那列列表在窗口里的矩形（滚动条、裁剪、滚轮都用它）。</summary>
+        private Rectangle ListRect
+        {
+            get { return new Rectangle(0, TopH + CaptionH, LeftW, Math.Max(1, Height - TopH - CaptionH)); }
+        }
+
+        /// <summary>内容坐标 → 窗口坐标。</summary>
+        private Rectangle RowRect(Row row)
+        {
+            return new Rectangle(row.Rect.X, row.Rect.Y + TopH + CaptionH - scroll,
+                                 row.Rect.Width, row.Rect.Height);
+        }
+
+        /// <summary>内容比列表高就出滚动条；顺带把 scroll 夹回合法范围。</summary>
+        private void LayoutScrollBar()
+        {
+            if (vbar == null) return;
+            Rectangle lr = ListRect;
+            if (contentH <= lr.Height) { vbar.Visible = false; scroll = 0; return; }
+            if (!vbar.Visible) vbar.Visible = true;
+            vbar.SetBounds(LeftW - ScrollBarW, lr.Top, ScrollBarW, lr.Height);
+
+            int max = contentH - lr.Height;                 // 最多能滚多少像素
+            if (scroll > max) scroll = max;
+            if (scroll < 0) scroll = 0;
+
+            // VScrollBar 的 Value 只能取到 Maximum - LargeChange + 1，所以 Maximum 得把它加回来。
+            vbar.LargeChange = Math.Max(1, lr.Height);
+            vbar.Maximum = max + vbar.LargeChange - 1;
+            vbar.SmallChange = Math.Max(1, ListRowH);
+            if (vbar.Value != scroll) vbar.Value = scroll;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            LayoutScrollBar();
+            Invalidate();
+        }
+
+        /// <summary>滚轮滚列表（搜索框有焦点时事件会冒泡到这儿）。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (vbar == null || !vbar.Visible) return;
+            int step = SystemInformation.MouseWheelScrollLines * ListRowH;
+            if (step <= 0) step = ListRowH * 3;
+            int v = vbar.Value - (e.Delta * step / 120);
+            int hi = vbar.Maximum - vbar.LargeChange + 1;
+            if (v > hi) v = hi;
+            if (v < vbar.Minimum) v = vbar.Minimum;
+            vbar.Value = v;
         }
 
         // ==================================================================
@@ -342,7 +471,17 @@ namespace TabbedExplorer
                 Px(12), TopH + Px(3));
             DrawCaption(g, "详情", LeftW + Px(12), TopH + Px(3), true);
 
-            for (int i = 0; i < rows.Count; i++) DrawRow(g, i);
+            // 行只画在列表区里（内容超出时不要压到上面那条标题栏上），顺带把看不见的行跳掉。
+            Rectangle list = ListRect;
+            System.Drawing.Drawing2D.GraphicsState st = g.Save();
+            g.SetClip(list, System.Drawing.Drawing2D.CombineMode.Intersect);
+            for (int i = 0; i < rows.Count; i++)
+            {
+                Rectangle rr = RowRect(rows[i]);
+                if (rr.Bottom < list.Top || rr.Top > list.Bottom) continue;
+                DrawRow(g, i);
+            }
+            g.Restore(st);
 
             if (view.Count == 0)
                 TextRenderer.DrawText(g, filter.Length > 0 ? "没有匹配的记录" : "还没有历史记录（去几个文件夹就自动记上了）",
@@ -363,12 +502,27 @@ namespace TabbedExplorer
         private void DrawRow(Graphics g, int i)
         {
             Row row = rows[i];
-            Rectangle r = row.Rect;
+            Rectangle r = RowRect(row);
 
-            // ---- 日期分堆标题：一条灰字，不参与选中 ----
+            // ---- 日期分堆标题：灰字 + 一个 ▾/▸ 小三角（点它收起 / 展开这一堆）----
             if (row.Item == null)
             {
-                TextRenderer.DrawText(g, row.Head, fontDim, new Rectangle(r.Left, r.Top, r.Width, r.Height),
+                int cy = r.Top + r.Height / 2;
+                int s = Math.Max(2, Px(3));
+                using (SolidBrush b = new SolidBrush(Theme.TextDim))
+                {
+                    Point[] tri = row.Collapsed
+                        ? new Point[] { new Point(r.Left + Px(2), cy - s),
+                                        new Point(r.Left + Px(2) + s, cy),
+                                        new Point(r.Left + Px(2), cy + s) }
+                        : new Point[] { new Point(r.Left + Px(1), cy - s),
+                                        new Point(r.Left + Px(1) + s * 2, cy - s),
+                                        new Point(r.Left + Px(1) + s, cy + s) };
+                    g.FillPolygon(b, tri);
+                }
+                string head = row.Head + "（" + row.Count + " 条）";
+                TextRenderer.DrawText(g, head, fontDim,
+                    new Rectangle(r.Left + Px(14), r.Top, Math.Max(1, r.Width - Px(14)), r.Height),
                     Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 return;
             }
@@ -512,7 +666,9 @@ namespace TabbedExplorer
         /// <summary>哪个**行号**（rows 的下标）在这个点上；-1 = 不在任何行上。</summary>
         private int RowAt(Point p)
         {
-            for (int i = 0; i < rows.Count; i++) if (rows[i].Rect.Contains(p)) return i;
+            if (!ListRect.Contains(p)) return -1;      // 点在滚动条 / 上方标题栏上不算命中
+            for (int i = 0; i < rows.Count; i++)
+                if (RowRect(rows[i]).Contains(p)) return i;
             return -1;
         }
 
@@ -539,12 +695,10 @@ namespace TabbedExplorer
             if (i < 0) { if (multi.Count > 0) { multi.Clear(); Invalidate(); } return; }
             Row row = rows[i];
 
-            // ---- 日期分堆标题：点一下 = 这一组全选上（想整组删就是这个入口）----
+            // ---- 日期分堆标题：点一下 = 收起 / 展开这一堆（整组选中、整组删除在右键菜单里）----
             if (row.Item == null)
             {
-                SelectDay(row.Head);
-                anchorPath = null;
-                Invalidate();
+                ToggleCollapsed(row.Head);
                 return;
             }
 
@@ -638,6 +792,9 @@ namespace TabbedExplorer
                 List<string> all = History.PathsOfDay(day);
                 if (all.Count == 0) return;
                 List<PopItem> hm = new List<PopItem>();
+                bool col = IsCollapsed(day);
+                hm.Add(PopMenu.It(col ? ("展开「" + day + "」") : ("收起「" + day + "」"),
+                    delegate { ToggleCollapsed(day); }));
                 hm.Add(PopMenu.It("选中「" + day + "」这一组（" + all.Count + " 条）",
                     delegate { SelectDay(day); anchorPath = null; Invalidate(); }));
                 hm.Add(PopMenu.Split());

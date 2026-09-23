@@ -19,6 +19,8 @@ namespace TabbedExplorer
     {
         public IntPtr Form;
         public IntPtr TabStrip;
+        /// <summary>垂直侧边栏那条窗格（横向模式下它不可见，所以两个都登记上）。</summary>
+        public IntPtr Pane;
         public IntPtr FavBar;
         /// <summary>标签是不是多到需要横向滚动（没开自动缩窄时才会 true）。</summary>
         public Func<bool> HasOverflow;
@@ -68,7 +70,7 @@ namespace TabbedExplorer
                 for (int i = 0; i < list.Count; i++)
                 {
                     WheelTarget t = list[i];
-                    if (hwnd == t.TabStrip || hwnd == t.FavBar || hwnd == t.Form) return t;
+                    if (hwnd == t.TabStrip || hwnd == t.Pane || hwnd == t.FavBar || hwnd == t.Form) return t;
                 }
                 for (int i = 0; i < list.Count; i++)
                 {
@@ -200,15 +202,17 @@ namespace TabbedExplorer
             WheelTarget t = WheelRouter.Find(w, root);
             if (t == null) return false;
 
-            if (w == t.TabStrip)
+            if (w == t.TabStrip || w == t.Pane)
             {
-                // 标签条上，分左右两半：标签区 = 切标签；右边那排按钮 = 横滑标签（溢出了才吞）
+                // 标签条上，分左右两半：标签区 = 切标签；右边那排按钮 = 横滑标签（溢出了才吞）。
+                // 垂直窗格那条没有「按钮区」这一说（工具排在顶上、不是右边），
+                // 它的 InButtonArea 恒 false —— 落在窗格上就是切标签。
                 POINT c = pt;
-                ScreenToClient(t.TabStrip, ref c);
+                ScreenToClient(w, ref c);
                 if (t.StripWheel != null) return t.StripWheel(c.x, delta);
                 return false;
             }
-            if (w == t.FavBar) return false;           // 书签栏自己有横向滚动，别抢
+            if (w == t.FavBar) return false;           // 书签栏自己有滚动（横排横滑、竖排纵滑），别抢
 
             // 内容区：只有标签真的溢出时才接管（否则会把文件列表的滚动弄没了，
             // 包括 shell 原生的 Shift+滚轮横向滚动）

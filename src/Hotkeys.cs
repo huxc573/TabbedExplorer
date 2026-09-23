@@ -31,17 +31,18 @@ namespace TabbedExplorer
     /// <summary>
     /// 程序自有快捷键的解析 / 规范化 / 匹配。
     ///
-    /// 覆盖的命令就是 `Settings.HotkeyKeys` 那 7 条（新建/关闭/前后标签/历史/恢复/书签栏）；
+    /// 覆盖的命令就是 `Settings.HotkeyKeys` 那几条（新建/关闭/前后标签/历史/恢复/书签栏/垂直侧边栏）；
     /// **Ctrl+1..9 跳第 N 个标签是写死的**（没法绑「一串」键，见 WinEHook.Handle），文档里也是这么写的。
     ///
-    /// 文本格式：`Ctrl+Shift+T`、`Alt+F4`、`Ctrl+Tab`、`F2`、`Ctrl+Alt+Delete`……
+    /// 文本格式：`Ctrl+Shift+T`、`Alt+F4`、`Ctrl+Tab`、`F2`、`Ctrl+Shift+,`……
     ///   修饰键只认 Ctrl / Shift / Alt（Win 不作为修饰键 —— Win+E 是硬接管，不参与这套）；
-    ///   键名认 A-Z、0-9、F1-F24 和 Tab / Space / Enter / Back / Delete / Insert / Home / End /
-    ///   PageUp / PageDown / 方向键。认不出来就算无效（不生效，但设置窗口里能看到是什么文本）。
+    ///   键名认 A-Z、0-9、F1-F24、Tab / Space / Enter / Back / Delete / Insert / Home / End /
+    ///   PageUp / PageDown / 方向键，以及 , . / ; ' [ ] \\ - = ` 这几个标点（垂直侧边栏的
+    ///   `Ctrl+Shift+,` 就是标点）。认不出来就算无效（不生效，但设置窗口里能看到是什么文本）。
     /// </summary>
     internal static class Hotkeys
     {
-        /// <summary>解析好的 7 条（`Reload` 之后整体换掉；钩子线程读的是**同一个引用**，换的是数组不是元素）。</summary>
+        /// <summary>解析好的那几条（`Reload` 之后整体换掉；钩子线程读的是**同一个引用**，换的是数组不是元素）。</summary>
         private static volatile HotkeySpec[] specs = Build();
 
         public static HotkeySpec[] Specs { get { return specs; } }
@@ -100,6 +101,22 @@ namespace TabbedExplorer
         {
             if (p.Length == 1)
             {
+                // OEM 那几颗标点：`Ctrl+Shift+,` 这类绑定就靠它们（虚拟键码名见 VK_OEM_*）。
+                // ⚠ 这几个必须在「A-Z / 0-9」前面判，不然 `,` 会落到下面那个 return 0 上。
+                switch (p[0])
+                {
+                    case ',': return 0xBC;    // VK_OEM_COMMA
+                    case '.': return 0xBE;    // VK_OEM_PERIOD
+                    case '/': return 0xBF;    // VK_OEM_2
+                    case ';': return 0xBA;    // VK_OEM_1
+                    case '\'': return 0xDE;   // VK_OEM_7
+                    case '[': return 0xDB;    // VK_OEM_4
+                    case ']': return 0xDD;    // VK_OEM_6
+                    case '\\': return 0xDC;   // VK_OEM_5
+                    case '-': return 0xBD;    // VK_OEM_MINUS
+                    case '=': return 0xBB;    // VK_OEM_PLUS
+                    case '`': return 0xC0;    // VK_OEM_3
+                }
                 char c = char.ToUpperInvariant(p[0]);
                 if (c >= 'A' && c <= 'Z') return (int)c;
                 if (c >= '0' && c <= '9') return (int)c;      // '0'=0x30 正好是 VK_0
@@ -140,6 +157,18 @@ namespace TabbedExplorer
             if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x6F);          // F1..F24
             switch (vk)
             {
+                // 标点（见 KeyOf）—— 规范化显示用，跟键名一一对应
+                case 0xBC: return ",";
+                case 0xBE: return ".";
+                case 0xBF: return "/";
+                case 0xBA: return ";";
+                case 0xDE: return "'";
+                case 0xDB: return "[";
+                case 0xDD: return "]";
+                case 0xDC: return "\\";
+                case 0xBD: return "-";
+                case 0xBB: return "=";
+                case 0xC0: return "`";
                 case 0x09: return "Tab";
                 case 0x20: return "Space";
                 case 0x0D: return "Enter";
@@ -258,6 +287,7 @@ namespace TabbedExplorer
                 case "history": return "历史记录";
                 case "reopen": return "恢复关闭的标签页";
                 case "favbar": return "显示/隐藏书签栏";
+                case "vtabs": return "垂直侧边栏";
             }
             return cmd;
         }

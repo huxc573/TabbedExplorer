@@ -485,19 +485,24 @@ namespace TabbedExplorer
                 return;
             }
 
-            target.CloseDeeper();       // 挪回浅的地方了，更深的那几层收掉
-
-            if (idx < 0) { target.SetHover(-1); return; }
+            if (idx < 0) { target.CloseDeeper(); target.SetHover(-1); return; }
             PopItem it = target.items[idx];
 
-            if (!IsEnabled(it)) { target.SetHover(-1); return; }
+            if (!IsEnabled(it)) { target.CloseDeeper(); target.SetHover(-1); return; }
             target.SetHover(idx);
 
             if (HasKids(it))
             {
-                target.OpenChild(idx);              // 悬停就展开（原生菜单也是）
+                // 悬停就展开（原生菜单也是）。
+                // ⚠ **这里绝不能先 `CloseDeeper()`**：鼠标在「带子项的那一项」上稍微动一下就是一次
+                //   MouseMove，先关再开 = 每移动一次就**销毁并重建**一个子菜单窗体 ——
+                //   表现就是「移到有子项的子文件夹上卡顿」+「有时子项根本不出现」（刚建好又被下一步关掉）。
+                //   该不该关交给 `OpenChild` 自己判（是同一项开的就原样留着，什么都不做）。
+                target.OpenChild(idx);
                 return;
             }
+
+            target.CloseDeeper();       // 悬停在普通项上：更深的那几层收掉
             if (!down) return;
 
             if (btn == MouseButtons.Left)

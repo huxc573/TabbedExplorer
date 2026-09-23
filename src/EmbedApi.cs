@@ -178,6 +178,50 @@ namespace TabbedExplorer
             catch { }
         }
 
+        // ==================================================================
+        // 抓屏（侧边栏「摊开盖在内容上」那一下的底图，见 PaneGlass）
+        //
+        // 为什么不用 `WS_EX_LAYERED`：子窗口分层在 Win8+ 虽然允许，但它合成的是
+        // **宿主窗口的背景**，不是盖住的那个兄弟窗口（我们嵌的是别的进程的 explorer）——
+        // 实测「设了不透明度，背景完全看不出效果」。所以改成自己抓底图 + 自己按比例叠。
+        // ==================================================================
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetDC(IntPtr h);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int ReleaseDC(IntPtr h, IntPtr dc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        public static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h,
+                                         IntPtr src, int sx, int sy, uint rop);
+
+        public const uint SRCCOPY = 0x00CC0020;
+
+        /// <summary>
+        /// 抓一块**屏幕**像素（物理坐标；抓的是「屏幕上现在显示的样子」，所以别的进程的窗口也在里面）。
+        /// ⚠ 返回的是 `Format32bppRgb`（不带 alpha）—— 屏幕 DC 没有 alpha 通道，
+        ///   用带 alpha 的格式会整张透明，贴上去什么都看不见。
+        /// </summary>
+        public static System.Drawing.Bitmap GrabScreen(int x, int y, int w, int h)
+        {
+            if (w <= 0 || h <= 0) return null;
+            try
+            {
+                System.Drawing.Bitmap bmp =
+                    new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+                using (System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(bmp))
+                {
+                    IntPtr dst = g.GetHdc();
+                    IntPtr src = GetDC(IntPtr.Zero);
+                    try { BitBlt(dst, 0, 0, w, h, src, x, y, SRCCOPY); }
+                    finally { ReleaseDC(IntPtr.Zero, src); g.ReleaseHdc(dst); }
+                }
+                return bmp;
+            }
+            catch { return null; }
+        }
+
         /// <summary>把顶层窗口降级成子窗口：清掉边框类样式、加上 WS_CHILD。
         /// 必须在 SetParent 之前做（MSDN 对 SetParent 的硬要求）。</summary>
         public static uint ToChildStyle(uint style)
@@ -497,6 +541,8 @@ namespace TabbedExplorer
         public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
 
         public const int WM_NCLBUTTONDOWN = 0x00A1;
+        /// <summary>非客户区双击 —— 补这条给 DefWindowProc 就等于双击标题栏（最大化 / 还原）。</summary>
+        public const int WM_NCLBUTTONDBLCLK = 0x00A3;
         public const int HTCAPTION = 2;
 
         public const uint WM_KEYDOWN = 0x0100;

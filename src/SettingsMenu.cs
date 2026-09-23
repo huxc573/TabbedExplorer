@@ -146,6 +146,33 @@ namespace TabbedExplorer
                        () => hub.SetKeepTabs(!Settings.KeepTabs)));
             n.Add(Sep());
 
+            // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。
+            //    「恢复默认」是个动作而不是设置项，但一样收在 Spec 里 ——
+            //    托盘菜单和设置窗口两处都能点到，不用各写一遍（这正是 Spec 存在的意义）。
+            n.Add(Leaf("记住窗口位置和大小（退出后下次照原样打开）",
+                       () => Settings.WindowSize,
+                       () => hub.SetWindowSize(!Settings.WindowSize)));
+            n.Add(Act("恢复默认窗口位置和大小", delegate { hub.RestoreDefaultWindow(); },
+                      "窗口已恢复默认位置和大小。"));
+            n.Add(Sep());
+
+            // ③″ 垂直侧边栏（用户：打开/关闭 Ctrl+Shift+,）。样式参考 Edge：
+            //    「折叠窗格」开着时，鼠标不在窗格上就收缩成纯图标、进来才临时展开成完整样式。
+            //    ⚠ 名字从「垂直标签页」改成「垂直侧边栏」：它现在装的不只是标签 ——
+            //      工具、书签段、窗口按钮全在里头，叫「标签页」已经名不副实。
+            n.Add(Leaf("垂直侧边栏（左栏：标签 / 书签 / 窗口按钮，Ctrl+Shift+,）",
+                       () => Settings.VTabs,
+                       () => hub.SetVerticalTabs(!Settings.VTabs)));
+            n.Add(Leaf("侧边栏折叠：鼠标不在时只显示图标",
+                       () => Settings.VTabsCollapse,
+                       () => hub.SetVTabCollapse(!Settings.VTabsCollapse)));
+            // 摊开时它盖在内容上 —— 给个半透明能看见后面那个文件夹（数值项，托盘菜单里不排）
+            n.Add(Num("侧边栏展开时的不透明度（%，100 = 完全不透明）",
+                      Settings.VPaneAlphaMin, Settings.VPaneAlphaMax, 5,
+                      delegate { return Settings.VPaneAlpha; },
+                      delegate(int a) { hub.SetVPaneAlpha(a); }));
+            n.Add(Sep());
+
             // ④ 标签页宽度（用户：「也可自己输入数值」）
             //    原来是「80/96/112/…」一串预设的子菜单 —— 只能挑不能敲，而且托盘菜单里挂着一层子菜单很难点。
             //    现在改成设置窗口里的数字输入框（64~240 逻辑像素），菜单里不排它。

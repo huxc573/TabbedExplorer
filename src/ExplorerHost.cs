@@ -110,6 +110,14 @@ namespace TabbedExplorer
         /// </summary>
         public bool Retried { get; set; }
 
+        /// <summary>
+        /// 这个标签被「置顶」了（用户：标签右键置顶 / 取消置顶）。
+        /// 只影响**排序和外观**：置顶的一律排在最前面、标签上多一枚小图钉。
+        /// 状态挂在 host 上而不是标签条上 —— host 就是标签本体，标签条那边的顺序是按 host 排的，
+        /// 挂在 host 上就不必在「加/删/挪标签」各处各维护一份平行数组。
+        /// </summary>
+        public bool Pinned { get; set; }
+
         public ExplorerHost()
         {
             Host = new Panel();

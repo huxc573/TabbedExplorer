@@ -103,6 +103,12 @@ namespace TabbedExplorer
             public readonly List<string> Paths = new List<string>();
             /// <summary>当时选中的那个标签（还原完一并切过去）。</summary>
             public string Active;
+            /// <summary>
+            /// 这张桌面上那个窗口退出时的位置和大小，`"x,y,w,h"`（屏幕像素，逗号分隔）。
+            /// null / 空 = 没记过（下次用默认尺寸）。只有「非最大化」状态才记 ——
+            /// 最大化时存的是 `RestoreBounds`，也就是还原后该占的那块地。
+            /// </summary>
+            public string Bounds;
         }
 
         /// <summary>数据目录：程序目录下的 `data\`（见 AppPaths）—— 拷走整个文件夹就把记忆带走了。</summary>
@@ -198,6 +204,8 @@ namespace TabbedExplorer
                 }
                 string act = Json.Get(obj, "active");
                 if (!string.IsNullOrEmpty(act)) b.Active = act;
+                string bd = Json.Get(obj, "bounds");
+                if (!string.IsNullOrEmpty(bd)) b.Bounds = bd;
             }
             return n;
         }
@@ -239,19 +247,23 @@ namespace TabbedExplorer
                 Directory.CreateDirectory(Folder);
                 StringBuilder sb = new StringBuilder();
                 sb.Append("{\r\n");
-                sb.Append("  \"_note\": \"TabbedExplorer 按虚拟桌面记住的标签页。id = 那张桌面的 GUID（换桌面/重排都不会变）；active = 当时选中的那个标签。\",\r\n");
+                sb.Append("  \"_note\": \"TabbedExplorer 按虚拟桌面记住的标签页。id = 那张桌面的 GUID（换桌面/重排都不会变）；active = 当时选中的那个标签；bounds = 当时窗口的位置和大小，格式 x,y,w,h，删掉就回到默认尺寸。\",\r\n");
                 sb.Append("  \"_hint\": \"开不了的项（库 / 别处删掉的目录）启动时会自动跳过，不用手改。整个 data 文件夹拷走就把记忆带走了。\",\r\n");
                 sb.Append("  \"desktops\": [\r\n");
 
                 bool first = true;
                 foreach (KeyValuePair<string, Bucket> kv in map)
                 {
-                    if (kv.Value == null || kv.Value.Paths.Count == 0) continue;   // 没标签的桌面就别留段落
+                    if (kv.Value == null) continue;
+                    if (kv.Value.Paths.Count == 0 && string.IsNullOrEmpty(kv.Value.Bounds)) continue;   // 又没标签又没窗口尺寸的桌面就别留段落
                     if (!first) sb.Append(",\r\n");
                     first = false;
                     sb.Append("    { \"id\": ").Append(Json.Str(kv.Key));
                     sb.Append(", \"active\": ").Append(Json.Str(kv.Value.Active ?? ""));
-                    sb.Append(", \"tabs\": ").Append(Json.Array(kv.Value.Paths)).Append(" }");
+                    sb.Append(", \"tabs\": ").Append(Json.Array(kv.Value.Paths));
+                    if (!string.IsNullOrEmpty(kv.Value.Bounds))
+                        sb.Append(", \"bounds\": ").Append(Json.Str(kv.Value.Bounds));
+                    sb.Append(" }");
                 }
                 sb.Append("\r\n  ]\r\n}\r\n");
 

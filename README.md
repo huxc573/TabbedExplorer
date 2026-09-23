@@ -1,6 +1,6 @@
 # TabbedExplorer —— 给Win10资源管理器加标签页（浏览器式）
 
-> **v1.12**（`VERSION` = `1.12.0`）· 作者 [huxc573](https://github.com/huxc573) ·
+> **v1.13**（`VERSION` = `1.13.0`）· 作者 [huxc573](https://github.com/huxc573) ·
 > 开源地址 [github.com/huxc573/TabbedExplorer](https://github.com/huxc573/TabbedExplorer) · **MIT 协议** ·
 > 变更见 [CHANGELOG.md](CHANGELOG.md)
 

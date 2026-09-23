@@ -63,6 +63,10 @@ namespace TabbedExplorer
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
+        /// <summary>窗口的位置和大小已经从记忆里还原过了（一次性的，别每次按 Win+E 都去搬）。</summary>
+        private bool boundsDone;
+        /// <summary>这个窗口真给用户看过（决定要不要把它的位置大小记进记忆 —— 没见过的窗口不许覆盖旧值）。</summary>
+        private bool windowShown;
 
         /// <summary>刚关掉的标签路径（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
         private readonly List<string> closedTabs = new List<string>();
@@ -72,8 +76,24 @@ namespace TabbedExplorer
         private readonly FavBar favBar;
         private bool favBarOn;
 
+        // ---- 垂直侧边栏（Ctrl+Shift+,）----
+        /// <summary>
+        /// 左侧那个竖排的标签窗格。它是**同一个 `TabStrip` 类的另一个实例**，
+        /// `MirrorFrom(tabStrip)` 之后两边共用同一份标签模型 —— 所以上面那些
+        /// SetTitle / AddTab / MoveTab 都只调一次，两个视图一起变（不做副本同步）。
+        /// </summary>
+        private readonly TabStrip vPane;
+        /// <summary>现在是不是垂直侧边栏模式。</summary>
+        private bool verticalOn;
+        /// <summary>鼠标在垂直窗格里 —— 「折叠窗格」临时展开的判据（见 PaneShowWidth）。</summary>
+        private bool paneHover;
+        /// <summary>竖排书签区已经读过一次数据了（书签一个都没有时也置位，免得每次排版都重读）。</summary>
+        private bool favBandLoaded;
+
         /// <summary>标签条空白处右键时鼠标在哪儿 —— 菜单要弹在那个点上。</summary>
         private Point blankAt;
+        /// <summary>那个「点」是哪个控件上的客户坐标（垂直模式下是左边窗格，不是顶部那条）。</summary>
+        private Control blankOwner;
 
         /// <summary>「收进托盘」那条提示只弹一次（原来靠 Hub 的 once 参数，现在提示归我们自己管）。</summary>
         private bool trayTipShown;
@@ -106,6 +126,17 @@ namespace TabbedExplorer
         /// </summary>
         private readonly Timer trimTimer = new Timer();
 
+        /// <summary>
+        /// 「临时摊开侧边栏」那个定时器（Ctrl+Shift+B 这类看不见的开关给个反馈，见 PeekPane）。
+        /// 每隔 `peekTickMs` 检查一次：鼠标不在窗格上就收回去，在就撒手（归正常的进出跟踪管）。
+        /// </summary>
+        private readonly Timer peekTimer = new Timer();
+        private int peekTicks;
+        private const int PeekTickMs = 160;
+
+        /// <summary>窗口起来后 Hub 同步过一次书签栏设置了 —— 第一次不算「用户在按」（见 SetFavBarOn）。</summary>
+        private bool favBarEverSet;
+
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
 
@@ -114,6 +145,13 @@ namespace TabbedExplorer
 
         /// <summary>自己做的窗口边框厚度（只在不最大化时有）。</summary>
         private readonly int ResizeBorder;
+
+        /// <summary>
+        /// 没记过尺寸时的窗口大小（也是托盘菜单「恢复默认窗口位置和大小」用的那一份）。
+        /// ⚠ 名字别叫 `DefaultSize` —— 那是 `Form` 的 protected virtual 成员，撞名会出 CS0114 警告，
+        /// 而且看起来像是在重写框架的默认尺寸逻辑，其实完全无关。
+        /// </summary>
+        private static Size DefaultWinSize { get { return new Size(Px(1200), Px(760)); } }
         private bool inLayout;
         /// <summary>窗口是不是失活的 —— 外壳配色跟着它换（见 SetInactive）。</summary>
         private bool inactive;
@@ -125,7 +163,7 @@ namespace TabbedExplorer
 
             Text = "此电脑";
             BackColor = Theme.Chrome;   // 无边框后，四周那圈就是这个色，当边框用（深色下 = 纯黑，跟标签条同色）
-            Size = new Size(Px(1200), Px(760));
+            Size = DefaultWinSize;
             MinimumSize = new Size(Px(640), Px(420));
             StartPosition = FormStartPosition.CenterScreen;
             KeyPreview = true;
@@ -153,35 +191,12 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 中键关闭标签 idx=" + i);
                 CloseTab(i);
             };
-            tabStrip.NewTabClicked += delegate
-            {
-                Diag.Step("EmbedForm: 点击新建标签");
-                // 新建标签页 = 开一个「此电脑」，**不是**复制当前标签（用户报的 bug 4）
-                NewTab(ExplorerView.ThisPcPath);
-            };
+            tabStrip.NewTabClicked += OnNewTabClicked;
             // 右侧那排：齿轮（设置）/ 历史 / 恢复关闭 / 书签栏
-            tabStrip.ToolClicked += delegate(TabStrip.Tool t)
-            {
-                switch (t)
-                {
-                    case TabStrip.Tool.Settings:
-                        Diag.Step("EmbedForm: 点击设置按钮");
-                        Defer(ShowSettingsWindow);
-                        break;
-                    case TabStrip.Tool.History:
-                        Diag.Step("EmbedForm: 点击历史按钮");
-                        Defer(ShowHistoryMenu);
-                        break;
-                    case TabStrip.Tool.Reopen:
-                        Diag.Step("EmbedForm: 点击恢复关闭按钮");
-                        ReopenClosedTab();
-                        break;
-                    case TabStrip.Tool.Fav:
-                        Diag.Step("EmbedForm: 点击书签栏按钮");
-                        if (hub != null) hub.SetFavBar(!favBarOn);
-                        break;
-                }
-            };
+            tabStrip.ToolClicked += OnToolClicked;
+            // 拖标签排序：先把 `hosts` 挪到同一个位置 ——
+            // 两边顺序一旦错位，点标签就会切到别的标签上的文件夹（见 OrderMoved 的说明）。
+            tabStrip.OrderMoved += delegate(TabStrip from, int f, int t) { MoveHostOnly(f, t); };
             // 标签右键（复制名称 / 复制完整路径 / 关闭）
             tabStrip.TabRightClicked += delegate(object s, int i)
             {
@@ -193,6 +208,7 @@ namespace TabbedExplorer
             tabStrip.BlankRightClicked += delegate(Point p)
             {
                 Diag.Step("EmbedForm: 标签条空白处右键 " + p.X + "," + p.Y);
+                blankOwner = tabStrip;
                 blankAt = p;
                 Defer(ShowBlankMenu);
             };
@@ -208,10 +224,20 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 书签 -> " + path);
                 NewTab(path);
             };
-            // 最左边那枚书签图标：点一下开**书签管理器**
-            // （用户：原来点是开数据目录，改成「管理书签」）
+            // 顶上 / 最左边那枚书签图标：
+            //   横排 = 开**书签管理器**（用户：原来点是开数据目录，改成「管理书签」）；
+            //   竖排 = 摊开 / 收起**书签段** —— 用户：「书签页可展开收缩…这样那个单独书签按钮也可以去掉了」，
+            //          所以竖排的工具行里不再放书签那枚星（见 TabStrip.EnsureLayoutV），
+            //          管理器挪到这一行的右键菜单里（ManageRequested）。
             favBar.LeadClicked += delegate
             {
+                if (verticalOn)
+                {
+                    Diag.Step("EmbedForm: 竖排书签标题 -> " + (favBarOn ? "收起" : "摊开"));
+                    // 走 Hub：要同时改设置、刷托盘菜单、刷所有窗口（跟那颗星同一个入口）
+                    if (hub != null) hub.SetFavBar(!favBarOn);
+                    return;
+                }
                 Diag.Step("EmbedForm: 书签图标 -> 管理书签");
                 if (hub != null) hub.OpenFavManager();
             };
@@ -229,6 +255,57 @@ namespace TabbedExplorer
             };
             favBar.Visible = false;
 
+            // ---- 垂直侧边栏的左侧窗格 ----
+            // 垂直模式下**整个窗口只靠这一条**：工具按钮 / 加号 / 标签行 / 书签区位 / 窗口按钮
+            // 全在它里面（顶部那条横向的整条隐藏，见 DoLayout），所以事件得接全套。
+            vPane = new TabStrip();
+            vPane.Vertical = true;
+            vPane.Visible = false;
+            vPane.MirrorFrom(tabStrip);
+            // 工具 / 加号 / 窗口按钮 / 滚轮切标签：**跟横向那条共用同一份处理**
+            vPane.ToolClicked += OnToolClicked;
+            vPane.NewTabClicked += OnNewTabClicked;
+            vPane.WindowButtonClicked += OnWindowButtonClicked;
+            vPane.TabWheel += delegate(int delta) { CycleTab(delta > 0 ? -1 : 1); };
+            vPane.OrderMoved += delegate(TabStrip from, int f, int t) { MoveHostOnly(f, t); };
+            vPane.TabClicked += delegate(object s, int i) { Activate(i); };
+            vPane.TabCloseClicked += delegate(object s, int i)
+            {
+                Diag.Step("EmbedForm: 垂直窗格点关闭按钮 idx=" + i);
+                CloseTab(i);
+            };
+            vPane.TabMiddleClicked += delegate(object s, int i)
+            {
+                Diag.Step("EmbedForm: 垂直窗格中键关闭标签 idx=" + i);
+                CloseTab(i);
+            };
+            vPane.TabRightClicked += delegate(object s, int i)
+            {
+                int idx = i;
+                Diag.Step("EmbedForm: 垂直窗格标签右键 idx=" + idx);
+                Defer(delegate { ShowTabMenu(idx); });
+            };
+            vPane.BlankRightClicked += delegate(Point p)
+            {
+                Diag.Step("EmbedForm: 垂直窗格空白处右键 " + p.X + "," + p.Y);
+                blankOwner = vPane;
+                blankAt = p;
+                Defer(ShowBlankMenu);
+            };
+            // 窗格顶部那枚图钉 = 「折叠窗格」开关（Edge 那个）。改的是全局设置，交给 Hub 广播。
+            vPane.PinClicked += delegate
+            {
+                Diag.Step("EmbedForm: 垂直窗格图钉 -> 折叠窗格开关");
+                if (hub != null) hub.SetVTabCollapse(!Settings.VTabsCollapse);
+            };
+            // 鼠标进出窗格 = 「临时展开成完整样式」的判据（Edge 那套折叠窗格）
+            vPane.MouseEnter += delegate { PaneMouseMoved(true); };
+            vPane.MouseLeave += delegate { PaneMouseMoved(false); };
+            // ⚠ 书签段是**盖在窗格留出来的那一块上**的另一个控件，视觉上属于窗格 ——
+            //   不把它算进来，鼠标一挪到书签上窗格就当着人的面缩回去（点都点不着）。
+            favBar.MouseEnter += delegate { PaneMouseMoved(true); };
+            favBar.MouseLeave += delegate { PaneMouseMoved(false); };
+
             content = new Panel();
             content.BackColor = Theme.Chrome;
 
@@ -238,10 +315,16 @@ namespace TabbedExplorer
             Controls.Add(tabStrip);
             Controls.Add(favBar);
             Controls.Add(content);
+            Controls.Add(vPane);
+            // 垂直窗格要盖在内容之上：折叠窗格开着时它「临时摊开」那一下比占位宽，
+            // 摊开的那截是**盖在内容上**的（Edge 也这么干）——见 DoLayout 里的 slot / show。
+            vPane.BringToFront();
 
             ApplyTheme();
             Theme.Changed += delegate { OnThemeChanged(); };
-            DoLayout();
+            // 收在 ApplyVertical 里：它会把「垂直侧边栏 / 折叠窗格」两个设置读出来、
+            // 把窗格和顶部那条的状态摆对，最后调 DoLayout（这三件事必须一起做，分两处迟早漏一处）
+            ApplyVertical();
 
             // 滚轮这件事登记给全局钩子（内容区是跨进程嵌进来的窗口，我们的窗体收不到它的滚轮消息）。
             // 回调都在**钩子线程**上被调用 —— 这里只读状态 / 往 UI 线程投递，绝不动界面。
@@ -249,22 +332,27 @@ namespace TabbedExplorer
             {
                 Form = Handle,
                 TabStrip = tabStrip.Handle,
+                // 垂直侧边栏那条也是「标签条」：滚轮落在窗格里走的还是切标签（见 WheelHook）。
+                Pane = vPane.Handle,
                 FavBar = favBar.Handle,
-                HasOverflow = delegate { return tabStrip.OverflowCached; },
+                // ⚠ 这两个都可能在**钩子线程**上被求值，所以只能读已算好的状态（见 WheelHook 的三条约束）。
+                //   `TabBar` 只是选一下是哪一个实例，`OverflowCached` 是个 volatile bool。
+                HasOverflow = delegate { return TabBar.OverflowCached; },
                 // 标签条上：左半边（标签）切前后标签，右半边（那排按钮）横向滑标签（用户）
                 StripWheel = delegate(int x, int delta)
                 {
-                    if (tabStrip.InButtonArea(x))
+                    TabStrip bar = TabBar;
+                    if (bar.InButtonArea(x))
                     {
                         // 没溢出就没什么可滑的 —— 别吞，让消息落到它该去的地方
-                        if (!tabStrip.OverflowCached) return false;
-                        Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); });
+                        if (!bar.OverflowCached) return false;
+                        Defer(delegate { bar.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); });
                         return true;
                     }
                     Defer(delegate { CycleTab(delta > 0 ? -1 : 1); });
                     return true;
                 },
-                ScrollStrip = delegate(int delta) { Defer(delegate { tabStrip.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); }); }
+                ScrollStrip = delegate(int delta) { Defer(delegate { TabBar.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); }); }
             });
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
@@ -273,6 +361,18 @@ namespace TabbedExplorer
             {
                 trimTimer.Stop();
                 TrimInactiveTabs();
+            };
+
+            // 侧边栏临时摊开一下再收（见 PeekPane）。
+            peekTimer.Interval = PeekTickMs;
+            peekTimer.Tick += delegate
+            {
+                if (--peekTicks > 0) return;
+                peekTimer.Stop();
+                // 到点了：鼠标还压在窗格上就让它摊着（后面归正常的进出跟踪管），否则收回去
+                if (PaneHasCursor()) return;
+                paneHover = false;
+                DoLayout();
             };
 
             // 标签**不在这里开**：要等第一次现身时才知道该还原什么
@@ -284,7 +384,10 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>
-        /// 手动布局：标签条 → （书签栏）→ 内容。
+        /// 手动布局，两种模式各走一路：
+        ///   横向（默认）：标签条 →（书签栏）→ 内容；
+        ///   垂直（Ctrl+Shift+,）：左栏一整列（工具行 / 标签 / 书签区 / 窗口按钮都归窗格）+ 右侧内容，
+        ///   顶部那条横向的**整条隐藏** —— 窗口最上面一行直接是内容。
         /// 全部摆在内边距（DisplayRectangle）里，四周那一圈（Padding）留给我们自己做可拖拽边框 ——
         /// 只有**没有被子控件盖住**的地方，窗体的 WM_NCHITTEST 才收得到。
         /// </summary>
@@ -298,6 +401,91 @@ namespace TabbedExplorer
             try
             {
                 Rectangle r = DisplayRectangle;
+
+                // ---- 垂直模式：整条左栏归窗格，顶部那条横向的**整条隐藏** ----
+                // 用户：「我就是觉得有一行空的很丑」—— 所以窗口最上面一行直接是内容。
+                if (verticalOn && vPane != null)
+                {
+                    tabStrip.Visible = false;
+
+                    // ⚠ 「占位」（slot）和「实际画多宽」（show）是两回事：折叠窗格开着时
+                    //   平时只占窄窄一条，鼠标进来才临时摊开 —— 摊开那下比占位宽，盖在内容上。
+                    //   要是让内容跟着一起缩，鼠标每进出一次都得 SetWindowPos 那个**跨进程**
+                    //   嵌进来的 explorer 窗口，看着就会一卡一卡的。
+                    int slot = PaneSlotWidth();
+                    int show = PaneShowWidth();
+                    vPane.Collapsed = (show < Px(120));
+                    vPane.PinOn = Settings.VTabsCollapse;
+
+                    // ---- 摊开那一下会压住内容：先抓一张底图，好给它做半透明（见 PaneGlass）----
+                    // ⚠ 必须抓在**改 bounds 之前** —— 那一刻这块地儿还是内容（窗格只有 slot 宽），
+                    //   抓下来才是「窗格要是透明的、底下能看见什么」。抓晚了就把窗格自己抓进去了。
+                    // 只在「不压内容 -> 压内容」那一翻抓；一直压着时不再抓（再抓就是拍自己）。
+                    bool over = show > slot;
+                    if (over && !paneWasOver) GrabGlass(slot, show, r.Height);
+                    else if (!over || glassW != show - slot || glassH != r.Height) DropGlass();
+                    paneWasOver = over;
+
+                    // 书签段摆进窗格里：先问它要多高，窗格才知道给标签区留多少。
+                    // 两边共用同一套坐标（都是这个窗体的子控件），算出来的矩形直接能用。
+                    // 收起态只留顶上那一行标题（点它能摊开，见 FavBar.SectionOpen）；
+                    // 折叠窗格那条窄缝里连标题都放不下，整段不给（展开鼠标移到窗格上才出来）。
+                    int band = 0;
+                    if (favBar != null && !vPane.Collapsed)
+                    {
+                        favBar.Vertical = true;                       // 必须是「竖排」才能算高度
+                        favBar.SectionOpen = favBarOn;
+                        // 第一次摆进来时还没读过数据 —— 不先读一次就算不出它要多高。
+                        // ⚠ 只读一次：书签一个都没有时 Count 恒为 0，不拿标记挡住就会每次排版都重读一遍。
+                        if (!favBandLoaded) { favBandLoaded = true; favBar.Reload(); }
+                        band = favBarOn ? favBar.PreferredVerticalHeight(Math.Max(0, r.Height / 3))
+                                        : favBar.HeaderHeight;
+                    }
+                    vPane.BookmarkBand = band;
+                    vPane.SetBounds(r.Left, r.Top, show, r.Height);
+                    vPane.Visible = true;
+                    vPane.BringToFront();
+
+                    if (favBar != null)
+                    {
+                        if (band > 0)
+                        {
+                            Rectangle bb = vPane.BookmarkBandBounds;
+                            favBar.SetBounds(r.Left + bb.Left, r.Top + bb.Top, bb.Width, bb.Height);
+                            favBar.Visible = true;
+                            favBar.BringToFront();    // 盖在窗格留出来的那一块上
+                        }
+                        else
+                        {
+                            favBar.Vertical = false;  // 没书签区时把它当横向那条收起来（免得它按竖排重算）
+                            favBar.Visible = false;
+                        }
+                    }
+
+                    content.SetBounds(r.Left + slot, r.Top, Math.Max(0, r.Width - slot), r.Height);
+
+                    // 半透明：底图 + 每块控件自己的落点，交给它们画（见 PaneGlass / GlassPaint）。
+                    // ⚠ 必须放在 favBar 摆完、位置定下来之后，否则书签段的落点算不准。
+                    paneGlass.Pct = favGlass.Pct = Settings.VPaneAlpha;
+                    paneGlass.Back = glassBmp;
+                    paneGlass.X = slot;
+                    paneGlass.Y = 0;
+                    vPane.Glass = paneGlass;
+                    if (favBar != null)
+                    {
+                        // 底图是按**窗格**坐标抓的 —— 书签段要减掉自己在窗格里的偏移（Y 是负的，往上够）
+                        favGlass.Back = glassBmp;
+                        favGlass.X = slot - (favBar.Left - vPane.Left);
+                        favGlass.Y = -(favBar.Top - vPane.Top);
+                        favBar.Glass = favGlass;
+                    }
+                    vPane.Invalidate();      // 半透明那层变了，得重画一遍才看得见
+                    if (favBar != null && favBar.Visible) favBar.Invalidate();
+                    return;
+                }
+
+                // ---- 横向模式（原来的排法）----
+                tabStrip.Visible = true;
                 int hTab = Px(TabStrip.StdHeight);
 
                 // 标签条就在最上面（自绘标题栏那一行已经删了，见 TabStrip 类注释）
@@ -308,6 +496,7 @@ namespace TabbedExplorer
                 // 书签栏（Ctrl+Shift+B 开）：夹在标签条和内容之间，跟浏览器一样
                 if (favBar != null)
                 {
+                    favBar.Vertical = false;
                     if (favBarOn)
                     {
                         int hFav = Px(FavBar.StdHeight);
@@ -318,9 +507,12 @@ namespace TabbedExplorer
                 }
 
                 // 内容直接吃到窗口底（以前底下还压着一条 22px 的状态栏）
-                int hContent = r.Bottom - top;
-                if (hContent < 0) hContent = 0;
-                content.SetBounds(r.Left, top, r.Width, hContent);
+                int bodyH = r.Bottom - top;
+                if (bodyH < 0) bodyH = 0;
+
+                if (vPane != null) vPane.Visible = false;
+                DropGlass();      // 横排没有「盖在内容上」这回事，底图要放掉
+                content.SetBounds(r.Left, top, r.Width, bodyH);
             }
             finally { inLayout = false; }
         }
@@ -336,6 +528,7 @@ namespace TabbedExplorer
                 DoLayout();
             }
             if (tabStrip != null) tabStrip.Maximized = max;
+            if (vPane != null) vPane.Maximized = max;
         }
 
         /// <summary>
@@ -350,8 +543,43 @@ namespace TabbedExplorer
                 case TabStrip.WBtn.Maximize:
                     WindowState = (WindowState == FormWindowState.Maximized)
                         ? FormWindowState.Normal : FormWindowState.Maximized;
+                    MarkDirty();   // 最大化 / 还原也算尺寸变了（记的是还原后那块地，见 BoundsString）
                     break;
                 case TabStrip.WBtn.Close: HideToTray(); break;   // 收进托盘，不退进程
+            }
+        }
+
+        /// <summary>「+」新建标签页 = 开一个「此电脑」，**不是**复制当前标签（用户报的 bug 4）。</summary>
+        private void OnNewTabClicked(object sender, EventArgs e)
+        {
+            Diag.Step("EmbedForm: 点击新建标签");
+            NewTab(ExplorerView.ThisPcPath);
+        }
+
+        /// <summary>
+        /// 右侧那排工具按钮（齿轮 / 历史 / 恢复关闭 / 书签栏）。
+        /// 横向那条和垂直窗格**共用这一个处理** —— 两边各写一份，迟早会有一边漏改。
+        /// </summary>
+        private void OnToolClicked(TabStrip.Tool t)
+        {
+            switch (t)
+            {
+                case TabStrip.Tool.Settings:
+                    Diag.Step("EmbedForm: 点击设置按钮");
+                    Defer(ShowSettingsWindow);
+                    break;
+                case TabStrip.Tool.History:
+                    Diag.Step("EmbedForm: 点击历史按钮");
+                    Defer(ShowHistoryMenu);
+                    break;
+                case TabStrip.Tool.Reopen:
+                    Diag.Step("EmbedForm: 点击恢复关闭按钮");
+                    ReopenClosedTab();
+                    break;
+                case TabStrip.Tool.Fav:
+                    Diag.Step("EmbedForm: 点击书签栏按钮");
+                    if (hub != null) hub.SetFavBar(!favBarOn);
+                    break;
             }
         }
 
@@ -360,6 +588,109 @@ namespace TabbedExplorer
             base.OnResize(e);
             SyncChrome();
             DoLayout();
+        }
+
+        // ==================================================================
+        // 记住窗口位置和大小（用户：完全退出后，下次照原样打开）
+        //
+        // 真源在 `desktops.json` 里**每张桌面**的 `bounds`，不另开一份，理由两条：
+        //   ① 每张虚拟桌面的窗口各记各的，互相不打架；
+        //   ② 退出时 `DesktopHub.SaveNow` 本来就要遍历所有活着的窗口写记忆，
+        //      顺手把 `BoundsString` 写进去即可 —— 不必为「记住尺寸」再加一条保存链路。
+        // 格式 `x,y,w,h`（屏幕像素），最大化时末尾再加一个 `1`（好知道下次该不该直接最大化）。
+        // 关掉设置里的「记住窗口位置和大小」= 既不还原也不写回，记忆里那份原样留着，随时再打开。
+        // ==================================================================
+
+        /// <summary>
+        /// 要记进记忆的窗口位置大小。
+        /// ⚠ 这个窗口**没真给用户看过**就返回 null —— 启动时预建、一直没露面的窗口，
+        /// 它的 Bounds 是构造函数里的默认值。照写的话，一次保存就会把用户上次调好的尺寸洗掉。
+        /// </summary>
+        internal string BoundsString
+        {
+            get
+            {
+                if (IsDisposed || Disposing || !windowShown) return null;
+                // 最大化 / 最小化时 `Bounds` 是整屏（或最小化的那个怪矩形），要的是「还原后该占的那块地」
+                Rectangle r = (WindowState == FormWindowState.Normal) ? Bounds : RestoreBounds;
+                if (r.Width <= 0 || r.Height <= 0) return null;
+                string s = r.X + "," + r.Y + "," + r.Width + "," + r.Height;
+                if (WindowState == FormWindowState.Maximized) s += ",1";
+                return s;
+            }
+        }
+
+        /// <summary>第一次现身时把上次退出时的位置和大小摆回去（只做一次）。</summary>
+        private void ApplyRememberedBounds()
+        {
+            if (boundsDone) return;
+            boundsDone = true;
+            if (!Settings.WindowSize)
+            {
+                Diag.Step("窗口: 设置里没开「记住窗口位置和大小」-> 用默认尺寸");
+                return;
+            }
+            DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
+            if (b == null || string.IsNullOrEmpty(b.Bounds)) return;
+
+            string[] p = b.Bounds.Split(',');
+            int x, y, w, h;
+            if (p.Length < 4 ||
+                !int.TryParse(p[0], out x) || !int.TryParse(p[1], out y) ||
+                !int.TryParse(p[2], out w) || !int.TryParse(p[3], out h))
+            {
+                Diag.Log("窗口: 记忆里的 bounds 读不动，忽略：" + b.Bounds);
+                return;
+            }
+            // 窗口太小（老版本记下的、或者被手改坏了）不接受：至少得有最小尺寸
+            if (w < MinimumSize.Width || h < MinimumSize.Height) return;
+
+            // 显示器拔了、换了分辨率、分辨率调小了之后，那个位置可能整个跑到屏幕外 ——
+            // 至少要有 80×80 落在某块屏幕的**工作区**里才认，否则宁可回到默认位置。
+            Rectangle r = new Rectangle(x, y, w, h);
+            bool onScreen = false;
+            foreach (Screen sc in Screen.AllScreens)
+            {
+                Rectangle it = Rectangle.Intersect(sc.WorkingArea, r);
+                if (it.Width >= Px(80) && it.Height >= Px(80)) { onScreen = true; break; }
+            }
+            if (!onScreen)
+            {
+                Diag.Step("窗口: 记忆里的位置已经不在任何屏幕上了 -> 用默认位置");
+                return;
+            }
+
+            if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            Bounds = r;
+            bool max = (p.Length >= 5 && p[4].Trim() == "1");
+            Diag.Step("窗口: 还原位置和大小 " + b.Bounds);
+            if (max) WindowState = FormWindowState.Maximized;
+        }
+
+        /// <summary>
+        /// 托盘菜单「恢复默认窗口位置和大小」：**把记着的那份忘掉**（下次启动也用默认的），
+        /// 然后把窗口摆回默认大小并居中到当前显示器。
+        /// </summary>
+        internal void RestoreDefaultBounds()
+        {
+            Diag.Step("窗口: 恢复默认位置和大小（并忘掉记忆里的那份）");
+            if (hub != null) hub.ForgetBounds(DesktopKey);
+
+            if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            Rectangle wa = Screen.FromHandle(Handle).WorkingArea;
+            Size sz = DefaultWinSize;
+            int w = Math.Min(sz.Width, wa.Width), h = Math.Min(sz.Height, wa.Height);
+            Size = new Size(w, h);
+            Location = new Point(wa.Left + (wa.Width - w) / 2, wa.Top + (wa.Height - h) / 2);
+            windowShown = true;
+            MarkDirty();
+        }
+
+        /// <summary>用户拖完 / 拉完窗口大小（WM_EXITSIZEMOVE）—— 攒一下写进记忆。</summary>
+        protected override void OnResizeEnd(EventArgs e)
+        {
+            base.OnResizeEnd(e);
+            MarkDirty();
         }
 
         protected override void WndProc(ref Message m)
@@ -434,6 +765,7 @@ namespace TabbedExplorer
             BackColor = chrome;
             content.BackColor = chrome;
             tabStrip.Invalidate();
+            if (vPane != null) vPane.Invalidate();
             if (favBar != null) favBar.Invalidate();
         }
 
@@ -475,6 +807,175 @@ namespace TabbedExplorer
         {
             if (IsDisposed || Disposing) return;
             tabStrip.Invalidate();
+            if (vPane != null) vPane.Invalidate();
+        }
+
+        // ==================================================================
+        // 垂直侧边栏（用户：打开/关闭用 Ctrl+Shift+,；样式参考 Edge 的折叠窗格）
+        //
+        // 两个控件：横向的那条（tabStrip）和垂直的左栏（vPane）。标签模型只有一份，
+        // 挂在 tabStrip 上，vPane 只是镜像它 —— 垂直模式下 tabStrip **整条隐藏**，
+        // 工具 / 加号 / 标签 / 窗口按钮全部由 vPane 自己排（见 TabStrip.EnsureLayoutV）。
+        // ==================================================================
+
+        /// <summary>标签现在画在哪个控件上（菜单锚点 / 坐标换算都用它）。</summary>
+        private TabStrip TabBar { get { return (vPane != null && verticalOn) ? vPane : tabStrip; } }
+
+        /// <summary>
+        /// 折叠态窗格宽度（逻辑像素）：**只比一个图标格子宽几个像素**。
+        /// 折叠态整条只有顶上「＋」和底下「×」两颗，中间是图标版的标签行（见 TabStrip.EnsureLayoutV），
+        /// 所以宽度 = 一个图标格子 + 两侧各一丁点留白就够 —— 用户：「未展开时太宽」。
+        /// 30 逻辑 ≈ 45 物理像素，跟原生标题栏那条黑的一样高（实测 43 物理像素 / 150% 缩放），
+        /// 图标列左右各留 3 物理像素，不至于贴着边。
+        /// ⚠ 这个值**不是随便调的**：`TabStrip.EnsureLayoutV` 拿它算图标列的 x，
+        ///   展开态虽然窗格宽得多，但 ＋ / × / 窗口按钮都挂在同一列上 —— 改了这里，两边一起动。
+        /// </summary>
+        internal const int PaneCollapsedL = 30;
+
+        /// <summary>
+        /// 垂直窗格的**占位宽度** —— 真正从内容里挖走的那块。
+        /// 折叠窗格开着时只占窄窄一条（平时收着），关了就一直占满。
+        /// </summary>
+        private static int PaneSlotWidth()
+        {
+            return Settings.VTabsCollapse ? Px(PaneCollapsedL) : Px(210);
+        }
+
+        /// <summary>
+        /// 垂直窗格**现在实际画多宽**。
+        /// 折叠窗格开着时：鼠标不在窗格里就收缩成「纯图标」（用户要的那一条），鼠标一进来临时展开成
+        /// 「图标 + 标题 + 书签段」；关了就是一直展开。
+        /// </summary>
+        private int PaneShowWidth()
+        {
+            int full = Px(210);
+            if (!Settings.VTabsCollapse) return full;
+            return paneHover ? full : Px(PaneCollapsedL);
+        }
+
+        /// <summary>
+        /// 侧边栏「摊开、盖在内容上」那一下的半透明（`Settings.VPaneAlpha`，100 = 不透明）。
+        ///
+        /// 做法：摊开**之前**从屏幕上抓一张那块地儿的图（那一刻还是内容），
+        /// 画的时候先铺底图、再把自己的画按不透明度盖上去（见 `PaneGlass` / `GlassPaint`）。
+        /// 为什么不用 `WS_EX_LAYERED`：子窗口分层合成的是**宿主窗口的背景**，
+        /// 不是它压着的那个兄弟窗口（我们嵌的是别的进程的 explorer）——
+        /// 实测就是「设了不透明度，背景完全看不出效果」。
+        /// ⚠ 底图是**共享**的（`glassBmp`），两个视图（`paneGlass` / `favGlass`）只是引用它，
+        ///   只有这里释放 —— 谁都不能自己 Dispose。
+        /// </summary>
+        private readonly PaneGlass paneGlass = new PaneGlass();
+        private readonly PaneGlass favGlass = new PaneGlass();
+        private Bitmap glassBmp;
+        private int glassW, glassH;
+        /// <summary>上一轮排版时窗格是不是正压着内容（用来卡「翻的那一下才抓图」）。</summary>
+        private bool paneWasOver;
+
+        private void GrabGlass(int slot, int show, int h)
+        {
+            if (Settings.VPaneAlpha >= 100) { DropGlass(); return; }   // 不透明就根本不用抓
+            int w = show - slot;
+            if (w <= 0 || h <= 0 || vPane == null || !vPane.IsHandleCreated) { DropGlass(); return; }
+            if (glassBmp != null && glassW == w && glassH == h) return;
+            DropGlass();
+            Point sp = vPane.PointToScreen(new Point(slot, 0));
+            glassBmp = EmbedApi.GrabScreen(sp.X, sp.Y, w, h);
+            if (glassBmp == null) return;
+            glassW = w;
+            glassH = h;
+        }
+
+        /// <summary>放掉底图（切横排 / 收起窗格 / 窗口尺寸变了抓不到干净底的时候）。</summary>
+        private void DropGlass()
+        {
+            // 先把两个控件的引用摘掉再释放 —— 反过来的话，下一次重画会去画一张已经销毁的图
+            if (vPane != null) vPane.Glass = null;
+            if (favBar != null) favBar.Glass = null;
+            paneGlass.Back = null;
+            favGlass.Back = null;
+            if (glassBmp != null) { Bitmap b = glassBmp; glassBmp = null; b.Dispose(); }
+            glassW = 0;
+            glassH = 0;
+        }
+
+        /// <summary>
+        /// 鼠标在不在「窗格这一块」里 —— 窗格本身 **或** 盖在它上面的书签段。
+        /// 折叠窗格的临时展开就靠这一条：鼠标走开就缩回去，但挪到书签段上不算走开
+        /// （书签段虽然盖在窗格上，可它是另一个控件，窗格自己只会收到 MouseLeave）。
+        /// ⚠ 判「在不在」得拿**实际鼠标位置**再核一遍矩形，不能光信「谁发的 MouseLeave」：
+        ///   书签段一收起（高度缩回只剩标题行 / 干脆 Visible=false），它的 MouseLeave 会跟着来一发，
+        ///   可那会儿鼠标其实还压在窗格上 —— 照着它收缩就成了「点一下书签标题、窗格自己缩回去」，
+        ///   用户报的正是这个（「明明鼠标还在窗格上」）。窗格把内容区那一截盖住是**本来就该算在里面**的。
+        /// </summary>
+        private void PaneMouseMoved(bool inside)
+        {
+            if (!verticalOn) return;
+            if (!inside && PaneHasCursor()) inside = true;
+            if (paneHover == inside) return;
+            paneHover = inside;
+            DoLayout();
+        }
+
+        /// <summary>
+        /// 鼠标现在是不是压在「窗格这一块」上 —— 窗格本身 **或** 盖在它上面的书签段。
+        /// ⚠ 一律拿**实际光标位置**核矩形，不信「谁发的 MouseEnter / MouseLeave」：
+        ///   书签段一收起（高度缩回只剩标题行），它就会给窗格补一发 MouseLeave，
+        ///   可那会儿鼠标其实还压在窗格上（用户报的「点一下书签标题、窗格自己缩回去」）。
+        /// 窗格把内容区那一截盖住时，那块本来就该算「在窗格里」。
+        /// </summary>
+        private bool PaneHasCursor()
+        {
+            Point c = PointToClient(Cursor.Position);
+            if (vPane != null && vPane.Visible && vPane.Bounds.Contains(c)) return true;
+            if (favBar != null && favBar.Visible && favBar.Bounds.Contains(c)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 把侧边栏**临时摊开**一下再收回去 —— 给「Ctrl+Shift+B」这类屏幕上看不出变化的开关一个反馈。
+        /// 竖排时书签段就住在侧边栏里，侧边栏收着的话按完热键画面上纹丝不动，
+        /// 用户根本分不清「是按了没生效」还是「生效了但看不见」（用户原话）。
+        /// 鼠标本来就在窗格上时不用折腾（它已经摊着了）。
+        /// </summary>
+        private void PeekPane()
+        {
+            if (!verticalOn || vPane == null || vPane.IsDisposed) return;
+            if (!vPane.Collapsed) return;                 // 已经摊着 / 折叠窗格关着 —— 没什么可展示的
+            paneHover = true;
+            DoLayout();
+            peekTicks = 10;                               // 160ms x 10 ≈ 1.6 秒
+            peekTimer.Stop();
+            peekTimer.Start();
+        }
+
+        /// <summary>
+        /// 垂直侧边栏相关的设置（模式 / 折叠窗格）变了 —— 重算外观和布局。
+        /// Hub 改完设置会广播给每一个窗口（见 DesktopHub.VerticalAll）。
+        /// </summary>
+        internal void ApplyVertical()
+        {
+            if (IsDisposed || Disposing) return;
+            verticalOn = Settings.VTabs;
+            paneHover = false;
+            if (tabStrip != null)
+            {
+                // 垂直模式下顶部那条**整条不显示**（不是留着当标题栏）：窗口最上面一行直接是内容
+                tabStrip.Visible = !verticalOn;
+                tabStrip.Maximized = (WindowState == FormWindowState.Maximized);
+            }
+            if (vPane != null)
+            {
+                vPane.PinOn = Settings.VTabsCollapse;
+                vPane.FavBarOn = favBarOn;      // 竖排里那枚书签星标也得是实心
+                vPane.Maximized = (WindowState == FormWindowState.Maximized);
+                vPane.Visible = verticalOn;
+                if (verticalOn)
+                {
+                    vPane.BringToFront();
+                    vPane.Invalidate();
+                }
+            }
+            DoLayout();
         }
 
         // ==================================================================
@@ -524,7 +1025,9 @@ namespace TabbedExplorer
                     return;
                 }
 
+                ApplyRememberedBounds();
                 if (!Visible) Show();
+                windowShown = true;
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
 
@@ -565,6 +1068,7 @@ namespace TabbedExplorer
             try
             {
                 if (!Visible) Show();
+                windowShown = true;
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
                 MarkDirty();
@@ -748,6 +1252,10 @@ namespace TabbedExplorer
                     Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 书签栏开关");
                     if (hub != null) hub.SetFavBar(!favBarOn);
                     return;
+                case "vtabs":
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 垂直侧边栏开关");
+                    if (hub != null) hub.SetVerticalTabs(!Settings.VTabs);
+                    return;
             }
             Diag.Log("EmbedForm: 不认识的热键命令 " + cmd);
         }
@@ -851,10 +1359,58 @@ namespace TabbedExplorer
             if (from == to) return;
             if (from < 0 || from >= hosts.Count) return;
             if (to < 0 || to >= hosts.Count) return;
+            MoveHostOnly(from, to);
+            tabStrip.MoveTab(from, to);
+        }
+
+        /// <summary>
+        /// 只挪 `hosts`（标签条那一侧由 `TabStrip` 自己做）。
+        /// ⚠ `hosts` 和标签列表的顺序**必须始终一致** —— `Activate(i)` / `SetPinned(i)` /
+        ///   `hosts[i]` 全是按同一个下标同时读两边的，错位就会「点这个标签、开那个文件夹」。
+        ///   拖标签排序走的是 `OrderMoved`（上层先挪 hosts，标签条再挪自己那份）。
+        /// </summary>
+        private void MoveHostOnly(int from, int to)
+        {
+            if (from == to) return;
+            if (from < 0 || from >= hosts.Count) return;
+            if (to < 0 || to >= hosts.Count) return;
             ExplorerHost h = hosts[from];
             hosts.RemoveAt(from);
             hosts.Insert(to, h);
-            tabStrip.MoveTab(from, to);
+        }
+
+        /// <summary>
+        /// 标签右键「置顶 / 取消置顶」（用户新增）。
+        /// 置顶的标签一律排到最前面（跟浏览器一样）；取消置顶退到「置顶区」右边第一个位置 ——
+        /// 不回原位，因为那一轮排序已经把原位置丢掉了，回哪儿都是猜。
+        /// </summary>
+        private void SetTabPinned(int idx, bool pinned)
+        {
+            if (idx < 0 || idx >= hosts.Count) return;
+            ExplorerHost h = hosts[idx];
+            if (h.Pinned == pinned) return;
+            h.Pinned = pinned;
+            Diag.Step("EmbedForm: " + (pinned ? "置顶" : "取消置顶") + "标签 idx=" + idx);
+
+            // 目标位置 = 「除自己之外」的置顶标签个数。
+            //   置顶：正好落在现有置顶区末尾；取消：正好是置顶区右边第一个。两边共用一个算法。
+            // ⚠ 得先把 h.Pinned 改完再数 —— 但数的时候要**跳过自己**，否则刚置顶的它会被自己多数一次。
+            int target = 0;
+            for (int i = 0; i < hosts.Count; i++)
+            {
+                if (hosts[i] == h) continue;
+                if (hosts[i].Pinned) target++;
+            }
+            MoveTabSynced(idx, target);
+            SyncPins();
+            MarkDirty();
+        }
+
+        /// <summary>把每个 host 的置顶标记同步到标签条（标签条只管画那枚小图钉）。</summary>
+        private void SyncPins()
+        {
+            int n = Math.Min(hosts.Count, tabStrip.Tabs.Count);
+            for (int i = 0; i < n; i++) tabStrip.SetPinned(i, hosts[i].Pinned);
         }
 
         // ==================================================================
@@ -1175,6 +1731,7 @@ namespace TabbedExplorer
             activeIndex = idx;
             for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);
             tabStrip.SetActive(idx);
+            if (vPane != null && verticalOn) vPane.ScrollActiveIntoView();   // 竖排那份也要把选中的那行拉进视线
             hosts[idx].Focus();
             Text = tabStrip.Tabs[idx].Title;   // 任务栏 / Alt+Tab 的显示名（自绘标题栏删了，就剩这一处用途）
             MarkDirty();     // 「当时选中那个」也要记
@@ -1372,9 +1929,13 @@ namespace TabbedExplorer
         private void ShowPopupAtTool(TabStrip.Tool tool, PopItem[] items, string what)
         {
             if (items == null || items.Length == 0) return;
-            Rectangle b = tabStrip.ToolButtonBounds(tool);
-            Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            PopMenu.Show(items, tabStrip, tabStrip.PointToClient(at), what);
+            TabStrip bar = TabBar;
+            Rectangle b = bar.ToolButtonBounds(tool);
+            // 竖排时菜单往**右边**弹（栏本身就窄，往下弹会被标签盖住）
+            Point at = verticalOn
+                ? new Point(b.Right + Px(4), b.Top)
+                : new Point(b.Left + b.Width / 2, b.Bottom);
+            PopMenu.Show(items, bar, at, what);
         }
 
         /// <summary>Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出）。</summary>
@@ -1424,9 +1985,17 @@ namespace TabbedExplorer
             string target = PathRules.Restorable(live) ? live : hosts[idx].TargetPath;
 
             List<PopItem> m = new List<PopItem>();
+            // 置顶（用户新增）：菜单文字随当前状态变，点一下就在两边切
+            bool pinNow = hosts[idx].Pinned;
             m.Add(Mi("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
             m.Add(Mi("复制完整路径", delegate { CopyText(target, "完整路径"); }));
             m.Add(SepItem());
+            m.Add(Mi(pinNow ? "取消置顶标签页" : "置顶标签页", delegate
+            {
+                int k = idx;
+                bool want = !pinNow;
+                Defer(delegate { SetTabPinned(k, want); });
+            }));
             m.Add(Mi("在新标签页打开", delegate
             {
                 if (!PathRules.Restorable(target))
@@ -1463,9 +2032,9 @@ namespace TabbedExplorer
             m.Add(SepItem());
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
-            Rectangle b = tabStrip.TabBounds(idx);
-            Point at = tabStrip.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
-            PopMenu.Show(m.ToArray(), tabStrip, tabStrip.PointToClient(at),
+            Rectangle b = TabBar.TabBounds(idx);
+            Point at = TabBar.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
+            PopMenu.Show(m.ToArray(), TabBar, TabBar.PointToClient(at),
                 "标签右键 idx=" + idx);
         }
 
@@ -1592,8 +2161,9 @@ namespace TabbedExplorer
             m.Add(SepItem());
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
-            Point at = tabStrip.PointToScreen(blankAt);
-            PopMenu.Show(m.ToArray(), tabStrip, tabStrip.PointToClient(at),
+            Control ow = blankOwner ?? tabStrip;
+            Point at = ow.PointToScreen(blankAt);
+            PopMenu.Show(m.ToArray(), ow, ow.PointToClient(at),
                 "标签条空白右键");
         }
 
@@ -1633,11 +2203,16 @@ namespace TabbedExplorer
         internal void SetFavBarOn(bool on)
         {
             if (IsDisposed || Disposing) return;
+            // 窗口刚起来时 Hub 会用它同步一次当前设置 —— 那不是用户在按，不弹侧边栏
+            bool syncOnly = !favBarEverSet;
+            favBarEverSet = true;
             favBarOn = on;
             tabStrip.FavBarOn = on;
+            if (vPane != null) vPane.FavBarOn = on;
             if (on) favBar.Reload();
             Diag.Step("EmbedForm: 书签栏 -> " + (on ? "显示" : "隐藏"));
             DoLayout();
+            if (!syncOnly) PeekPane();
         }
 
         internal bool FavBarOn { get { return favBarOn; } }
@@ -1651,6 +2226,7 @@ namespace TabbedExplorer
         {
             this.inactive = inactive;
             if (tabStrip != null) tabStrip.Inactive = inactive;
+            if (vPane != null) vPane.Inactive = inactive;
             if (favBar != null) favBar.Inactive = inactive;
             ApplyTheme();    // 外壳底色也换成激活 / 失活那一套
         }
@@ -1725,6 +2301,8 @@ namespace TabbedExplorer
             try { WheelRouter.Unregister(Handle); } catch { }
             // 设置窗口现在归 Hub 管（它会在自己 Dispose 时收）—— 这里不再碰。
             try { trimTimer.Stop(); trimTimer.Dispose(); } catch { }
+            try { peekTimer.Stop(); peekTimer.Dispose(); } catch { }
+            DropGlass();
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }
 

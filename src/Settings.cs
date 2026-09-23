@@ -17,6 +17,10 @@ namespace TabbedExplorer
     ///   tabautofit = 1 | 0                  自适应宽度②：挤不下时自动缩窄
     ///   favbar     = 1 | 0                  书签栏显不显示（Ctrl+Shift+B）
     ///   captureall = 1 | 0                  是否把「从开始菜单/桌面打开的文件夹」也收成标签
+    ///   winsize    = 1 | 0                  退出后记住窗口位置和大小（默认开，按虚拟桌面分别记）
+    ///   vtabs      = 1 | 0                  垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）
+    ///   vtabscollapse = 1 | 0               垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标
+    ///   vpanealpha = 60 ~ 100               侧边栏盖在内容上那一下的不透明度（%，100 = 不透明）
     ///   debug      = 1 | 0                  是否把详细过程写进 data\log.txt（默认关，见 Diag）
     ///
     /// ⚠ 用 JSON 而不是 `key=value`（用户要求「配置项文件用 json 格式」）：
@@ -70,6 +74,32 @@ namespace TabbedExplorer
         /// </summary>
         public static bool CaptureAll = true;
         /// <summary>
+        /// 退出后**记住窗口位置和大小**（默认开）。真源在 `desktops.json` 每张桌面的 `bounds` 里 ——
+        /// 这里只是一个开关：关了就不记、也不还原（下次起来还是默认尺寸）。
+        /// </summary>
+        public static bool WindowSize = true;
+        /// <summary>垂直侧边栏（Ctrl+Shift+,）：标签竖排在左边窗格，参考 Edge 的垂直侧边栏。</summary>
+        public static bool VTabs = false;
+        /// <summary>
+        /// 垂直窗格的「折叠窗格」（窗格顶部那枚图钉）：开 = 鼠标不在窗格上时收缩成纯图标、
+        /// 鼠标一进来临时展开成完整（图标 + 标题）；关 = 一直显示完整标题。
+        /// </summary>
+        public static bool VTabsCollapse = true;
+        /// <summary>
+        /// 垂直侧边栏「临时摊开、盖在内容上」那一下的不透明度（%）：100 = 完全不透明，越小越透。
+        /// 折叠窗格开着时窗格会比占位宽、盖住内容一截（见 `PaneShowWidth`）——
+        /// 透一点能看见后面那个文件夹，不至于像一块板子糊在脸上。只在「盖住内容」时生效。
+        /// </summary>
+        public static int VPaneAlpha = 80;
+
+        /// <summary>
+        /// 不透明度的合法范围（%）。**下限就是 0**（用户：「不要限制范围」）——
+        /// 0 = 完全透明，那时窗格上的字基本看不见了，但那是用户自己的选择。
+        /// </summary>
+        public const int VPaneAlphaMin = 0;
+        public const int VPaneAlphaMax = 100;
+
+        /// <summary>
         /// Debug 模式：把每一步的详细过程写进 `data\log.txt`。
         ///
         /// 用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，不过我们要开」。
@@ -101,13 +131,15 @@ namespace TabbedExplorer
         /// <summary>可自定义的命令（顺序 = 设置窗口里显示的顺序）。</summary>
         public static readonly string[] HotkeyKeys = new string[]
         {
-            "newtab", "closetab", "nexttab", "prevtab", "history", "reopen", "favbar"
+            "newtab", "closetab", "nexttab", "prevtab", "history", "reopen", "favbar", "vtabs"
         };
 
         /// <summary>各项的默认组合键（跟浏览器对齐那一套）。</summary>
         public static readonly string[] HotkeyDefaults = new string[]
         {
-            "Ctrl+T", "Ctrl+W", "Ctrl+Tab", "Ctrl+Shift+Tab", "Ctrl+H", "Ctrl+Shift+T", "Ctrl+Shift+B"
+            "Ctrl+T", "Ctrl+W", "Ctrl+Tab", "Ctrl+Shift+Tab", "Ctrl+H", "Ctrl+Shift+T", "Ctrl+Shift+B",
+            // 垂直侧边栏：跟 Edge 对齐 —— Ctrl+Shift+,（用户指定）
+            "Ctrl+Shift+,"
         };
 
         private static readonly Dictionary<string, string> hotkeys =
@@ -162,6 +194,10 @@ namespace TabbedExplorer
                     TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
                     FavBar       = Json.GetBool(json, "favbar", false);
                     CaptureAll   = Json.GetBool(json, "captureall", true);
+                    WindowSize   = Json.GetBool(json, "winsize", true);
+                    VTabs        = Json.GetBool(json, "vtabs", false);
+                    VTabsCollapse = Json.GetBool(json, "vtabscollapse", true);
+                    VPaneAlpha   = ClampAlpha(Json.GetInt(json, "vpanealpha", VPaneAlpha));
                     Debug        = Json.GetBool(json, "debug", false);
                     Diag.Enabled = Debug;        // 读完才是最终口径（见 Diag.Enabled 的说明）
                     hotkeys.Clear();
@@ -222,6 +258,10 @@ namespace TabbedExplorer
                     case "tabautowiden": TabAutoWiden = ParseBool(v, true); break;
                     case "favbar":       FavBar = ParseBool(v, false); break;
                     case "captureall":   CaptureAll = ParseBool(v, true); break;
+                    case "winsize":      WindowSize = ParseBool(v, true); break;
+                    case "vtabs":        VTabs = ParseBool(v, false); break;
+                    case "vtabscollapse": VTabsCollapse = ParseBool(v, true); break;
+                    case "vpanealpha":    VPaneAlpha = ClampAlpha(ParseInt(v, VPaneAlpha)); break;
                     case "debug":        Debug = ParseBool(v, false); break;
                 }
             }
@@ -243,8 +283,12 @@ namespace TabbedExplorer
                 sb.Append("  \"_tabautowiden\": \"true = 名字太长时这个标签自己加宽（最多 400 逻辑像素）；false = 所有标签一样宽\",\r\n");
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
+                sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
+                sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
+                sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");
                 sb.Append("  \"_debug\": \"true = 把每一步的详细过程写进 data\\\\log.txt（默认 false）。查问题时打开，平时关着不占地方。\",\r\n");
                 sb.Append("  \"_hotkeys\": \"程序自己的快捷键，格式 Ctrl+Shift+T / Alt+F4 这样；留空或删掉这一行 = 用默认。Ctrl+1..9 跳标签是固定的、不在这里。\",\r\n");
+                sb.Append("  \"_vpanealpha\": \"侧边栏摊开盖在内容上那一下的不透明度，%，0 ~ 100；100 = 完全不透明，0 = 完全透明（只在折叠窗格开着、鼠标移进去盖住内容时生效）\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
@@ -253,6 +297,10 @@ namespace TabbedExplorer
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"winsize\": ").Append(WindowSize ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"vtabs\": ").Append(VTabs ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"vtabscollapse\": ").Append(VTabsCollapse ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"vpanealpha\": ").Append(VPaneAlpha).Append(",\r\n");
                 sb.Append("  \"debug\": ").Append(Debug ? "true" : "false").Append(",\r\n");
                 // 快捷键：只写「跟默认不一样」的那些（默认值不落文件，以后换默认值能跟着走）
                 StringBuilder hb = new StringBuilder();
@@ -287,10 +335,10 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} debug={8} hotkeys={9}",
+            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} winsize={8} vtabs={9} vtabsfold={10} vpanealpha={11} debug={12} hotkeys={13}",
                 Text(Capture), KeepTabs ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
-                Debug ? 1 : 0, hotkeys.Count);
+                WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0, VPaneAlpha, Debug ? 1 : 0, hotkeys.Count);
         }
 
         // ==================================================================
@@ -302,6 +350,13 @@ namespace TabbedExplorer
             if (w < TabWidthMin) return TabWidthMin;
             if (w > TabWidthMax) return TabWidthMax;
             return w;
+        }
+
+        public static int ClampAlpha(int a)
+        {
+            if (a < VPaneAlphaMin) return VPaneAlphaMin;
+            if (a > VPaneAlphaMax) return VPaneAlphaMax;
+            return a;
         }
 
         private static bool ParseBool(string v, bool dflt)
@@ -372,6 +427,10 @@ namespace TabbedExplorer
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }
+        public static void SetWindowSize(bool on) { WindowSize = on; Save(); }
+        public static void SetVTabs(bool on) { VTabs = on; Save(); }
+        public static void SetVTabsCollapse(bool on) { VTabsCollapse = on; Save(); }
+        public static void SetVPaneAlpha(int a) { VPaneAlpha = ClampAlpha(a); Save(); }
 
         /// <summary>Debug 模式开关：改完立刻生效（`Diag` 每次写之前都看那个闸）。</summary>
         public static void SetDebug(bool on)

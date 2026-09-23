@@ -39,6 +39,8 @@ namespace TabbedExplorer
             public Image Icon;
             /// <summary>标题文字的像素宽（只在换标题时量一次 —— 自适应宽度每个鼠标事件都要用它算布局）。</summary>
             public int TextW;
+            /// <summary>置顶了（右键「置顶标签页」）—— 排在最前面，名字前面多一枚小图钉。</summary>
+            public bool Pinned;
         }
 
         private static readonly float DpiScale = ReadDpi();
@@ -56,10 +58,26 @@ namespace TabbedExplorer
 
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
-        /// <summary>标签条标准高度（逻辑像素）。**一行**文字，所以比两行那版矮回来。</summary>
-        public const int StdHeight = 34;
+        /// <summary>
+        /// 标签条标准高度（逻辑像素）。**一行**文字，所以比两行那版矮回来。
+        /// 30 = 跟垂直侧边栏的折叠宽度（`EmbedForm.PaneCollapsedL`）、书签栏（`FavBar.StdHeight`）**同一个数**：
+        /// 三处的图标都是 `IconSize` 一样大，横向那条比侧栏宽一截就显得「太厚」（用户：「水平状态感觉太高了，
+        /// 不和谐……垂直时宽度倒是挺合适的」）。要再矮就得先看顶部那条滚动条（`LayoutScrollBar`，高 `Px(4)`，
+        /// 压在 y=0）还够不够点。
+        /// </summary>
+        public const int StdHeight = 30;
 
-        private readonly List<TabItem> tabs = new List<TabItem>();
+        /// <summary>自己那份标签模型（没挂镜像时用的就是它）。</summary>
+        private readonly List<TabItem> ownTabs = new List<TabItem>();
+        /// <summary>
+        /// 当前用的标签模型 —— 默认指向 `ownTabs`。
+        /// 垂直模式下左侧窗格**是另一个 TabStrip 实例**，它 `MirrorFrom(顶部那条)` 之后这个字段
+        /// 就指向**同一个 List**：上层增删改只调一次，两个视图看到的永远是同一份数据，
+        /// 不必写「两个标签条之间的同步」那种一定会漏的代码。
+        /// </summary>
+        private List<TabItem> tabs;
+        /// <summary>镜像对端 —— 这边重画时那边跟着重画（见 Redraw）。</summary>
+        private TabStrip peer;
         private readonly List<Rectangle> bounds = new List<Rectangle>();
 
         /// <summary>
@@ -91,12 +109,24 @@ namespace TabbedExplorer
         // 位置全部由 EnsureLayout 算（标签数 / 窗口宽 / 右侧那排按钮都会变）。
         private Rectangle newRect;
         private Rectangle settingsRect;
-        private static readonly Rectangle[] toolRects = new Rectangle[4];   // 见 Tool 枚举
-        private static readonly Rectangle[] wbtnRects = new Rectangle[3];   // 见 WBtn 枚举
+        // ⚠ 这两个**必须是实例字段**，不能是 static：垂直模式下左侧窗格和顶部那条是
+        //   **同一个类的两个实例**，static 会让两边互相把对方的排版矩形冲掉。
+        private readonly Rectangle[] toolRects = new Rectangle[4];   // 见 Tool 枚举
+        private readonly Rectangle[] wbtnRects = new Rectangle[3];   // 见 WBtn 枚举
         private int dividerX;
         private int toolsLeft;
         /// <summary>标签区右界（画的时候裁到这儿、命中判定也以它为准）。由 EnsureLayout 算一次，两边共用。</summary>
         private int tabsClipRight;
+
+        // ---- 垂直窗格的排法结果（横向那条不读这几个）----
+        /// <summary>垂直窗格：标签区上界 = 顶部那排工具按钮的下沿。</summary>
+        private int tabsTopV;
+        /// <summary>垂直窗格：标签区下界（画和命中判定都裁到这儿，下面要么是书签区要么是窗口按钮）。</summary>
+        private int tabsBottomV;
+        /// <summary>垂直窗格：底部窗口按钮那一块的上沿。</summary>
+        private int winTopV;
+        /// <summary>垂直窗格：书签区**实际留出**的高度（可能被挤压，见 BookmarkBand）。</summary>
+        private int favBandH;
 
         // 标签宽度：跟着设置走（逻辑像素 ×DPI）。
         //   `MaxTabWidth` = 「标签页宽度」那一项，也就是**基准宽度**；
@@ -115,6 +145,8 @@ namespace TabbedExplorer
         private int CloseBoxSize { get { return Px(16); } }
 
         private static int IconSize { get { return Px(16); } }
+        /// <summary>置顶标签名前那枚小图钉占的宽度（含右侧留白）。</summary>
+        private int PinAreaWidth { get { return Px(15); } }
         /// <summary>标签图标的目标尺寸（设备像素）。外面给 ExplorerHost 设尺寸时用这个。</summary>
         public static int TabIconSize { get { return IconSize; } }
         private const int TextPadLeft = 6;
@@ -148,7 +180,11 @@ namespace TabbedExplorer
         /// 同一个字号并排会明显看着小（用户：「右上三颗窗控图标已经一样大了，书签图标有点小」）。
         /// </summary>
         private readonly Font favGlyphFont;
-
+        /// <summary>
+        /// 置顶标签上那枚小图钉（MDL2 `\uE718`）的字号。比工具按钮再小一号 ——
+        /// 它只是个「这个标签被钉住了」的标记，不该跟文件夹名抢视觉重量（用户：小标志、不占地方）。
+        /// </summary>
+        private readonly Font pinFont;
         /// <summary>窗口没激活（失活）时整体降色 —— 底色和文字都跟原生标题栏一个逻辑。</summary>
         public bool Inactive
         {
@@ -158,7 +194,7 @@ namespace TabbedExplorer
                 if (inactive == value) return;
                 inactive = value;
                 BackColor = BarBack;
-                Invalidate();
+                Redraw();
             }
         }
         private bool inactive;
@@ -170,7 +206,7 @@ namespace TabbedExplorer
         public bool Maximized
         {
             get { return maximized; }
-            set { if (maximized != value) { maximized = value; Invalidate(); } }
+            set { if (maximized != value) { maximized = value; Redraw(); } }
         }
         private bool maximized;
 
@@ -178,9 +214,90 @@ namespace TabbedExplorer
         public bool FavBarOn
         {
             get { return favBarOn; }
-            set { if (favBarOn != value) { favBarOn = value; Invalidate(); } }
+            set { if (favBarOn != value) { favBarOn = value; Redraw(); } }
         }
         private bool favBarOn;
+
+        /// <summary>
+        /// 垂直模式：这个标签条当**左侧窗格**用 —— 整个窗口就靠这一条，
+        /// 工具按钮 / 加号 / 标签行 / 书签区位 / 窗口按钮全在里面从上往下摞
+        /// （这时顶部那条横向的**整条隐藏**，见 EmbedForm.DoLayout）。
+        /// </summary>
+        public bool Vertical { get; set; }
+
+        /// <summary>
+        /// 垂直模式的折叠态（默认）：整条只有顶上「＋」、底下「×」两颗，标签行只画图标 ——
+        /// 鼠标移进来窗格摊开才显示其余工具、标题和书签段（Edge 的「折叠窗格」就是这意思）。
+        /// </summary>
+        public bool Collapsed
+        {
+            get { return collapsed; }
+            set { if (collapsed != value) { collapsed = value; Redraw(); } }
+        }
+        private bool collapsed;
+
+        /// <summary>
+        /// 垂直窗格顶部那枚图钉现在是「开」还是「关」（开 = 折叠窗格：焦点不在就只显示图标）。
+        /// 只影响画成什么颜色，折叠与否由上层（EmbedForm）算完窗格宽度再告诉我们。
+        /// </summary>
+        public bool PinOn
+        {
+            get { return pinOn; }
+            set { if (pinOn != value) { pinOn = value; Redraw(); } }
+        }
+        private bool pinOn;
+
+        /// <summary>
+        /// 垂直窗格底部留给**书签区**的高度（0 = 不留）。
+        /// 垂直模式下书签栏是另一个控件（`FavBar`），由上层摆进这块地方里 ——
+        /// 这里只负责给它腾位子、并且让标签列表别画到它头上。两边互不认识对方。
+        /// </summary>
+        public int BookmarkBand
+        {
+            get { return bookmarkBand; }
+            set { if (bookmarkBand != value) { bookmarkBand = value; Redraw(); } }
+        }
+        private int bookmarkBand;
+
+        /// <summary>书签区那块矩形（窗格客户坐标）—— 上层拿它摆书签控件。</summary>
+        public Rectangle BookmarkBandBounds
+        {
+            get
+            {
+                EnsureLayout();
+                return new Rectangle(0, winTopV - favBandH, Width, Math.Max(0, favBandH));
+            }
+        }
+
+        /// <summary>底部窗口按钮那一块的上沿（上层要在它上面摆东西时用得到）。</summary>
+        public int WindowRowTop
+        {
+            get { EnsureLayout(); return winTopV; }
+        }
+
+        /// <summary>垂直窗格顶部那枚图钉被点了（上层拿它开关「折叠窗格」）。</summary>
+        public event Action PinClicked;
+
+        /// <summary>重画自己 **+ 镜像对端** —— 两边渲染同一份模型，一边变了另一边必须跟着重算。</summary>
+        private void Redraw()
+        {
+            Invalidate();
+            TabStrip p = peer;
+            if (p != null && !p.IsDisposed) p.Invalidate();
+        }
+
+        /// <summary>
+        /// 把标签模型挂到**另一个标签条**上（垂直窗格用的就是这条）。
+        /// 挂上之后两边共用同一个 `List&lt;TabItem&gt;`，上层只调一次就够了。
+        /// ⚠ 镜像方是**只读**的：别对镜像实例调 AddTab / RemoveTab / MoveTab（那会动到源的头）。
+        /// </summary>
+        public void MirrorFrom(TabStrip source)
+        {
+            tabs = (source == null) ? ownTabs : source.tabs;
+            peer = source;
+            if (source != null) source.peer = this;
+            Redraw();
+        }
 
         public delegate void IndexEventHandler(object sender, int index);
 
@@ -195,6 +312,12 @@ namespace TabbedExplorer
         public event Action<WBtn> WindowButtonClicked;
         public event IndexEventHandler TabMiddleClicked;
         public event IndexEventHandler OrderChanged;   // 拖拽排序后：原索引
+        /// <summary>
+        /// 拖拽排序**即将**生效（`from` → `to`）。跟 `OrderChanged` 的区别是它带上了目标位置 ——
+        /// 上层要挪自己那份平行列表（EmbedForm 的 `hosts`）就得知道挪到哪儿。
+        /// 在 `MoveTab` **之前**发：上层先挪它那份、我们再做视图这一侧，不会两边各挪一次。
+        /// </summary>
+        public event Action<TabStrip, int, int> OrderMoved;
         /// <summary>标签条**空白区域**（不是标签、不是按钮）上按了右键。</summary>
         public event Action<Point> BlankRightClicked;
         /// <summary>在标签条上滚滚轮（用户：标签条上滚轮 = 切换前后标签页）。参数是 delta（正=往上滚=上一个）。</summary>
@@ -202,6 +325,7 @@ namespace TabbedExplorer
 
         public TabStrip()
         {
+            tabs = ownTabs;
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.Selectable, true);
@@ -212,6 +336,8 @@ namespace TabbedExplorer
             glyphFont = new Font("Segoe MDL2 Assets", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
             wbtnFont = new Font("Segoe MDL2 Assets", Px(10), FontStyle.Regular, GraphicsUnit.Pixel);
             favGlyphFont = new Font("Segoe MDL2 Assets", Px(14), FontStyle.Regular, GraphicsUnit.Pixel);
+            // 置顶标签上那枚小图钉：比工具按钮再小一号 —— 它只是个标记，不该抢标题的视觉重量
+            pinFont = new Font("Segoe MDL2 Assets", Px(11), FontStyle.Regular, GraphicsUnit.Pixel);
             BackColor = Theme.TabBar;
             AllowDrop = true;
             tips.InitialDelay = 350;    // 停一下再弹，别鼠标一扫过就满屏提示
@@ -219,7 +345,7 @@ namespace TabbedExplorer
             tips.AutoPopDelay = 8000;
             tips.ShowAlways = true;     // 见字段注释：不开的话窗口没激活就不弹
             Theme.StyleTip(tips, tipTitleFont, titleFont);   // 名字那行粗体、路径行常规（量尺寸也要按粗体量）
-            Theme.Changed += delegate { BackColor = BarBack; tips.BackColor = Theme.MenuBack; tips.ForeColor = Theme.Text; Invalidate(); };
+            Theme.Changed += delegate { BackColor = BarBack; tips.BackColor = Theme.MenuBack; tips.ForeColor = Theme.Text; Redraw(); };
         }
 
         public IList<TabItem> Tabs { get { return tabs; } }
@@ -227,7 +353,7 @@ namespace TabbedExplorer
         public void AddTab(string title)
         {
             tabs.Add(new TabItem { Title = title ?? "", TextW = MeasureTitle(title) });
-            Invalidate();
+            Redraw();
         }
 
         public void SetTitle(int index, string title)
@@ -236,7 +362,7 @@ namespace TabbedExplorer
             if (tabs[index].Title == title) return;
             tabs[index].Title = title ?? "";
             tabs[index].TextW = MeasureTitle(tabs[index].Title);
-            Invalidate();
+            Redraw();
         }
 
         /// <summary>标题文字有多宽（自适应宽度要用）。空标题给个最小宽度，别缩成一条缝。</summary>
@@ -258,7 +384,7 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             if (tabs[index].Path == path) return;
             tabs[index].Path = path ?? "";
-            Invalidate();
+            Redraw();
         }
 
         /// <summary>换掉某个标签的图标（当前文件夹的实时图标，导航后上层会再调）。</summary>
@@ -267,7 +393,16 @@ namespace TabbedExplorer
             if (index < 0 || index >= tabs.Count) return;
             if (tabs[index].Icon == icon) return;
             tabs[index].Icon = icon;
-            Invalidate();
+            Redraw();
+        }
+
+        /// <summary>改某个标签的「置顶」标记（排序由上层做，这里只管那枚小图钉）。</summary>
+        public void SetPinned(int index, bool pinned)
+        {
+            if (index < 0 || index >= tabs.Count) return;
+            if (tabs[index].Pinned == pinned) return;
+            tabs[index].Pinned = pinned;
+            Redraw();
         }
 
         public void RemoveTab(int index)
@@ -277,14 +412,14 @@ namespace TabbedExplorer
             if (hoverIndex == index) hoverIndex = -1;
             // 不用把 scrollX 归零：下一次 EnsureLayout 会把它夹到新的 maxScroll 上
             // （归零反而会让用户刚滑到的位置白滑 —— 关一个标签不该把视口弹回最左边）。
-            Invalidate();
+            Redraw();
         }
 
         public void SetActive(int index)
         {
             for (int i = 0; i < tabs.Count; i++) tabs[i].Active = (i == index);
             ScrollActiveIntoView();   // 选中的标签不许停在屏幕外（浏览器都这么做）
-            Invalidate();
+            Redraw();
         }
 
         /// <summary>
@@ -298,6 +433,19 @@ namespace TabbedExplorer
             if (maxScroll <= 0) return;
             int i = ActiveIndex;
             if (i < 0 || i >= bounds.Count) return;
+            if (Vertical)
+            {
+                // 竖排：把选中的那一行拉进标签区（工具行 / 书签区那两块不算可视区）
+                int ny = scrollX;
+                if (bounds[i].Top < tabsTopV) ny = scrollX + (bounds[i].Top - tabsTopV);
+                else if (bounds[i].Bottom > tabsBottomV) ny = scrollX + (bounds[i].Bottom - tabsBottomV);
+                if (ny < 0) ny = 0;
+                if (ny > maxScroll) ny = maxScroll;
+                if (ny == scrollX) return;
+                scrollX = ny;
+                Redraw();
+                return;
+            }
             int nx = scrollX;
             if (bounds[i].Left < 0) nx = scrollX + bounds[i].Left;
             else if (bounds[i].Right > tabsClipRight) nx = scrollX + (bounds[i].Right - tabsClipRight);
@@ -305,7 +453,7 @@ namespace TabbedExplorer
             if (nx > maxScroll) nx = maxScroll;
             if (nx == scrollX) return;
             scrollX = nx;
-            Invalidate();
+            Redraw();
         }
 
         public int ActiveIndex
@@ -319,7 +467,7 @@ namespace TabbedExplorer
             TabItem it = tabs[from];
             tabs.RemoveAt(from);
             tabs.Insert(to, it);
-            Invalidate();
+            Redraw();
         }
 
         // ------------------------------------------------------------------
@@ -334,6 +482,15 @@ namespace TabbedExplorer
         ///      关 → 不缩，但**总宽仍然不越过右边那排按钮**：多出来的部分靠横向滚动看（`scrollX`）。
         /// </summary>
         private void EnsureLayout()
+        {
+            // 垂直窗格和顶部那条是**同一套代码的两种排法**（见 Vertical）：
+            // 一个控件只可能是其中一种，这里分一下路，两边互不打扰。
+            if (Vertical) { EnsureLayoutV(); return; }
+            EnsureLayoutH();
+        }
+
+        /// <summary>横向（顶部那条）的排法。</summary>
+        private void EnsureLayoutH()
         {
             // 最右：窗口按钮（从右往左：关闭 → 最大化 → 最小化）
             wbtnRects[(int)WBtn.Close] = new Rectangle(Width - WBtnWidth, 0, WBtnWidth, Height);
@@ -370,11 +527,12 @@ namespace TabbedExplorer
             {
                 int t = tabs[i].TextW;
                 if (t <= 0) t = MeasureTitle(tabs[i].Title);
+                int pin = tabs[i].Pinned ? PinAreaWidth : 0;
                 int w = MaxTabWidth;
                 if (Settings.TabAutoWiden)
                 {
                     // 图标 + 左右留白 + 右边给关闭按钮留位
-                    int need = Px(TextPadLeft) + IconSize + Px(IconGap) + t + CloseAreaWidth + Px(4);
+                    int need = Px(TextPadLeft) + IconSize + Px(IconGap) + pin + t + CloseAreaWidth + Px(4);
                     w = Math.Max(MaxTabWidth, Math.Min(WidenMaxWidth, need));
                     // ⚠ 用户报「过长依然出现遮挡问题（没收到滚动条范围内）」：
                     //   原来这里还把 w 再夹一次「标签区可用宽度」（`if (w > avail) w = avail`），
@@ -385,6 +543,8 @@ namespace TabbedExplorer
                     //   想「谁也别挤谁」就把「自动缩窄」打开，那条路是 `TabAutoFit`，别在这儿夹。
                 }
                 if (w < MinTabWidth) w = MinTabWidth;
+                // 置顶那枚小图钉要占地方的 —— 不补这一段，图钉就会把标题挤掉一截
+                w += pin;
                 want[i] = w;
                 total += w;
             }
@@ -419,6 +579,159 @@ namespace TabbedExplorer
             int limit = areaRight;
             if (nx > limit) nx = Math.Max(Px(2), limit);
             newRect = new Rectangle(nx, 0, NewButtonWidth, Height);
+        }
+
+        // ==================================================================
+        // 垂直窗格（用户：打开/关闭垂直侧边栏 Ctrl+Shift+,）
+        //
+        // 就是**同一个类的另一种排法**，而且是垂直模式下**唯一**的一条：
+        // 展开时从上往下是 工具行（加号 + 历史 / 恢复 + 齿轮，图钉在右端）→ 标签行 → 书签段 →
+        // 窗口按钮（底部**左起**：关闭 / 放大 / 缩小）。
+        // 顶部那条横向的在垂直模式下**整条隐藏**（不是留着当标题栏）——
+        // 用户：「我就是觉得有一行空的很丑」，所以窗口最上面一行就是内容。
+        // 折叠态（默认）只留**顶上「＋」和底下「×」**两颗，中间是图标版的标签行；
+        // 展开（鼠标移进来）才是图标 + 标题 + 关闭按钮 + 书签段。
+        // ==================================================================
+
+        /// <summary>垂直模式每行标签的高度（逻辑像素）。</summary>
+        private const int VRowHeightL = 32;
+        /// <summary>垂直模式顶部工具行的下沿（两种状态共用 —— 摊开时标签列表不上下跳）。</summary>
+        private const int VToolRowL = 34;
+        /// <summary>垂直模式底部窗口按钮那一块的上沿（两种状态共用）。</summary>
+        private const int VWinRowL = 34;
+        /// <summary>垂直模式里一个图标格子的大小 —— 工具按钮 / 图钉 / 窗口按钮都用它。</summary>
+        private const int VCellL = 26;
+
+        private Rectangle pinRect;
+        private bool hoverPin;
+
+        private int VRowH { get { return Px(VRowHeightL); } }
+        private int VCell { get { return Px(VCellL); } }
+        private int VGap { get { return Px(2); } }
+
+        /// <summary>
+        /// 垂直排法。整条左栏从上往下：工具行 → 标签行 → 书签段 → 窗口按钮。
+        ///
+        /// **折叠态（默认）整条只留两颗**：顶上一个「＋」、底下一颗「×」，中间那段全给标签图标；
+        /// 鼠标移进来窗格摊开（`EmbedForm.PaneShowWidth` 把宽度放大）才排其余工具、显示标题和书签段。
+        /// 两条**不许破的**几何约束：
+        /// ① 上下 —— 两种状态共用同一套边界（`tabsTopV` / `winTopV`）；
+        /// ② 左右 —— 两种状态共用同一个图标列 x（`iconX`，按**折叠态宽度**算，不看当前 Width）。
+        /// 摊开时 ＋ / × 原地不动，只是中间「多出来」东西、旁边多出几颗按钮。
+        ///
+        /// ⚠ 书签段那一块**不是我们画的** —— 上层把书签控件摆进来，这里只留空位
+        /// （`BookmarkBand`）并把标签区裁到它上面为止；`favBandH` 是**实际**留出来的高度。
+        /// </summary>
+        private void EnsureLayoutV()
+        {
+            bounds.Clear();
+            int pad = Px(4);
+            int cell = VCell;
+            int gap = VGap;
+
+            // 图标列：**两种状态共用同一个 x** —— 折叠态窗格就只有 EmbedForm.PaneCollapsedL 宽，
+            // 图标（＋ / × / 标签图标）都钉在这一条的中线上；展开后窗格宽多了，这一列**不跟着 Width 变**。
+            // ⚠ 关键就在这：算 x 要用**折叠态宽度**而不是当前 Width。要是拿 Width 居中，
+            //   鼠标一进出窗格 ＋ 和 × 就横着跳一下（用户：「展开前后加号和关闭图标不在同一位置，
+            //   这肯定不行的，就算修改收缩时宽度，也要达到在同一位置的要求」）。
+            int iconX = Math.Max(0, (Px(EmbedForm.PaneCollapsedL) - cell) / 2);
+            int iconY = Px(4);
+            int winY = Height - Px(VWinRowL) + Px(4);
+
+            // ⚠ 每轮先把矩形**全部清空**再排：折叠态只有 ＋ 和 × 两颗，
+            //   留着上一轮的矩形就会画在（也能点到）本该不存在的地方。
+            newRect = Rectangle.Empty;
+            settingsRect = Rectangle.Empty;
+            pinRect = Rectangle.Empty;
+            dividerX = 0;
+            for (int i = 0; i < toolRects.Length; i++) toolRects[i] = Rectangle.Empty;
+            for (int i = 0; i < wbtnRects.Length; i++) wbtnRects[i] = Rectangle.Empty;
+
+            if (collapsed)
+            {
+                newRect = new Rectangle(iconX, iconY, cell, cell);
+                wbtnRects[(int)WBtn.Close] = new Rectangle(iconX, winY, cell, cell);
+            }
+            else
+            {
+                // ---- 顶部工具行：从图标列起横着排一行（加号 + 历史 / 恢复 + 齿轮），图钉钉在右端 ----
+                int y = iconY;
+                int x = iconX;
+                newRect = new Rectangle(x, y, cell, cell); x += cell + gap;
+                toolRects[(int)Tool.History] = new Rectangle(x, y, cell, cell); x += cell + gap;
+                toolRects[(int)Tool.Reopen] = new Rectangle(x, y, cell, cell); x += cell + gap;
+                // 书签那枚星**不排**：书签段自己带标题行，点标题就摊开 / 收起（见 BookmarkBand）
+                dividerX = x + Px(4);
+                x += Px(10);
+                settingsRect = new Rectangle(x, y, cell, cell);
+                // 图钉钉在右端 —— 不跟着工具排，否则窗格一窄就跟齿轮叠上了。
+                // 工具排完到右端之间本来就留着一截（展开态窗格固定 Px(210) 宽），放得下。
+                pinRect = new Rectangle(Width - pad - cell, y, cell, cell);
+
+                // ---- 底部窗口按钮：**左对齐**、也从同一个图标列起排 ----
+                // 用户：「展开时这排窗口按钮要挪到左下」，顺序按「关闭 / 放大 / 缩小」。
+                // 这样折叠态那颗 × 的落点，正好就是展开态这颗关闭按钮的落点，展开前后不位移。
+                int wx = iconX;
+                wbtnRects[(int)WBtn.Close] = new Rectangle(wx, winY, cell, cell); wx += cell + gap;
+                wbtnRects[(int)WBtn.Maximize] = new Rectangle(wx, winY, cell, cell); wx += cell + gap;
+                wbtnRects[(int)WBtn.Minimize] = new Rectangle(wx, winY, cell, cell);
+            }
+
+            // 这几样在竖排里没有意义。**必须清掉** —— 菜单锚点 / 命中判定都会读它们，
+            // 留着上一轮（或另一个实例）的矩形，就会点到看不见的东西上。
+            toolsLeft = 0;              // 滚轮那边靠它判「是不是在按钮区」：竖排一律当标签区
+            tabsClipRight = Width;
+
+            // ---- 上下边界：折叠态和展开态取**同一套值**（摊开时 ＋ / × 不动）----
+            tabsTopV = Px(VToolRowL);
+            winTopV = Height - Px(VWinRowL);
+            // 书签段最多只准吃到「工具行以下」的一半、且必须给标签区留两行 ——
+            // 不然窗口一矮，标签就全被书签挤没了（宁可书签段少显示几行，它自己能滚）。
+            // 折叠态那条窄缝连标题都放不下，直接不给。
+            int below = Math.Max(0, winTopV - tabsTopV);
+            int cap = Math.Max(0, below - VRowH * 2);
+            favBandH = collapsed ? 0 : Math.Min(Math.Max(0, bookmarkBand), cap);
+            tabsBottomV = winTopV - favBandH;
+
+            // ---- 标签行 ----
+            int avail = Math.Max(0, tabsBottomV - tabsTopV);
+            int total = tabs.Count * VRowH;
+            maxScroll = Math.Max(0, total - avail);
+            if (scrollX > maxScroll) scrollX = maxScroll;
+            if (scrollX < 0) scrollX = 0;
+            overflow = (maxScroll > 0);
+
+            int tx = pad;
+            int tw = Math.Max(Px(16), Width - pad * 2);
+            int ty = tabsTopV - scrollX;
+            for (int i = 0; i < tabs.Count; i++)
+            {
+                // 被书签段 / 窗口按钮挡住的那些**不排** —— 命中判定是按 bounds 走的，
+                // 排出来就等于把那些地方变成了可点标签。
+                if (ty >= tabsBottomV) break;
+                bounds.Add(new Rectangle(tx, ty, tw, VRowH));
+                ty += VRowH;
+            }
+        }
+
+        /// <summary>垂直窗格里鼠标落在第几个标签上（-1 = 不在标签上）。</summary>
+        private int VHitTest(Point p)
+        {
+            EnsureLayout();
+            // 工具行 / 书签区 / 窗口按钮那三块都不算标签 ——
+            // 少了这道判，点加号就会点到一个标签上（它们的矩形是同一套坐标系）
+            if (p.Y < tabsTopV || p.Y >= tabsBottomV) return -1;
+            for (int i = 0; i < bounds.Count; i++)
+                if (bounds[i].Contains(p)) return i;
+            return -1;
+        }
+
+        /// <summary>垂直窗格里某一行的关闭按钮位置。</summary>
+        private Rectangle VCloseBounds(Rectangle row)
+        {
+            int s = CloseBoxSize;
+            return new Rectangle(row.Right - CloseAreaWidth + (CloseAreaWidth - s) / 2,
+                                 row.Top + (row.Height - s) / 2, s, s);
         }
 
         /// <summary>标签区能画到哪儿（右边那排按钮的左边）。画标签时要按它裁，不能压到按钮上。</summary>
@@ -458,7 +771,7 @@ namespace TabbedExplorer
             if (scrollX > maxScroll) scrollX = maxScroll;
             if (scrollX < 0) scrollX = 0;
             if (scrollX == old) return false;
-            Invalidate();
+            Redraw();
             return true;
         }
 
@@ -616,6 +929,7 @@ namespace TabbedExplorer
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (Vertical) { OnPaintV(e); return; }
             EnsureLayout();
             Graphics g = e.Graphics;
             Rectangle r = ClientRectangle;
@@ -630,7 +944,9 @@ namespace TabbedExplorer
             int clipR = Math.Max(1, TabsClipRight);
             g.SetClip(new Rectangle(0, 0, clipR, Height));
 
-            for (int i = 0; i < tabs.Count; i++)
+            // ⚠ 上界取 bounds.Count 而不是 tabs.Count：**排不下的标签不进 bounds**
+            //   （竖排被书签区挤掉的那些就是这样），还按 tabs.Count 循环就会越界。
+            for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
             {
                 Rectangle tab = bounds[i];
                 if (tab.Right < 0 || tab.Left > Width) continue;
@@ -674,6 +990,23 @@ namespace TabbedExplorer
                 Color c1 = tabs[i].Active ? (inactive ? Theme.TextInactive : Theme.Text)
                                           : (inactive ? Theme.TextInactive : Theme.TextDim);
 
+                // 置顶标记：紧挨着文件夹图标右边那枚小图钉（用户：小标志，别太占地方）。
+                // 画在图标和标题之间而不是右边 —— 右边那格是关闭按钮的地盘，两个图标叠在一起会很挤。
+                if (tabs[i].Pinned)
+                {
+                    int ps = Px(12);
+                    int pxx = tab.Left + Px(TextPadLeft) + isz + Px(IconGap);
+                    g.FillRectangle(new SolidBrush(bar), new Rectangle(pxx, tab.Top, PinAreaWidth, tab.Height));
+                    TextRenderer.DrawText(g, "\uE718", pinFont,
+                        new Rectangle(pxx, tab.Top + (tab.Height - ps) / 2, ps, ps),
+                        tabs[i].Active ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping);
+                    textLeft = pxx + PinAreaWidth;
+                    textW = textRight - textLeft;
+                    if (textW < 0) textW = 0;
+                }
+
                 TextRenderer.DrawText(g, tabs[i].Title, titleFont,
                     new Rectangle(textLeft, tab.Top, textW, tab.Height), c1,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
@@ -683,7 +1016,7 @@ namespace TabbedExplorer
                 if (showClose && roomForClose)
                 {
                     bool hc = i == hoverCloseIndex;
-                    if (hc) g.FillRectangle(new SolidBrush(Color.FromArgb(232, 17, 35)), close);
+                    if (hc) g.FillRectangle(new SolidBrush(BG(Color.FromArgb(232, 17, 35))), close);
                     Color penColor = hc ? Color.White : (inactive ? Theme.TextInactive : Theme.TextDim);
                     Pen pen = new Pen(penColor, stroke * 1.4f);
                     int inset = Math.Max(3, Px(4));
@@ -713,7 +1046,7 @@ namespace TabbedExplorer
             int accentH = Math.Max(2, Px(2));
             Region clipForAccent = g.Clip;
             g.SetClip(new Rectangle(0, 0, clipR, Height));
-            for (int i = 0; i < tabs.Count; i++)
+            for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
             {
                 if (!tabs[i].Active) continue;
                 Rectangle ab = bounds[i];
@@ -730,7 +1063,7 @@ namespace TabbedExplorer
 
             // “+” 新建：紧跟在最后一个标签右边（位置由 EnsureLayout 算）
             Rectangle nb = newRect;
-            if (hoverNew) g.FillRectangle(new SolidBrush(Theme.Hover), nb);
+            if (hoverNew) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), nb);
             int mx = nb.Left + nb.Width / 2, my = nb.Top + nb.Height / 2;
             int arm = Math.Max(4, Px(5));
             Pen p2 = new Pen(hoverNew ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim), stroke * 1.6f);
@@ -744,7 +1077,7 @@ namespace TabbedExplorer
                 if (i == (int)Tool.Settings) continue;
                 Rectangle b = toolRects[i];
                 if (b.Right <= 0) continue;
-                if (i == hoverTool) g.FillRectangle(new SolidBrush(Theme.Hover), b);
+                if (i == hoverTool) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), b);
                 Color fg = (i == hoverTool) ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim);
                 if (i == (int)Tool.Fav && favBarOn) fg = inactive ? Theme.AccentDim : Theme.Accent;
                 Font gf = (i == (int)Tool.Fav) ? favGlyphFont : glyphFont;
@@ -773,7 +1106,213 @@ namespace TabbedExplorer
                 Rectangle b = wbtnRects[i];
                 if (b.Right <= 0) continue;
                 if (i == hoverWBtn)
-                    g.FillRectangle(new SolidBrush(i == (int)WBtn.Close ? Color.FromArgb(232, 17, 35) : Theme.Hover), b);
+                    g.FillRectangle(new SolidBrush(BG(i == (int)WBtn.Close ? Color.FromArgb(232, 17, 35) : Theme.Hover)), b);
+                Color fg = (i == hoverWBtn) ? Color.White
+                         : (inactive ? Theme.TextInactive : Theme.Text);
+                TextRenderer.DrawText(g, glyph[i], wbtnFont, b, fg,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+        }
+
+        /// <summary>侧边栏半透明那层（`EmbedForm` 摆进来；横排模式下永远是 null）。</summary>
+        public PaneGlass Glass;
+
+        /// <summary>底色 / 高亮色的填充色：半透明态下带 alpha。图标、文字别用它（见 `GlassPaint`）。</summary>
+        private Color BG(Color c) { return GlassPaint.Wash(Glass, c); }
+
+        /// <summary>
+        /// 垂直窗格的画法：从上往下 工具行（折叠态只有「＋」）→ 标签行 → 书签段 → 窗口按钮行
+        /// 单独开一个方法而不是在 OnPaint 里塞分支 —— 两种排法的绘制几乎不共用，
+        /// 混在一起只会让「改横向的顺手弄坏竖向的」。
+        ///
+        /// 摊开盖在内容上时（`Glass`）**只让背景透明**：先铺「底下长什么样」当底，
+        /// 底色 / 高亮色再带 alpha 盖上去；图标、文字、线条照旧不透明（见 `GlassPaint`）。
+        /// </summary>
+        private void OnPaintV(PaintEventArgs e)
+        {
+            EnsureLayout();
+            Graphics g = e.Graphics;
+            Color bar = BarBack;
+            GlassPaint.Backdrop(g, this, Glass, bar);
+            float stroke = Math.Max(1f, DpiScale);
+            int isz = IconSize;
+
+            DrawVTools(g, bar, stroke);
+
+            // 标签行裁到标签区里：上面别盖工具行、下面别盖书签区和窗口按钮
+            Region oldClip = g.Clip;
+            g.SetClip(new Rectangle(0, tabsTopV, Width, Math.Max(0, tabsBottomV - tabsTopV)));
+
+            // ⚠ 上界取 bounds.Count：地方不够时 EnsureLayoutV 会提前 break，
+            //   bounds 比 tabs 短 —— 还按 tabs.Count 循环就会越界。
+            for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
+            {
+                Rectangle row = bounds[i];
+                if (row.Bottom <= tabsTopV || row.Top >= tabsBottomV) continue;
+
+                Color fill = tabs[i].Active ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
+                             : (i == hoverIndex ? Theme.Hover : bar);
+                // 半透明态下「底色那一档」不再补一刀：底下已经按不透明度铺过底色了，
+                // 再叠一次那几行就更实（标签区比工具行更不透，一眼就看出来）；只补高亮那一档。
+                if (Glass == null || !Glass.On || fill != bar)
+                    g.FillRectangle(new SolidBrush(BG(fill)), row);
+
+                Image ic = tabs[i].Icon;
+                if (ic == null) { EnsureFolderIcon(); ic = folderIcon; }
+                // 图标横坐标**两种状态取同一个**：都挂在折叠态窗格那条中线上 ——
+                // 跟顶上的 ＋、底下的 × 同一条竖线。以前展开态是「靠左 Px(6)」，
+                // 鼠标一进出窗格，整列标签图标要横跳 4~5 像素（用户：「展开与否都不会错位」）。
+                int ix = Px(EmbedForm.PaneCollapsedL) / 2 - isz / 2;
+                if (ic != null)
+                    g.DrawImage(ic, new Rectangle(ix, row.Top + (row.Height - isz) / 2, isz, isz));
+
+                if (collapsed) continue;    // 折叠态到此为止：一行只有一个图标
+
+                bool showClose = tabs[i].Active || i == hoverIndex;
+                bool roomForClose = row.Width > Px(80);
+                Rectangle close = VCloseBounds(row);
+                int textRight = row.Right - (showClose && roomForClose ? CloseAreaWidth : Px(8));
+
+                Color c1 = tabs[i].Active ? (inactive ? Theme.TextInactive : Theme.Text)
+                                          : (inactive ? Theme.TextInactive : Theme.TextDim);
+
+                int textLeft = ix + isz + Px(IconGap);
+                int textW = textRight - textLeft;
+                if (textW < 0) textW = 0;
+                TextRenderer.DrawText(g, tabs[i].Title, titleFont,
+                    new Rectangle(textLeft, row.Top, textW, row.Height), c1,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding |
+                    TextFormatFlags.PreserveGraphicsClipping);
+
+                // 置顶标记：缩在最左边那条窄带上（图标左侧），不跟标题抢地方
+                if (tabs[i].Pinned)
+                {
+                    TextRenderer.DrawText(g, "\uE718", pinFont,
+                        new Rectangle(row.Left, row.Top, Px(12), row.Height),
+                        tabs[i].Active ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping);
+                }
+
+                if (showClose && roomForClose)
+                {
+                    bool hc = i == hoverCloseIndex;
+                    if (hc) g.FillRectangle(new SolidBrush(BG(Color.FromArgb(232, 17, 35))), close);
+                    Color penColor = hc ? Color.White : (inactive ? Theme.TextInactive : Theme.TextDim);
+                    Pen pen = new Pen(penColor, stroke * 1.4f);
+                    int inset = Math.Max(3, Px(4));
+                    int s2 = close.Width - inset * 2;
+                    int cx = close.Left + inset, cy = close.Top + inset;
+                    g.DrawLine(pen, cx, cy, cx + s2, cy + s2);
+                    g.DrawLine(pen, cx + s2, cy, cx, cy + s2);
+                    pen.Dispose();
+                }
+            }
+
+            // 选中标签的指示条：竖向靠**左**（横向那条是贴底，两边各占一边，不抢地方）
+            for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
+            {
+                if (!tabs[i].Active) continue;
+                Rectangle ab = bounds[i];
+                if (ab.Bottom <= tabsTopV || ab.Top >= tabsBottomV) continue;
+                g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),
+                    new Rectangle(0, ab.Top, Math.Max(2, Px(2)), ab.Height));
+            }
+
+            // 拖动排序的落点：竖排画在那一行的**上沿**（横排是在左右缝上划线）
+            if (dragFromIndex >= 0 && dragOverIndex >= 0 && dragOverIndex < bounds.Count && dragFromIndex != dragOverIndex)
+            {
+                Rectangle dr = bounds[dragOverIndex];
+                Pen dp = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2));
+                g.DrawLine(dp, dr.Left, dragOverIndex < dragFromIndex ? dr.Top : dr.Bottom,
+                               dr.Right, dragOverIndex < dragFromIndex ? dr.Top : dr.Bottom);
+                dp.Dispose();
+            }
+            g.Clip = oldClip;
+
+            DrawVWindowRow(g);
+
+            // 书签区上沿一条淡淡的线：它是「另一件事」，跟标签列表分开
+            if (favBandH > 0) g.DrawLine(new Pen(Theme.Border), 0, tabsBottomV, Width, tabsBottomV);
+            // 右边一条竖线：跟内容区分开
+            g.DrawLine(new Pen(Theme.Border), Width - 1, 0, Width - 1, Height);
+        }
+
+        /// <summary>
+        /// 垂直窗格顶上那一块：加号、历史 / 恢复关闭、齿轮、图钉。
+        /// 折叠态只排到「＋」一颗（其余矩形是 Empty，见 EnsureLayoutV），展开态才是横排一行 ——
+        /// 图标和悬停色跟横向那条**同一套**（用户：「横向是图标的东西，垂直也用图标吧」）。
+        /// </summary>
+        private void DrawVTools(Graphics g, Color bar, float stroke)
+        {
+            // “+” 新建：位置由 EnsureLayoutV 算
+            Rectangle nb = newRect;
+            if (nb.Width <= 0) return;      // 折叠态只有它一颗，正常不会为空；空了一律不画
+            if (hoverNew) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), nb);
+            int mx = nb.Left + nb.Width / 2, my = nb.Top + nb.Height / 2;
+            int arm = Math.Max(4, Px(5));
+            Pen p2 = new Pen(hoverNew ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim), stroke * 1.6f);
+            g.DrawLine(p2, mx - arm, my, mx + arm, my);
+            g.DrawLine(p2, mx, my - arm, mx, my + arm);
+            p2.Dispose();
+
+            for (int i = 0; i < toolRects.Length; i++)
+            {
+                if (i == (int)Tool.Settings) continue;
+                Rectangle b = toolRects[i];
+                if (b.Width <= 0) continue;
+                if (i == hoverTool) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), b);
+                Color fg = (i == hoverTool) ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim);
+                if (i == (int)Tool.Fav && favBarOn) fg = inactive ? Theme.AccentDim : Theme.Accent;
+                Font gf = (i == (int)Tool.Fav) ? favGlyphFont : glyphFont;
+                TextRenderer.DrawText(g, GlyphOf((Tool)i), gf, b, fg,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+
+            // 齿轮左边那条竖线：只有展开态横排时才有地方放（折叠态整条只有 ＋ 和 ×，没有齿轮）
+            if (dividerX > 0)
+                g.DrawLine(new Pen(Theme.Border), dividerX, settingsRect.Top - Px(2), dividerX, settingsRect.Bottom + Px(2));
+
+            Rectangle sbr = settingsRect;
+            if (sbr.Width > 0)
+            {
+                bool hset = (hoverTool == (int)Tool.Settings);
+                Color sBack = hset ? Theme.Hover : bar;
+                if (hset) g.FillRectangle(new SolidBrush(BG(sBack)), sbr);
+                DrawGear(g, sbr, hset ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim), sBack, stroke);
+            }
+
+            // 图钉 = 「折叠窗格」开关（Edge 那个）。
+            // ⚠ 它必须在**展开态**下能点到（折叠态整条只有 ＋ 和 ×，见 EnsureLayoutV）。
+            Rectangle pr = pinRect;
+            if (pr.Width > 0)
+            {
+                if (hoverPin) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), pr);
+                Color pfg = pinOn ? (inactive ? Theme.AccentDim : Theme.Accent)
+                                  : (hoverPin ? Theme.Text : (inactive ? Theme.TextInactive : Theme.TextDim));
+                TextRenderer.DrawText(g, "\uE718", glyphFont, pr, pfg,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+        }
+
+        /// <summary>垂直窗格底部的窗口按钮 —— 横向那条最右边那三颗，竖过来。</summary>
+        private void DrawVWindowRow(Graphics g)
+        {
+            string[] glyph = new string[wbtnRects.Length];
+            glyph[(int)WBtn.Minimize] = "\uE921";
+            glyph[(int)WBtn.Maximize] = maximized ? "\uE923" : "\uE922";
+            glyph[(int)WBtn.Close] = "\uE8BB";
+
+            // 这里原来还有一条横线（`winTopV - 1`）把窗口按钮跟标签区分开 —— 去掉。
+            // 用户：「当垂直时，关闭上方不用分隔条了，不然看着别扭」：窗格本来就窄，
+            // 这条线横在「×」（折叠态就它一颗）上方，看着像把底下截掉一块。
+            for (int i = 0; i < wbtnRects.Length; i++)
+            {
+                Rectangle b = wbtnRects[i];
+                if (b.Width <= 0) continue;
+                if (i == hoverWBtn)
+                    g.FillRectangle(new SolidBrush(BG(i == (int)WBtn.Close ? Color.FromArgb(232, 17, 35) : Theme.Hover)), b);
                 Color fg = (i == hoverWBtn) ? Color.White
                          : (inactive ? Theme.TextInactive : Theme.Text);
                 TextRenderer.DrawText(g, glyph[i], wbtnFont, b, fg,
@@ -854,7 +1393,7 @@ namespace TabbedExplorer
             if (nx > maxScroll) nx = maxScroll;
             if (nx == scrollX) return;
             scrollX = nx;
-            Invalidate();
+            Redraw();
         }
 
         /// <summary>
@@ -902,16 +1441,30 @@ namespace TabbedExplorer
             if (string.Equals(key, tipKey, StringComparison.Ordinal)) return;
             tipKey = key;
             if (key == null) { tips.Hide(this); return; }
-            if (anchor.Right > Width) anchor.X = Math.Max(0, Width - anchor.Width - Px(40));
+            int x, y;
+            if (Vertical)
+            {
+                // 竖排：提示一律贴到窗格**右边**（横向那条是贴下边）——
+                // 窗格本身很窄，提示放下面会压住下一个标签。
+                x = anchor.Right + Px(4);
+                y = anchor.Top;
+            }
+            else
+            {
+                if (anchor.Right > Width) anchor.X = Math.Max(0, Width - anchor.Width - Px(40));
+                x = anchor.Left;
+                y = anchor.Bottom + Px(2);
+            }
             // 先把「马上要显示的原文」交给 Theme（它自己量尺寸得知道原文，见 Theme.TipText）
             Theme.TipText(tips, text);
-            tips.Show(text, this, anchor.Left, anchor.Bottom + Px(2), 8000);
+            tips.Show(text, this, x, y, 8000);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
             pointerIn = true;
+            if (Vertical) { VMouseMove(e); return; }
 
             // ---- 拖滚动条最优先（滑块就压在标签底下那一条上）----
             if (barDrag)
@@ -992,12 +1545,12 @@ namespace TabbedExplorer
             }
             ShowTip(key, text, anchor);
 
-            if (changed) Invalidate();
+            if (changed) Redraw();
 
             if (dragFromIndex >= 0 && idx >= 0 && idx != dragOverIndex)
             {
                 dragOverIndex = idx;
-                Invalidate();
+                Redraw();
             }
         }
 
@@ -1005,22 +1558,208 @@ namespace TabbedExplorer
         protected override void OnMouseEnter(EventArgs e)
         {
             base.OnMouseEnter(e);
-            if (!pointerIn) { pointerIn = true; Invalidate(); }
+            if (!pointerIn) { pointerIn = true; Redraw(); }
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
             hoverIndex = -1; hoverCloseIndex = -1; hoverNew = false; hoverTool = -1; hoverWBtn = -1;
+            hoverPin = false;
             pointerIn = false; barHot = false; barDrag = false;
             ShowTip(null, null, Rectangle.Empty);
-            Invalidate();
+            Redraw();
+        }
+
+        // ---- 垂直窗格上的鼠标：跟横向那条几乎不共用，所以单独一组，用 Vertical 分路 ----
+
+        /// <summary>竖排里这一点算不算「空白」（既不是标签也不是任何按钮）—— 空白处就是标题栏。</summary>
+        private bool VOnBlank(Point p)
+        {
+            if (VHitTest(p) >= 0) return false;
+            if (NewButtonBounds().Contains(p)) return false;
+            if (ToolAt(p) >= 0) return false;
+            if (WBtnAt(p) >= 0) return false;
+            if (pinRect.Contains(p)) return false;
+            return true;
+        }
+
+        private void VMouseMove(MouseEventArgs e)
+        {
+            EnsureLayout();
+            int idx = VHitTest(e.Location);
+            bool hp = pinRect.Contains(e.Location);
+            int hc = (idx >= 0 && !collapsed && VCloseBounds(bounds[idx]).Contains(e.Location)) ? idx : -1;
+            int ht = ToolAt(e.Location);
+            int hw = WBtnAt(e.Location);
+            bool hn = NewButtonBounds().Contains(e.Location);
+
+            string key = null, text = null;
+            Rectangle anchor = Rectangle.Empty;
+            if (hw >= 0)
+            {
+                key = "vwbtn:" + hw;
+                text = TipOf((WBtn)hw);
+                anchor = wbtnRects[hw];
+            }
+            else if (ht >= 0)
+            {
+                key = "vtool:" + ht;
+                text = TipOf((Tool)ht);
+                anchor = ht == (int)Tool.Settings ? settingsRect : toolRects[ht];
+            }
+            else if (hn)
+            {
+                key = "vnew";
+                text = "新建标签页(Ctrl+T)";
+                anchor = newRect;
+            }
+            else if (hp)
+            {
+                key = "vpin";
+                text = pinOn ? "折叠窗格：开（鼠标不在时只留 ＋ 和 ×）" : "折叠窗格：关（一直展开）";
+                anchor = pinRect;
+            }
+            else if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
+            {
+                anchor = bounds[idx];
+                if (hc == idx) { key = "vclose:" + idx; text = "关闭标签页(Ctrl+W)"; anchor = VCloseBounds(anchor); }
+                else { key = "vtab:" + idx; text = TipTextFor(tabs[idx]); }
+            }
+
+            if (idx != hoverIndex || hp != hoverPin || hc != hoverCloseIndex ||
+                ht != hoverTool || hw != hoverWBtn || hn != hoverNew)
+            {
+                hoverIndex = idx;
+                hoverPin = hp;
+                hoverCloseIndex = hc;
+                hoverTool = ht;
+                hoverWBtn = hw;
+                hoverNew = hn;
+                Redraw();
+            }
+            ShowTip(key, text, anchor);
+
+            // ⚠ 判「左键还按着没」必须用 `Control.MouseButtons`：WinForms 在 MouseMove 的 e.Button 里
+            //   经常给 None，拿它判会永远判成「没按」，拖动根本不触发。
+            if (blankDrag && (Control.MouseButtons & MouseButtons.Left) != 0)
+            {
+                int dx = e.Location.X - blankFrom.X, dy = e.Location.Y - blankFrom.Y;
+                if (dx * dx + dy * dy >= Px(4) * Px(4)) { blankDrag = false; DragWindow(); }
+            }
+            // 竖向拖标签排序（横排那套的竖版：落点是**行号**）
+            if (dragFromIndex >= 0 && idx >= 0 && idx != dragOverIndex)
+            {
+                dragOverIndex = idx;
+                Redraw();
+            }
+        }
+
+        private void VMouseDown(MouseEventArgs e)
+        {
+            EnsureLayout();
+            // 右键一律交给 MouseUp 发（在 MouseDown 里弹菜单会被紧接着的「右键抬起」当场关掉）
+            if (e.Button != MouseButtons.Left) return;
+            ShowTip(null, null, Rectangle.Empty);
+            dragFromIndex = -1;
+
+            // 顺序跟横排一致：窗口按钮 → 工具按钮 → 加号 → 图钉 → 标签 → 空白
+            int w = WBtnAt(e.Location);
+            if (w >= 0) { pendingTool = -1; if (WindowButtonClicked != null) WindowButtonClicked((WBtn)w); return; }
+            int t = ToolAt(e.Location);
+            if (t >= 0)
+            {
+                // ⚠ **只记下来**，事件推迟到 VMouseUp 再发 —— 跟横排同一个理由（见 OnMouseUp 那段）：
+                //   按着键弹菜单，一松手系统就把鼠标捕获收走，看门狗会把菜单关掉。
+                pendingTool = t;
+                return;
+            }
+            if (NewButtonBounds().Contains(e.Location))
+            {
+                if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
+                return;
+            }
+            if (pinRect.Contains(e.Location)) return;      // 松手才算一次点击（见 VMouseUp）
+
+            int idx = VHitTest(e.Location);
+            if (idx < 0)
+            {
+                // 窗格空白（工具行右侧、标签下面那些地方）—— 也当标题栏拖一把
+                blankDrag = true;
+                blankFrom = e.Location;
+                return;
+            }
+            dragFromIndex = idx;
+        }
+
+        private void VMouseUp(MouseEventArgs e)
+        {
+            EnsureLayout();
+
+            if (e.Button == MouseButtons.Right)
+            {
+                int ri = VHitTest(e.Location);
+                if (ri >= 0) { if (TabRightClicked != null) TabRightClicked(this, ri); }
+                else if (VOnBlank(e.Location) && BlankRightClicked != null) BlankRightClicked(e.Location);
+                return;
+            }
+            if (e.Button == MouseButtons.Middle)
+            {
+                int mi = VHitTest(e.Location);
+                if (mi >= 0 && TabMiddleClicked != null) TabMiddleClicked(this, mi);
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
+
+            // 功能按钮：松手时鼠标还在同一颗上才算一次点击（跟横排同一套）
+            if (pendingTool >= 0)
+            {
+                int t = pendingTool;
+                pendingTool = -1;
+                if (ToolAt(e.Location) == t && ToolClicked != null) ToolClicked((Tool)t);
+                Redraw();
+                return;
+            }
+
+            if (pinRect.Contains(e.Location))
+            {
+                blankDrag = false;
+                if (PinClicked != null) PinClicked();
+                return;
+            }
+
+            // 拖动排序：松手才改数据（拖动中只画落点线，跟横排一样）
+            if (dragFromIndex >= 0 && dragOverIndex >= 0 && dragFromIndex != dragOverIndex)
+            {
+                int from = dragFromIndex, to = dragOverIndex;
+                dragFromIndex = -1;
+                dragOverIndex = -1;
+                blankDrag = false;
+                if (OrderMoved != null) OrderMoved(this, from, to);
+                MoveTab(from, to);
+                if (OrderChanged != null) OrderChanged(this, from);
+                Redraw();
+                return;
+            }
+            dragFromIndex = -1;
+            dragOverIndex = -1;
+
+            int idx = VHitTest(e.Location);
+            if (idx < 0) { blankDrag = false; return; }
+            if (!collapsed && VCloseBounds(bounds[idx]).Contains(e.Location))
+            {
+                if (TabCloseClicked != null) TabCloseClicked(this, idx);
+                return;
+            }
+            blankDrag = false;
+            if (TabClicked != null) TabClicked(this, idx);
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
             ShowTip(null, null, Rectangle.Empty);
+            if (Vertical) { VMouseDown(e); return; }
 
             // ---- 滚动条优先：它现在是贴顶那一整条，命中判定必须排在标签 / 按钮前面 ----
             // ⚠ 轨道拉满整宽之后，「窗口按钮顶上那 4 逻辑像素」也会被它吃掉（拖滚动 vs 点关闭）。
@@ -1040,7 +1779,7 @@ namespace TabbedExplorer
                         ScrollThumbTo(e.Location.X - barGrabDX, tr, th);
                     }
                     Capture = true;                              // 拖出标签条也要继续跟手
-                    Invalidate();
+                    Redraw();
                     return;
                 }
             }
@@ -1107,12 +1846,13 @@ namespace TabbedExplorer
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (Vertical) { VMouseUp(e); return; }
 
             if (barDrag)
             {
                 barDrag = false;
                 Capture = false;
-                Invalidate();
+                Redraw();
                 return;
             }
 
@@ -1129,7 +1869,7 @@ namespace TabbedExplorer
                 int t = pendingTool;
                 pendingTool = -1;
                 if (ToolAt(e.Location) == t && ToolClicked != null) ToolClicked((Tool)t);
-                Invalidate();
+                Redraw();
                 return;
             }
 
@@ -1157,12 +1897,13 @@ namespace TabbedExplorer
             if (dragFromIndex >= 0 && dragOverIndex >= 0 && dragFromIndex != dragOverIndex)
             {
                 int from = dragFromIndex, to = dragOverIndex;
+                if (OrderMoved != null) OrderMoved(this, from, to);
                 MoveTab(from, to);
                 if (OrderChanged != null) OrderChanged(this, from);
             }
             dragFromIndex = -1; dragOverIndex = -1;
             blankDrag = false;
-            Invalidate();
+            Redraw();
         }
 
         /// <summary>
@@ -1181,6 +1922,7 @@ namespace TabbedExplorer
             if (disposing)
             {
                 if (tips != null) tips.Dispose();
+                if (pinFont != null) pinFont.Dispose();
                 if (titleFont != null) titleFont.Dispose();
                 if (tipTitleFont != null) tipTitleFont.Dispose();
                 if (glyphFont != null) glyphFont.Dispose();
@@ -1194,6 +1936,14 @@ namespace TabbedExplorer
         {
             base.OnDoubleClick(e);
             Point p = PointToClient(Cursor.Position);
+            if (Vertical)
+            {
+                // 竖排里整条窗格就是标题栏：空白处双击 = 最大化 / 还原。
+                // 不自己改 WindowState，而是补一条 WM_NCLBUTTONDBLCLK(HTCAPTION) 交给系统 ——
+                // 跟拖拽那条路一样走原生标题栏处理，行为（以及以后的调整）都跟真标题栏一致。
+                if (VOnBlank(p)) MaximizeFromTitle();
+                return;
+            }
             if (OnBlank(p))
             {
                 if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
@@ -1201,21 +1951,34 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 空白处按住拖动 —— 把「拖标题栏」还给系统：ReleaseCapture 之后补一条
-        /// WM_NCLBUTTONDOWN(HTCAPTION)，DefWindowProc 就走原生移动循环（拖动、贴边吸附、双击最大化）。
+        /// 空白处按住拖动 —— 把「拖标题栏」还给系统（见 DragOrMaximize）。
         /// 自绘标题栏那一行删掉之后，这段就从 TitleBar 搬过来了。
         /// </summary>
         internal void DragWindow()
+        {
+            DragOrMaximize(EmbedApi.WM_NCLBUTTONDOWN);
+        }
+
+        /// <summary>空白处双击 = 最大化 / 还原（补一条原生标题栏消息，见 OnDoubleClick）。</summary>
+        private void MaximizeFromTitle()
+        {
+            DragOrMaximize(EmbedApi.WM_NCLBUTTONDBLCLK);
+        }
+
+        /// <summary>
+        /// ReleaseCapture 之后补一条「非客户区按下」给 DefWindowProc ——
+        /// 拖动 / 双击最大化 / 贴边吸附全白拿，不用自己实现。
+        /// </summary>
+        private void DragOrMaximize(uint msg)
         {
             try
             {
                 Form f = FindForm();
                 if (f == null) return;
                 EmbedApi.ReleaseCapture();
-                EmbedApi.SendMessageW(f.Handle, EmbedApi.WM_NCLBUTTONDOWN,
-                    new IntPtr(EmbedApi.HTCAPTION), IntPtr.Zero);
+                EmbedApi.SendMessageW(f.Handle, msg, new IntPtr(EmbedApi.HTCAPTION), IntPtr.Zero);
             }
-            catch (Exception ex) { Diag.Log("TabStrip: 拖动失败 " + ex.Message); }
+            catch (Exception ex) { Diag.Log("TabStrip: 标题栏动作失败 " + ex.Message); }
         }
     }
 }

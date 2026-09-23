@@ -77,6 +77,12 @@ namespace TabbedExplorer
         private readonly List<Row> listRows = new List<Row>();
         private readonly HashSet<FavNode> collapsed = new HashSet<FavNode>();
 
+        // ---- 滚动条（用户：「管理器左侧没有滚动条」）----
+        // 两列各一条（左树 / 右列）。行坐标每次都按当前偏移**重算**（Rebuild 把偏移烤进去），
+        // 所以拖动 / 命中那一套（UpdateDrop、RowRectOf、DrawDropHint）一行都不用改。
+        private int treeScroll, listScroll;
+        private VScrollBar treeBar, listBar;
+
         private FavNode sel;                 // 右列显示哪个文件夹的孩子
         private FavNode hoverTree, hoverList;
         private bool hoverClose;
@@ -135,6 +141,11 @@ namespace TabbedExplorer
             search.TextChanged += delegate { filter = search.Text.Trim(); Rebuild(); Invalidate(); };
             Controls.Add(search);
 
+            // 两列都是自绘的（不是 TreeView / ListView），系统不会给滚动条 —— 自己挂两条。
+            // 原生滚动条属非客户区、不吃自绘配色，颜色得走 Theme.StyleScrollBar。
+            treeBar = NewBar(true);
+            listBar = NewBar(false);
+
             int bx = x + Px(232);
             bx = AddButton("添加文件夹", bx, y, delegate
             {
@@ -174,6 +185,8 @@ namespace TabbedExplorer
             BackColor = Theme.Chrome;
             ForeColor = Theme.Text;
             if (search != null) { search.BackColor = Theme.InputBack; search.ForeColor = Theme.Text; }
+            if (treeBar != null && treeBar.IsHandleCreated) Theme.StyleScrollBar(treeBar.Handle);
+            if (listBar != null && listBar.IsHandleCreated) Theme.StyleScrollBar(listBar.Handle);
             Invalidate(true);
         }
 
@@ -188,6 +201,83 @@ namespace TabbedExplorer
         {
             Rebuild();
             Invalidate();
+        }
+
+        private VScrollBar NewBar(bool tree)
+        {
+            VScrollBar b = new VScrollBar();
+            b.Visible = false;
+            b.Scroll += delegate
+            {
+                if (tree)
+                {
+                    if (treeScroll == b.Value) return;
+                    treeScroll = b.Value;
+                }
+                else
+                {
+                    if (listScroll == b.Value) return;
+                    listScroll = b.Value;
+                }
+                Rebuild();
+                Invalidate();
+            };
+            Controls.Add(b);
+            return b;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (treeBar == null) return;      // 构造期 ClientSize 会先触发一次，那时滚动条还没建
+            Rebuild();                        // 右列宽度跟客户区挂钩，得跟着重排
+            Invalidate();
+        }
+
+        /// <summary>滚轮滚哪一列看光标在左还是在右。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            Point p = PointToClient(Cursor.Position);
+            VScrollBar bar = (p.X < LeftW) ? treeBar : listBar;
+            if (bar == null || !bar.Visible) return;
+            int step = SystemInformation.MouseWheelScrollLines * TreeRowH;
+            if (step <= 0) step = TreeRowH * 3;
+            int v = bar.Value - (e.Delta * step / 120);
+            int hi = bar.Maximum - bar.LargeChange + 1;
+            if (v > hi) v = hi;
+            if (v < bar.Minimum) v = bar.Minimum;
+            bar.Value = v;
+        }
+
+        private static int ScrollBarW { get { return SystemInformation.VerticalScrollBarWidth; } }
+
+        /// <summary>两列的内容各有多高（行高固定，数一下就出来了）。</summary>
+        private void LayoutBars()
+        {
+            int viewH = Math.Max(1, Height - TopH - CaptionH);
+            int treeContent = CaptionH + treeRows.Count * TreeRowH + Px(8);
+            int listContent = CaptionH + listRows.Count * ListRowH + Px(8);
+            SetupBar(treeBar, treeContent, viewH, LeftW - ScrollBarW, ref treeScroll);
+            SetupBar(listBar, listContent, viewH, Width - ScrollBarW, ref listScroll);
+        }
+
+        private static void SetupBar(VScrollBar bar, int contentH, int viewH, int x, ref int offset)
+        {
+            if (bar == null) return;
+            if (contentH <= viewH) { bar.Visible = false; offset = 0; return; }
+            if (!bar.Visible) bar.Visible = true;
+            bar.SetBounds(x, TopH + CaptionH, ScrollBarW, viewH);
+
+            int max = contentH - viewH;                     // 最多能滚多少像素
+            if (offset > max) offset = max;
+            if (offset < 0) offset = 0;
+
+            // VScrollBar 的 Value 只能取到 Maximum - LargeChange + 1，所以 Maximum 得把它加回来。
+            bar.LargeChange = Math.Max(1, viewH);
+            bar.Maximum = max + bar.LargeChange - 1;
+            bar.SmallChange = Math.Max(1, TreeRowH);
+            if (bar.Value != offset) bar.Value = offset;
         }
 
         private int AddButton(string text, int x, int y, Action a)
@@ -219,6 +309,8 @@ namespace TabbedExplorer
         {
             base.OnShown(e);
             Theme.ApplyTitleBar(Handle);
+            if (treeBar != null && treeBar.IsHandleCreated) Theme.StyleScrollBar(treeBar.Handle);
+            if (listBar != null && listBar.IsHandleCreated) Theme.StyleScrollBar(listBar.Handle);
             if (sel == null) sel = FavStore.BarFolder;
             Rebuild();
             Invalidate();
@@ -234,13 +326,13 @@ namespace TabbedExplorer
             listRows.Clear();
             if (sel == null) sel = FavStore.BarFolder;
 
-            // 左树：拍平（收起来的文件夹不展开）
-            int y = TopH + CaptionH;
+            // 左树：拍平（收起来的文件夹不展开）。y 起点减去滚动量 = 行坐标直接就是屏幕坐标。
+            int y = TopH + CaptionH - treeScroll;
             FavNode[] roots = FavStore.Tree;
             for (int i = 0; i < roots.Length; i++) Flatten(roots[i], null, i, 0, ref y);
 
             // 右列：某个文件夹的孩子，或者（搜索时）全树的过滤结果
-            y = TopH + CaptionH;
+            y = TopH + CaptionH - listScroll;
             if (filter.Length > 0)
             {
                 List<FavNode> hits = new List<FavNode>();
@@ -251,7 +343,7 @@ namespace TabbedExplorer
                     r.Node = hits[i];
                     r.Parent = null;      // 搜索结果不属于任何文件夹，只能「拖进文件夹」
                     r.Index = -1;
-                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
+                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24) - ScrollBarW), ListRowH);
                     listRows.Add(r);
                     y += ListRowH;
                 }
@@ -264,7 +356,7 @@ namespace TabbedExplorer
                     r.Node = sel.Kids[i];
                     r.Parent = sel;       // 拖放在列表内调顺序靠这两个
                     r.Index = i;
-                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24)), ListRowH);
+                    r.Rect = new Rectangle(LeftW + Px(12), y, Math.Max(1, ClientSize.Width - LeftW - Px(24) - ScrollBarW), ListRowH);
                     listRows.Add(r);
                     y += ListRowH;
                 }
@@ -288,6 +380,8 @@ namespace TabbedExplorer
                     if (!found) multi.RemoveAt(i);
                 }
             }
+
+            LayoutBars();
         }
 
         private void Flatten(FavNode n, FavNode parent, int indexInParent, int depth, ref int y)
@@ -298,7 +392,8 @@ namespace TabbedExplorer
             r.Parent = parent;
             r.Index = indexInParent;
             r.Depth = depth;
-            r.Rect = new Rectangle(Px(8) + depth * Px(14), y, Math.Max(1, LeftW - Px(18) - depth * Px(14)), TreeRowH);
+            r.Rect = new Rectangle(Px(8) + depth * Px(14), y,
+                Math.Max(1, LeftW - Px(18) - depth * Px(14) - ScrollBarW), TreeRowH);
             treeRows.Add(r);
             y += TreeRowH;
             if (n.IsFolder && !collapsed.Contains(n))
@@ -364,8 +459,18 @@ namespace TabbedExplorer
                                : "");
             DrawCaption(g, right, LeftW + Px(12), TopH + Px(3), true);
 
+            // 两列各画在自己那一格里（滚动后行会跑到窗格外面，不裁会盖到顶上的动作条上）
+            System.Drawing.Drawing2D.GraphicsState st = g.Save();
+            g.SetClip(new Rectangle(0, TopH + CaptionH, LeftW, Math.Max(1, Height - TopH - CaptionH)),
+                      System.Drawing.Drawing2D.CombineMode.Intersect);
             for (int i = 0; i < treeRows.Count; i++) DrawTreeRow(g, treeRows[i]);
+            g.Restore(st);
+
+            st = g.Save();
+            g.SetClip(new Rectangle(LeftW, TopH + CaptionH, Math.Max(1, Width - LeftW), Math.Max(1, Height - TopH - CaptionH)),
+                      System.Drawing.Drawing2D.CombineMode.Intersect);
             for (int i = 0; i < listRows.Count; i++) DrawListRow(g, listRows[i]);
+            g.Restore(st);
 
             DrawDropHint(g);      // 拖动中的落点提示（画在行上面）
 

@@ -18,11 +18,21 @@ namespace TabbedExplorer
     ///   3. 项上右键可以**重命名**（改我们自己这份 json 里记的显示名，磁盘上那个文件夹不动）。
     ///
     /// 点击行为：文件夹 → 开成新标签；文件 → 交给系统（默认程序）打开。
+    ///
+    /// **竖排**（`Vertical`）：垂直侧边栏模式下它住在左栏里当一段 ——
+    /// 顶上一行是「★ 书签」，**点它摊开 / 收起**这一段（收起时这条只剩那一行）；下面一行一个书签。
+    /// 两种排法共用同一份 `items`，坐标全部经 `EnsureLayout` / `BoundsOf` / `LeadBounds`，
+    /// 所以只要这三个分支了，命中判定 / 画 / 拖动落点就全跟着对。
     /// </summary>
     internal sealed class FavBar : Control
     {
         /// <summary>书签栏高度（逻辑像素）。够放一行 18px 图标 + 文字。</summary>
         public const int StdHeight = 30;
+
+        /// <summary>竖排时一行书签的高度（逻辑像素）。</summary>
+        private const int VRowL = 26;
+        /// <summary>竖排时顶上那一行（星标 + 「书签」）的高度。</summary>
+        private const int VHeadL = 28;
 
         private static readonly float DpiScale = ReadDpi();
 
@@ -54,9 +64,50 @@ namespace TabbedExplorer
 
         private int hoverIndex = -1;
         private bool hoverLead;
-        private int scrollX;                 // 内容左移了多少（挤不下时靠它翻）
+        private int scrollX;                 // 内容滚了多少（横排=左移，竖排=上移）
         private int contentWidth;
+        private int contentHeight;
+        private bool vertical;
         private string tipKey;
+
+        /// <summary>
+        /// 竖排（垂直侧边栏那个左栏里的一截）。
+        /// ⚠ 竖排时 `scrollX` 当**纵向**滚动量用 —— 两种排法不可能同时出现，
+        ///   没必要再开一个字段（多一个字段就多一处忘了同步的地方）。
+        /// </summary>
+        public bool Vertical
+        {
+            get { return vertical; }
+            set
+            {
+                if (vertical == value) return;
+                vertical = value;
+                scrollX = 0;
+                tips.Hide(this);
+                tipKey = null;
+                Invalidate();
+            }
+        }
+
+        private int VRowH { get { return Px(VRowL); } }
+        private int VHeadH { get { return Px(VHeadL); } }
+
+        /// <summary>
+        /// 竖排「收起态」要多高 —— 只剩顶上那行标题（用户：书签段默认收缩、可展开收缩，记住上次的行为）。
+        /// 上层拿它给书签段留位置（见 `EmbedForm.DoLayout`）。
+        /// </summary>
+        public int HeaderHeight { get { return VHeadH; } }
+
+        /// <summary>
+        /// 竖排时书签段摊开着没。只影响**画**（箭头方向、提示文案）——
+        /// 高度由上层按 `BookmarkBand` 决定，两边不能各算一次。
+        /// </summary>
+        public bool SectionOpen
+        {
+            get { return sectionOpen; }
+            set { if (sectionOpen != value) { sectionOpen = value; Invalidate(); } }
+        }
+        private bool sectionOpen;
 
         // ---- 拖动（用户：栏上的项要能调顺序 / 拖进子文件夹）----
         // 按下时只记状态，**动作留到 MouseUp** —— 不这样就没法跟拖动区分（见 OnMouseDown 注释）。
@@ -165,6 +216,12 @@ namespace TabbedExplorer
 
         private void EnsureLayout()
         {
+            if (vertical)
+            {
+                // 竖排：不看宽度看高度 —— 一行一个书签，装不下靠纵向滚
+                contentHeight = VHeadH + items.Count * VRowH + Px(4);
+                return;
+            }
             contentWidth = Px(6);
             for (int i = 0; i < items.Count; i++)
             {
@@ -177,8 +234,24 @@ namespace TabbedExplorer
             contentWidth += Px(6);
         }
 
+        /// <summary>
+        /// 竖排时这一截「想要多高」（上层拿它给书签区留位置）。
+        /// 行数 × 行高 + 顶上那行，不超过 `maxH`（装不下就靠它自己的纵向滚）。
+        /// </summary>
+        public int PreferredVerticalHeight(int maxH)
+        {
+            int need = VHeadH + Math.Max(1, items.Count) * VRowH + Px(4);
+            int cap = Math.Max(Px(24), maxH);
+            return Math.Max(Px(24), Math.Min(need, cap));
+        }
+
         private Rectangle BoundsOf(int i)
         {
+            if (vertical)
+            {
+                int w = Math.Max(Px(16), Width - Px(8));
+                return new Rectangle(Px(4), VHeadH + i * VRowH - scrollX, w, VRowH);
+            }
             int x = LeadWidth + Px(6) - scrollX;
             for (int k = 0; k < i; k++) x += items[k].LayoutW;
             return new Rectangle(x, Px(4), items[i].LayoutW, Height - Px(8));
@@ -186,6 +259,11 @@ namespace TabbedExplorer
 
         private Rectangle LeadBounds()
         {
+            if (vertical)
+            {
+                // 竖排的「拦名牌」就是顶上那一行：星标 + 「书签」（窗格窄到放不下字时只剩星标）
+                return new Rectangle(Px(2), Px(2), Math.Max(Px(16), Width - Px(4)), VHeadH - Px(4));
+            }
             return new Rectangle(Px(2), Px(3), LeadWidth - Px(4), Height - Px(6));
         }
 
@@ -202,20 +280,28 @@ namespace TabbedExplorer
 
         private void ClampScroll()
         {
-            int max = Math.Max(0, contentWidth - (Width - LeadWidth));
-            if (scrollX > max) scrollX = max;
+            if (vertical)
+            {
+                int maxY = Math.Max(0, contentHeight - Height);
+                if (scrollX > maxY) scrollX = maxY;
+                if (scrollX < 0) scrollX = 0;
+                return;
+            }
+            int maxX = Math.Max(0, contentWidth - (Width - LeadWidth));
+            if (scrollX > maxX) scrollX = maxX;
             if (scrollX < 0) scrollX = 0;
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (vertical) { OnPaintV(e); return; }
             EnsureLayout();
             Graphics g = e.Graphics;
             g.FillRectangle(new SolidBrush(TheBack), ClientRectangle);
 
             // ---- 左边那枚固定的「书签」图标（用户要的）----
             Rectangle lead = LeadBounds();
-            if (hoverLead) g.FillRectangle(new SolidBrush(Theme.Hover), lead);
+            if (hoverLead) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), lead);
             Image li = LeadImage();
             if (li != null)
                 g.DrawImage(li, new Rectangle(lead.Left + (lead.Width - Px(20)) / 2,
@@ -238,7 +324,7 @@ namespace TabbedExplorer
                 {
                     Rectangle r = BoundsOf(i);
                     if (r.Right < LeadWidth || r.Left > Width) continue;
-                    if (i == hoverIndex) g.FillRectangle(new SolidBrush(Theme.Hover), r);
+                    if (i == hoverIndex) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), r);
 
                     Bitmap ic = items[i].Icon;
                     if (ic == null)
@@ -284,6 +370,119 @@ namespace TabbedExplorer
 
             // 底下一条淡淡的线，跟内容区分开
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
+        }
+
+        /// <summary>侧边栏半透明那层（`EmbedForm` 摆进来；横排 / 不透明时是 null）。</summary>
+        public PaneGlass Glass;
+
+        /// <summary>底色 / 高亮色的填充色：半透明态下带 alpha。图标、文字别用它（见 `GlassPaint`）。</summary>
+        private Color BG(Color c) { return GlassPaint.Wash(Glass, c); }
+
+        /// <summary>
+        /// 竖排的画法：顶上一行「★ 书签」，下面一行一个书签。
+        /// 单开一个方法而不是在 OnPaint 里塞分支 —— 两种排法的绘制几乎不共用，
+        /// 混在一起只会让「改横排的顺手弄坏竖排的」。
+        ///
+        /// 竖排时它住在侧边栏里，摊开那一下也会压到内容上 —— 所以跟窗格走同一套
+        /// 「**只让背景透明**，图标文字不透明」（见 `GlassPaint`）。
+        /// </summary>
+        private void OnPaintV(PaintEventArgs e)
+        {
+            EnsureLayout();
+            Graphics g = e.Graphics;
+            GlassPaint.Backdrop(g, this, Glass, TheBack);
+
+            // ---- 顶上那行：星标 + 「书签」（点星标开管理器）----
+            Rectangle lead = LeadBounds();
+            if (hoverLead) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), lead);
+            Image li = LeadImage();
+            if (li != null)
+                g.DrawImage(li, new Rectangle(lead.Left + Px(5), lead.Top + (lead.Height - Px(16)) / 2, Px(16), Px(16)));
+            if (Width > Px(80))
+            {
+                TextRenderer.DrawText(g, "书签", font,
+                    new Rectangle(lead.Left + Px(26), lead.Top, Math.Max(1, lead.Width - Px(46)), lead.Height),
+                    Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            }
+            // 右端一枚小箭头 —— 说明这一行点了能摊开 / 收起（收起态方向朝右，摊开朝下）
+            if (Width > Px(80))
+            {
+                int ax = Width - Px(14), ay = VHeadH / 2;
+                Pen ap = new Pen(Theme.TextDim, Math.Max(1f, DpiScale));
+                if (sectionOpen) { g.DrawLine(ap, ax - Px(5), ay - Px(2), ax, ay + Px(2)); g.DrawLine(ap, ax, ay + Px(2), ax + Px(5), ay - Px(2)); }
+                else { g.DrawLine(ap, ax - Px(2), ay - Px(5), ax + Px(2), ay); g.DrawLine(ap, ax + Px(2), ay, ax - Px(2), ay + Px(5)); }
+                ap.Dispose();
+            }
+            g.DrawLine(new Pen(Theme.Border), 0, VHeadH - 1, Width, VHeadH - 1);
+
+            Region oldClip = g.Clip;
+            g.SetClip(new Rectangle(0, VHeadH, Width, Math.Max(0, Height - VHeadH)));
+
+            if (items.Count == 0)
+            {
+                TextRenderer.DrawText(g, "把文件夹或文件拖到这里就能加进书签", font,
+                    new Rectangle(Px(6), VHeadH + Px(2), Math.Max(1, Width - Px(12)),
+                                  Math.Max(0, Height - VHeadH - Px(4))),
+                    Theme.TextDim, TextFormatFlags.Left | TextFormatFlags.Top |
+                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            }
+            else
+            {
+                int ic = Px(16);
+                bool narrow = Width < Px(120);   // 折叠窗格：一行只剩图标（跟标签行一个规矩）
+                for (int i = 0; i < items.Count; i++)
+                {
+                    Rectangle r = BoundsOf(i);
+                    if (r.Bottom <= VHeadH || r.Top >= Height) continue;
+                    if (i == hoverIndex) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), r);
+
+                    Bitmap bm = items[i].Icon;
+                    if (bm == null)
+                    {
+                        if (folderFallback == null) folderFallback = ShellIcon.FolderIcon(Px(16));
+                        bm = folderFallback;
+                    }
+                    int ix = narrow ? r.Left + (r.Width - ic) / 2 : r.Left + Px(6);
+                    if (bm != null) g.DrawImage(bm, new Rectangle(ix, r.Top + (r.Height - ic) / 2, ic, ic));
+                    if (narrow) continue;
+
+                    int tx = ix + ic + Px(5);
+                    int tw = r.Right - Px(8) - tx;
+                    if (tw <= 0) continue;
+                    TextRenderer.DrawText(g, items[i].Name, font,
+                        new Rectangle(tx, r.Top, tw, r.Height),
+                        i == hoverIndex ? Theme.Text : Theme.TextDim,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                }
+
+                // 拖动中的落点提示：放进文件夹 = 整行罩一层蓝；调顺序 = 在那一行的**上沿**画一条蓝横线
+                for (int i = 0; i < items.Count; i++)
+                {
+                    Rectangle r = BoundsOf(i);
+                    if (dropInto == i)
+                    {
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(70, Theme.Accent)))
+                            g.FillRectangle(b, r);
+                    }
+                    if (dropIndex == i)
+                    {
+                        using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
+                            g.DrawLine(p, r.Left, r.Top, r.Right, r.Top);
+                    }
+                }
+                if (dropIndex >= items.Count && items.Count > 0)
+                {
+                    Rectangle last = BoundsOf(items.Count - 1);
+                    using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
+                        g.DrawLine(p, last.Left, last.Bottom, last.Right, last.Bottom);
+                }
+            }
+            g.Clip = oldClip;
+
+            // 右边一条竖线：跟内容区分开（上边那条分隔线归标签区画，这里不重复）
+            g.DrawLine(new Pen(Theme.Border), Width - 1, 0, Width - 1, Height);
         }
 
         /// <summary>
@@ -351,18 +550,26 @@ namespace TabbedExplorer
                 else if (hl)
                 {
                     Rectangle r = LeadBounds();
-                    tips.Show("书签\r\n把文件夹或文件拖到这条栏上就能加进来；点这儿管理书签",
-                        this, r.Left, r.Bottom + Px(2), 8000);
+                    // 竖排时提示贴到右边（栏本身窄，放下面会压住下一行）
+                    int lx = vertical ? r.Right + Px(4) : r.Left;
+                    int ly = vertical ? r.Top : r.Bottom + Px(2);
+                    // 竖排里这一行是**书签段的标题**：点它摊开 / 收起（管理器挪到右键菜单里）
+                    string body = vertical
+                        ? (sectionOpen ? "点一下收起书签段" : "点一下摊开书签段")
+                        : "把文件夹或文件拖到这条栏上就能加进来；点这儿管理书签";
+                    tips.Show("书签\r\n" + body, this, lx, ly, 8000);
                 }
                 else
                 {
                     Rectangle r = BoundsOf(i);
-                    int x = r.Left;                       // 提示贴在那项下面、左边对齐
-                    if (x + Px(240) > Width) x = Math.Max(0, Width - Px(240));
+                    int x = r.Left;                       // 横排：提示贴在那项下面、左边对齐
+                    int y = r.Bottom + Px(2);
+                    if (vertical) { x = r.Right + Px(4); y = r.Top; }
+                    else if (x + Px(240) > Width) x = Math.Max(0, Width - Px(240));
                     string body = items[i].IsFolder
                         ? ("子文件夹，里面有 " + items[i].Node.Kids.Count + " 项")
                         : items[i].Node.Path;
-                    tips.Show(items[i].Name + "\r\n" + body, this, x, r.Bottom + Px(2), 8000);
+                    tips.Show(items[i].Name + "\r\n" + body, this, x, y, 8000);
                 }
             }
         }
@@ -381,6 +588,16 @@ namespace TabbedExplorer
         {
             base.OnMouseWheel(e);
             EnsureLayout();
+            if (vertical)
+            {
+                // 收起态这条只剩顶上那行标题，没有可滚的内容 —— 不挡一下的话滚轮会去滚看不见的列表
+                if (Height <= VHeadH) return;
+                if (contentHeight <= Height) return;
+                scrollX -= e.Delta / 3;
+                ClampScroll();
+                Invalidate();
+                return;
+            }
             if (contentWidth <= Width - LeadWidth) return;
             scrollX -= e.Delta / 3;     // 一格滚一点，别一滚就飞到头
             ClampScroll();
@@ -431,6 +648,9 @@ namespace TabbedExplorer
                 if (added > 0)
                 {
                     Reload();
+                    // 收起态时这个控件只剩顶上那行标题，不加这一句就成了「拖进来了却什么都看不见」。
+                    // 竖排里 LeadClicked 的含义就是「摊开 / 收起书签段」（见 EmbedForm 的接线）。
+                    if (vertical && !sectionOpen && LeadClicked != null) LeadClicked(this, EventArgs.Empty);
                     // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
                     // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
                     // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
@@ -523,15 +743,18 @@ namespace TabbedExplorer
                 if (items[i].IsFolder)
                     nInto = i;                                 // 落点在文件夹项上 = 放进它里面
                 else
-                    ni = (p.X < r.Left + r.Width / 2) ? i : i + 1;   // 左半 / 右半 = 插前 / 插后
+                    ni = vertical
+                         ? (p.Y < r.Top + r.Height / 2 ? i : i + 1)   // 竖排：上半 / 下半 = 插前 / 插后
+                         : (p.X < r.Left + r.Width / 2 ? i : i + 1);  // 横排：左半 / 右半
                 break;
             }
 
-            // 落在最后一项右边的空白里 = 挪到最末尾
+            // 落在最后一项外面那块空白里 = 挪到最末尾
             if (!overItem && items.Count > 0 && dragIndex >= 0)
             {
                 Rectangle last = BoundsOf(items.Count - 1);
-                if (p.X >= last.Right) ni = items.Count;
+                if (vertical) { if (p.Y >= last.Bottom) ni = items.Count; }
+                else if (p.X >= last.Right) ni = items.Count;
             }
 
             if (ni != dropIndex || nInto != dropInto)
@@ -598,7 +821,8 @@ namespace TabbedExplorer
             PopItem[] kids = ItemsOf(nd);
             if (kids.Length == 0) { Toast.Show(nd.Display, "这个文件夹里还没有书签。"); return; }
             Rectangle r = BoundsOf(index);
-            Point at = new Point(r.Left, r.Bottom + Px(1));
+            // 竖排时子菜单往**右边**弹（栏本身就在最左边，往下列会盖住下一行）
+            Point at = vertical ? new Point(r.Right + Px(1), r.Top) : new Point(r.Left, r.Bottom + Px(1));
             string what = "书签子文件夹 " + nd.Display;
             // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（用户报的「点书签栏文件夹，
             //   里面的子项点不动」的根就在那儿）—— 这里不用自己 Defer。

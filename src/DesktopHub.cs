@@ -806,6 +806,97 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 退出后是否记住窗口位置和大小（默认开）。改了立刻生效，但**只影响下次还原** ——
+        /// 关掉它不会去动手上那个窗口，也不会把已经记着的那份删掉（随时再打开就又能用）。
+        /// </summary>
+        public void SetWindowSize(bool on)
+        {
+            if (Settings.WindowSize == on) return;
+            Settings.SetWindowSize(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 记住窗口位置和大小 -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
+        /// 垂直侧边栏开关（用户：Ctrl+Shift+, / 设置菜单）。
+        /// 所有窗口一起切 —— 它是窗口外壳的排法，不是某张桌面的事。
+        /// </summary>
+        public void SetVerticalTabs(bool on)
+        {
+            if (Settings.VTabs == on) return;
+            Settings.SetVTabs(on);
+            RefreshTrayMenu();
+            VerticalAll();
+            Diag.Step("Hub: 垂直侧边栏 -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
+        /// 垂直窗格的「折叠窗格」开关（窗格顶上那枚图钉）。
+        /// 开 = 鼠标不在窗格上时收缩成纯图标、进来才临时展开；关 = 一直显示完整标题。
+        /// </summary>
+        public void SetVTabCollapse(bool on)
+        {
+            if (Settings.VTabsCollapse == on) return;
+            Settings.SetVTabsCollapse(on);
+            RefreshTrayMenu();
+            VerticalAll();
+            Diag.Step("Hub: 垂直窗格折叠 -> " + (on ? "开（平时只显示图标）" : "关（一直显示标题）"));
+        }
+
+        /// <summary>
+        /// 侧边栏「摊开盖在内容上」那一下的不透明度（%，100 = 完全不透明）。
+        /// 数值项，改完所有窗口一起重排（`ApplyVertical` 会把新值读到布局里）。
+        /// </summary>
+        public void SetVPaneAlpha(int pct)
+        {
+            if (Settings.VPaneAlpha == pct) return;
+            Settings.SetVPaneAlpha(pct);
+            RefreshTrayMenu();
+            VerticalAll();
+            Diag.Step("Hub: 侧边栏不透明度 -> " + Settings.VPaneAlpha + "%");
+        }
+
+        private void VerticalAll()
+        {
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f == null || f.IsDisposed) continue;
+                try { f.ApplyVertical(); }
+                catch (Exception ex) { Diag.Log("Hub: 切垂直侧边栏失败 " + ex.Message); }
+            }
+        }
+
+        /// <summary>忘掉某张桌面记着的窗口位置和大小（托盘菜单「恢复默认窗口位置和大小」用）。</summary>
+        public void ForgetBounds(string key)
+        {
+            DesktopMemory.Bucket b = memory.Find(key);
+            if (b == null || string.IsNullOrEmpty(b.Bounds)) return;
+            b.Bounds = null;
+            memory.Save();
+            Diag.Step("Hub: 已忘掉桌面 " + key + " 记着的窗口尺寸");
+        }
+
+        /// <summary>
+        /// 托盘菜单「恢复默认窗口位置和大小」：把前台那个窗口（没前台就找任何一个显示着的）
+        /// 摆回默认大小并居中，同时把记忆里那份尺寸去掉。
+        /// 一个窗口都没有就先按 Win+E 开一个 —— 新开的本来就是默认尺寸，用户要的结果一样。
+        /// </summary>
+        public void RestoreDefaultWindow()
+        {
+            EmbedForm f = ForegroundForm();
+            if (f == null)
+            {
+                foreach (EmbedForm x in new List<EmbedForm>(forms.Values))
+                {
+                    if (x != null && !x.IsDisposed && x.Visible) { f = x; break; }
+                }
+            }
+            if (f == null) { Diag.Step("Hub: 恢复默认窗口位置和大小 -> 现在没窗口，先开一个"); OnWinE(); return; }
+            try { f.RestoreDefaultBounds(); }
+            catch (Exception ex) { Diag.Log("Hub: 恢复窗口尺寸失败 " + ex.Message); }
+        }
+
+        /// <summary>
         /// Debug 模式（用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，
         /// 不过我们要开」）。改了立刻生效 —— `Diag` 每次写之前都现看那个闸，不用重启。
         /// </summary>
@@ -930,6 +1021,14 @@ namespace TabbedExplorer
                         b.Paths.Add(p);
                         if (PathRules.Same(p, active)) b.Active = p;
                         tabs++;
+                    }
+                    // 窗口位置和大小（用户：完全退出后下次照原样打开）。
+                    // ⚠ 只有「真给用户看过」的窗口才有值（空 = 不动记忆里那份）——
+                    //   否则启动时预建但一直没露面的窗口会用它构造时的默认尺寸把旧记忆洗掉。
+                    if (Settings.WindowSize)
+                    {
+                        string bs = f.BoundsString;
+                        if (!string.IsNullOrEmpty(bs)) b.Bounds = bs;
                     }
                     live++;
                 }

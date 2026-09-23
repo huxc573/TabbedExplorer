@@ -630,6 +630,10 @@ namespace TabbedExplorer
                 EmbedForm f = EnsureForm(d);
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
                 f.OpenPathAsTab(path);
+                // 这一步不能省：用户是在**别的程序**里点的「打开文件夹」，本该有一扇窗弹到最前面。
+                // 只 `OpenPathAsTab` 的话窗口只是被 `Show()` 出来、还压在那个程序后面，
+                // 用户看到的就只有「原生窗闪了一下 + 任务栏图标闪」= 像什么都没发生。
+                f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: shell 窗口转生失败 " + ex.Message); }
         }

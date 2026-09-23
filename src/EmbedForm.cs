@@ -1053,7 +1053,10 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 「用户自己打开的文件夹窗口被收进来了」—— 需要现身把它露出来。
+        /// 「用户在外面开了一个文件夹，窗体现在在我们手里」—— 需要现身把它露出来。
+        /// 两个入口：① 收编用户自己开出来的窗口（`AdoptWindow`）；② shell 的窗口「转生」
+        /// 过来之后（`DesktopHub.TakeOverShellWindow`）—— 那一下同样是他刚在别的程序里点了
+        /// 「打开文件夹」，窗口一样得顶到前面。
         ///
         /// 跟 `ShowForUser` 的区别（**别混用**）：
         ///   · 不 `EnsureFirstTab`（标签刚收进来就是第一个，不能再自作主张开一个「此电脑」）；
@@ -1181,15 +1184,19 @@ namespace TabbedExplorer
             bool attached = false;
             if (fgThread != 0 && fgThread != myThread)
                 attached = EmbedApi.AttachThreadInput(fgThread, myThread, true);
+            bool ok;
             try
             {
                 NativeMethods.BringWindowToTop(h);
-                NativeMethods.SetForegroundWindow(h);
+                ok = NativeMethods.SetForegroundWindow(h);
             }
             finally
             {
                 if (attached) EmbedApi.AttachThreadInput(fgThread, myThread, false);
             }
+            // 没抢到就等于「窗口上不来、只闪任务栏」——那是用户看得见的症状，所以留一行日志好对账
+            Diag.Step(string.Format("EmbedForm: 顶到前台 -> {0}（前台线程 {1}，借队列 {2}）",
+                ok ? "成功" : "被拒", fgThread, attached ? "是" : "否"));
         }
 
         /// <summary>

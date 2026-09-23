@@ -68,11 +68,22 @@ namespace TabbedExplorer
         /// </summary>
         private readonly HashSet<IntPtr> hiddenByUs = new HashSet<IntPtr>();
         private readonly object hideLock = new object();
+        /// <summary>
+        /// 「shell 进程开的、等它地址栏填好就转生」的窗口（只在开了接管 shell 时才用）。
+        /// 它们不能收编（见 EmbedApi.IsShellOwned），所以要等地址栏出现真路径，再关掉重开。
+        /// </summary>
+        private readonly Dictionary<IntPtr, ShellCandidate> pendingShell =
+            new Dictionary<IntPtr, ShellCandidate>();
         /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
         private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
         /// <summary>候选窗口要「晾」多久才收。够短，用户感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
+        /// <summary>
+        /// shell 窗口「等地址栏填好」的上限：新窗口是先建出来再导航的，刚看见时地址栏还是空的。
+        /// 到点还读不出真路径就把它还回去（见 ReleaseIfAbandoned）—— 宁可保持原样，不能把它晾成隐形的。
+        /// </summary>
+        private const int ShellResolveMs = 2500;
         private RegisteredWaitHandle sigWait;
         private RegisteredWaitHandle quitWait;
         private EventWaitHandle quitEvent;
@@ -373,6 +384,13 @@ namespace TabbedExplorer
             public int ReactMs;
         }
 
+        /// <summary>shell 窗口转生候选：等它的地址栏出现真路径（见 ShellResolveMs）。</summary>
+        private sealed class ShellCandidate
+        {
+            public DateTime SeenAt;
+            public int ReactMs;
+        }
+
         /// <summary>
         /// ★★ 看见一个新窗口 —— **在 watcher 自己的线程上同步藏**，不绕 UI 线程。
         ///
@@ -402,7 +420,12 @@ namespace TabbedExplorer
             {
                 if (quitting || h == IntPtr.Zero) return;
                 if (!Settings.CaptureAll) return;
-                if (!IsHideCandidate(h)) return;
+                // 桌面 shell 进程自己开的窗口：默认（v1.13.1 起）一个都不碰；
+                // 只有开了「接管 shell 打开的文件夹」才走另一条路 —— **不 SetParent 它**，
+                // 而是读出它要去哪个目录、把它关掉、用我们自己的 explorer 重开成标签（见 TakeOverShellWindow）。
+                // 这条路绕开了 v1.13.1 那个坑（收编 shell 的窗口会弄坏 Win+E / 开始菜单那条入口）。
+                bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
+                if (!shellTake && !IsHideCandidate(h)) return;
 
                 int react = Environment.TickCount - tick;      // 系统报事件 → 我们动手，差了多少毫秒
                 bool wasVisible = EmbedApi.IsWindowVisible(h);
@@ -420,7 +443,7 @@ namespace TabbedExplorer
                     wasVisible ? "已可见" : "还没画出来", h.ToInt64()));
 
                 // 后面的账（pendingCapture / 起定时器）回 UI 线程做 —— 那两个是 UI 线程的状态
-                if (isShow) Post(delegate { RegisterCandidate(h, react); });
+                if (isShow) Post(delegate { if (shellTake) RegisterShellCandidate(h, react); else RegisterCandidate(h, react); });
             }
             catch (Exception ex) { Diag.Log("Hub: 处理新窗口事件失败 " + ex.Message); }
         }
@@ -501,10 +524,109 @@ namespace TabbedExplorer
             return true;
         }
 
+        /// <summary>
+        /// 「值不值得把它转生」的粗筛：**跟 `IsHideCandidate` 就差最后那一条（正好相反）** ——
+        /// 这里要的恰恰是「桌面 shell 进程自己开的」那种。
+        /// 其余条件一样：必须还是个没被人认领、没被嵌走、没属主的新浏览窗口。
+        /// </summary>
+        private bool IsShellTakeoverCandidate(IntPtr h)
+        {
+            string c = EmbedApi.ClassOf(h);
+            if (c != "CabinetWClass" && c != "ExploreWClass") return false;
+            if (EmbedApi.IsClaimed(h)) return false;          // 我们自己起的 / 已经被某个标签收了
+            if (EmbedApi.IsBaseline(h)) return false;         // 启动前就在那儿的老窗口
+            if (EmbedApi.GetParent(h) != IntPtr.Zero) return false;
+            if (EmbedApi.GetWindow(h, EmbedApi.GW_OWNER) != IntPtr.Zero) return false;
+            int pid = EmbedApi.ProcessIdOf(h).ToInt32();
+            if (pid == 0 || pid == ourPid) return false;
+            return EmbedApi.IsShellOwned(h);                  // ★ 就是这条跟 IsHideCandidate 反着来
+        }
+
+        /// <summary>登记一个「等地址栏」的 shell 窗口（UI 线程）。</summary>
+        private void RegisterShellCandidate(IntPtr h, int react)
+        {
+            if (quitting || !Settings.CaptureAll || !Settings.CaptureShell) { ReleaseIfAbandoned(h); return; }
+            if (pendingShell.ContainsKey(h)) return;
+            if (!NativeMethods.IsWindow(h)) { ReleaseIfAbandoned(h); return; }
+            pendingShell[h] = new ShellCandidate { SeenAt = DateTime.Now, ReactMs = react };
+            if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
+        }
+
+        /// <summary>
+        /// 等 shell 窗口的地址栏填上真路径：拿到了就转生，超时就还回去。
+        /// 轮询而不是等通知 —— 地址栏那个 toolbar 的文本不会给我们发消息（跟标签那边读当前路径是一回事）。
+        /// </summary>
+        private void DrainShell()
+        {
+            if (pendingShell.Count == 0) return;
+            DateTime now = DateTime.Now;
+            foreach (KeyValuePair<IntPtr, ShellCandidate> kv in new List<KeyValuePair<IntPtr, ShellCandidate>>(pendingShell))
+            {
+                IntPtr h = kv.Key;
+                if (!NativeMethods.IsWindow(h))
+                {
+                    pendingShell.Remove(h);
+                    UnmarkHidden(h);                    // 它自己没了（被关掉）——不用还
+                    continue;
+                }
+                string path = EmbedApi.AddressPathOf(h);
+                if (path == null)
+                {
+                    // 刚建出来的窗口地址栏还是空的（先建窗、后导航）—— 再看看，到点就放手
+                    if ((now - kv.Value.SeenAt).TotalMilliseconds >= ShellResolveMs)
+                    {
+                        pendingShell.Remove(h);
+                        Diag.Step(string.Format("Hub: shell 开的窗口读不出路径，还给它 cab=0x{0:X}", h.ToInt64()));
+                        ReleaseIfAbandoned(h);
+                    }
+                    continue;
+                }
+                pendingShell.Remove(h);
+                TakeOverShellWindow(h, path, kv.Value.ReactMs);
+            }
+        }
+
+        /// <summary>
+        /// 「转生」：shell 进程开的文件夹窗口不归我们（不能 SetParent），但它的目标是我们的。
+        /// 读出目标目录 → 把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录开成标签。
+        /// 这样既拿到了标签，又没碰 shell 的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
+        ///
+        /// ⚠ 先 `ClearTransparent` 再 `WM_CLOSE`：万一它不吃这一套（没关掉），界面上留下的是个**正常窗口**，
+        /// 而不是一个隐形窗口 —— 隐形窗口是最坏的结果（用户眼里就是「窗口没了，任务栏还留着」）。
+        /// </summary>
+        private void TakeOverShellWindow(IntPtr h, string path, int react)
+        {
+            try
+            {
+                Guid d = VirtualDesktop.WindowDesktopId(h);
+                if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
+                Diag.Step(string.Format(
+                    "Hub: shell 开的文件夹 -> {0}（pid={1}，反应 {2}ms）=> 关掉它、用自己的标签重开",
+                    path, EmbedApi.ProcessIdOf(h).ToInt32(), react));
+                try { EmbedApi.ClearTransparent(h); } catch { }
+                UnmarkHidden(h);
+                EmbedApi.PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);     // WM_CLOSE
+                EmbedForm f = EnsureForm(d);
+                if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
+                f.OpenPathAsTab(path);
+            }
+            catch (Exception ex) { Diag.Log("Hub: shell 窗口转生失败 " + ex.Message); }
+        }
+
+        /// <summary>shell 窗口的转生开关。跟捕获开关一样：开关立刻生效，不用装/卸钩子。</summary>
+        public void SetCaptureShell(bool on)
+        {
+            if (Settings.CaptureShell == on) return;
+            Settings.SetCaptureShell(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 接管 shell 打开的文件夹 -> " + (on ? "开" : "关"));
+        }
+
         /// <summary>到点的那批 —— 还活着、还没被认领的，收；其余的丢掉。</summary>
         private void DrainCapture()
         {
-            if (pendingCapture.Count == 0) { captureTimer.Stop(); return; }
+            DrainShell();
+            if (pendingCapture.Count == 0 && pendingShell.Count == 0) { captureTimer.Stop(); return; }
             DateTime now = DateTime.Now;
             List<IntPtr> ready = null;
             foreach (KeyValuePair<IntPtr, CaptureCandidate> kv in new List<KeyValuePair<IntPtr, CaptureCandidate>>(pendingCapture))

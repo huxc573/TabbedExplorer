@@ -204,6 +204,13 @@ namespace TabbedExplorer
             n.Add(Leaf("捕获所有打开的文件夹（不只 Win+E）",
                        () => Settings.CaptureAll,
                        () => hub.SetCaptureAll(!Settings.CaptureAll)));
+            // ⑦′ 接管**桌面 shell 进程开的**那批（默认关，得实测过才敢默认开）：
+            //     开始菜单 / 任务栏 / 桌面双击 / 第三方程序（下载器的「打开文件夹」）都是这一类。
+            //     这种窗口不能收编（会把 shell 那条 Win+E 入口弄坏），所以走
+            //     「读出它的路径 → 关掉它 → 用我们自己的 explorer 重开成标签」（见 DesktopHub）。
+            n.Add(Leaf("接管 shell 打开的文件夹（开始菜单 / 第三方程序的「打开文件夹」）",
+                       () => Settings.CaptureShell,
+                       () => hub.SetCaptureShell(!Settings.CaptureShell)));
             n.Add(Sep());
 
             // ⑧ 开机自启（用户要的）。状态现问注册表，见 AutoStart。

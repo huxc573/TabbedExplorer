@@ -540,6 +540,33 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 读一个**别人的**资源管理器窗口现在开着哪个文件夹（不碰它的窗口对象，纯读）。
+        ///
+        /// 用途：接管 shell 打开的文件夹 —— shell 那条路建出来的窗口不能收进来（见 IsShellOwned），
+        /// 所以改成「读出它要去哪儿 → 关掉它 → 用我们自己的 explorer 把同一个文件夹开成标签」。
+        /// 地址栏是**唯一一条**「按手上这个 HWND 读、又拿得到当前文件夹」的路，理由见 FindAddressBand。
+        ///
+        /// 读不到 / 读出来不是真目录（「此电脑」「主文件夹」这类虚拟位置）一律返回 null，
+        /// 调用方据此走「放手」那条路 —— 绝不能因为读不出来就把窗口晾成隐形的。
+        /// </summary>
+        public static string AddressPathOf(IntPtr cab)
+        {
+            try
+            {
+                IntPtr band = FindAddressBand(cab);
+                if (band == IntPtr.Zero) return null;
+                string raw = WindowTextOf(band);
+                // 「地址: <当前地址>」——前缀跟着系统语言变，所以只认第一个冒号加空格
+                int i = raw.IndexOf(": ", StringComparison.Ordinal);
+                if (i < 0) return null;
+                string p = raw.Substring(i + 2).Trim();
+                if (p.Length == 0) return null;
+                return System.IO.Directory.Exists(p) ? p : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
         /// p 是不是 root 的后代（跨进程也能判）。
         /// 用来防「句柄被回收后瞎认」：地址栏那个 toolbar 是我们缓存下来的，
         /// 万一 shell 把它换成了别的窗口而句柄号被复用，至少能保证读到的还是自己那棵树里的东西。

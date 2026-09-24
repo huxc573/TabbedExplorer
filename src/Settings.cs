@@ -74,19 +74,18 @@ namespace TabbedExplorer
         /// </summary>
         public static bool CaptureAll = true;
         /// <summary>
-        /// 接管**桌面 shell 进程开的**文件夹窗口（默认关，得实测过才敢默认开）。
+        /// 接管**桌面 shell 进程开的**文件夹窗口（默认开）。
         ///
         /// 背景：从开始菜单 / 任务栏 / 桌面双击 / 第三方程序（Rayburst 这类）打开文件夹，
         /// 窗口是**桌面 shell 那个 explorer 进程**建的（`EmbedApi.IsShellOwned`）——
-        /// v1.13.1 起这种窗口一律不收，因为把一个 shell 自己的窗口 SetParent 成我们的子窗口
-        /// 会让 shell 那条「打开资源管理器」入口（Win+E 与开始菜单共用）去激活一扇坏窗口，
-        /// 而且退了程序也不恢复。
-        ///
-        /// 开：认出这种窗口后**不碰它的窗口对象** —— 先把它的真实路径从地址栏读出来，
-        /// 再关掉它、用我们自己的 `explorer /n,/separate` 把同一个文件夹开成标签（见 DesktopHub）。
-        /// 关：维持 v1.13.1 的行为，一个都不收。
+        /// 收编这种窗口（SetParent 进我们的窗口）会让 shell 那条「打开资源管理器」入口
+        /// （Win+E 与开始菜单共用）去激活一扇坏窗口，而且退了程序也不恢复，所以这条路只读、只关：
+        /// 把真实路径从地址栏读出来 → 像用户点 × 一样关掉它（SC_CLOSE）→ 用我们自己的
+        /// `explorer /n,/separate` 把同一个文件夹开成标签（见 DesktopHub.TakeOverShellWindow）。
+        /// **全程不碰它的窗口对象**（不 SetParent、不改样式位）：代价只是那扇原生窗会可见地闪一下。
+        /// 关：维持 v1.13.1 的行为，这种窗口一个都不收（从开始菜单/桌面双击的文件夹也就进不了标签）。
         /// </summary>
-        public static bool CaptureShell = false;
+        public static bool CaptureShell = true;
         /// <summary>
         /// 退出后**记住窗口位置和大小**（默认开）。真源在 `desktops.json` 每张桌面的 `bounds` 里 ——
         /// 这里只是一个开关：关了就不记、也不还原（下次起来还是默认尺寸）。
@@ -208,7 +207,7 @@ namespace TabbedExplorer
                     TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
                     FavBar       = Json.GetBool(json, "favbar", false);
                     CaptureAll   = Json.GetBool(json, "captureall", true);
-                    CaptureShell = Json.GetBool(json, "captureshell", false);
+                    CaptureShell = Json.GetBool(json, "captureshell", true);
                     WindowSize   = Json.GetBool(json, "winsize", true);
                     VTabs        = Json.GetBool(json, "vtabs", false);
                     VTabsCollapse = Json.GetBool(json, "vtabscollapse", true);
@@ -273,7 +272,7 @@ namespace TabbedExplorer
                     case "tabautowiden": TabAutoWiden = ParseBool(v, true); break;
                     case "favbar":       FavBar = ParseBool(v, false); break;
                     case "captureall":   CaptureAll = ParseBool(v, true); break;
-                    case "captureshell": CaptureShell = ParseBool(v, false); break;
+                    case "captureshell": CaptureShell = ParseBool(v, true); break;
                     case "winsize":      WindowSize = ParseBool(v, true); break;
                     case "vtabs":        VTabs = ParseBool(v, false); break;
                     case "vtabscollapse": VTabsCollapse = ParseBool(v, true); break;
@@ -299,7 +298,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_tabautowiden\": \"true = 名字太长时这个标签自己加宽（最多 400 逻辑像素）；false = 所有标签一样宽\",\r\n");
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
-                sb.Append("  \"_captureshell\": \"true = 连桌面 shell 进程开的文件夹窗口也接管（先读出它的路径、关掉它，再用我们自己的 explorer 开成标签）；false = 一个都不碰（默认，收编 shell 的窗口会弄坏 Win+E）\",\r\n");
+                sb.Append("  \"_captureshell\": \"true = 连桌面 shell 进程开的文件夹窗口也接管（先读出它的路径、像点 × 一样关掉它，再用我们自己的 explorer 开成标签）；false = 一个都不碰（从开始菜单/桌面双击打开的文件夹就不会进标签了）\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
                 sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");

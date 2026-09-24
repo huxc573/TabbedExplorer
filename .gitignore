@@ -15,6 +15,7 @@ obj/
 !assets/*.png
 probe/*.log
 probe/*.txt
+__pycache__/
 
 # 本机数据（绿色便携那个 data\ 目录：settings.txt / desktops.txt / log.txt 全在这儿）
 data/

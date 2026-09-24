@@ -409,6 +409,11 @@ namespace TabbedExplorer
                 Diag.Step(string.Format("Embed: 接管 cab=0x{0:X} pid={1} style 0x{2:X8}->0x{3:X8}",
                     cab.ToInt64(), pid, origStyle, child));
 
+                // 让 shell 以后别再把这扇窗当成「这个文件夹已经开着的那扇窗」（见 ShellBrowserReg 的类注释）：
+                // 不然三方程序再点「打开文件夹」时 shell 只会去激活这扇已被我们收编的窗，
+                // 不建新窗、也不给我们任何事件 —— 用户看到的就是「点了没反应、标签没切」。
+                ShellBrowserReg.ExcludeOurs(true);
+
                 // 防闪流程里 cab 一直是藏着的，这时量出来的空白可能是 0，先按它摆一下位置即可；
                 // 真正的值以「现身之后」那次为准（下面 + settle 定时器）。
                 TopBlank = EmbedApi.TopBlankOf(cab);
@@ -681,6 +686,11 @@ namespace TabbedExplorer
                 if (d != null) d(this, EventArgs.Empty);
                 return;
             }
+
+            // 顺手维护一件全局的事（内部自己节流）：让 shell 别再把这扇窗当成「这个文件夹已经开着的窗」。
+            // 挂在每个标签的 500ms 心跳上，是为了兜住两种「登记可能不作数」的情况 ——
+            // 收编那一刻句柄可能还没转过弯、以及标签换过目录（见 ShellBrowserReg 的类注释）。
+            ShellBrowserReg.ExcludeOurs();
 
             string t = CurrentDisplayName;
 

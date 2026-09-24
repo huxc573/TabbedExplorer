@@ -699,6 +699,33 @@ namespace TabbedExplorer
                 if (!IsCapturable(h)) { ReleaseIfAbandoned(h); return; }   // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
                 int pid = EmbedApi.ProcessIdOf(h).ToInt32();
 
+                Guid d = VirtualDesktop.WindowDesktopId(h);
+                if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
+                EmbedForm f = EnsureForm(d);
+                if (f == null) { ReleaseIfAbandoned(h); return; }
+
+                f.RestoreRememberedTabs();      // 同上：新窗口先把本桌面记着的标签摆回来，再收下这一个
+
+                // ★ 这扇新窗的目标**本来就是我们某个标签**（他原来就开着这个文件夹，只是没切到前面）：
+                //   shell 不会去复用那扇窗，而是又开一扇；我们照单全收就成了**两个一模一样的标签**，
+                //   而他真正要的是「切到原来那个」（用户报的就是这个）。
+                //   所以：把这扇现建出来的窗关掉，切过去、把窗口顶到前台。
+                //   ⚠ 必须排在 `RestoreRememberedTabs` 之后 —— 那个「原来的标签」可能刚被记忆摆回来。
+                //   ⚠ 也排在防闪那两步之前：这里只**关**、不藏；万一没关成，留在屏幕上的是一扇正常窗，
+                //     而不是一扇隐形窗（隐形窗会毒坏 shell，见 v1.13.1 那个「Win+E 没反应」的教训）。
+                string incoming = EmbedApi.AddressPathOf(h);
+                if (incoming != null && f.HasTabForPath(incoming))
+                {
+                    Diag.Step(string.Format(
+                        "Hub: 新窗的文件夹「{0}」已经有标签 -> 关掉这扇新窗、切到原来的标签", incoming));
+                    EmbedApi.ClearTransparent(h);
+                    EmbedApi.PostMessageW(h, EmbedApi.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    UnmarkHidden(h);            // 关掉了，别在「我们藏过的那批」里留个野句柄
+                    f.OpenPathAsTab(incoming);  // 已有 → 只会切过去（见 OpenPathAsTab）
+                    f.ShowForCapture();
+                    return;
+                }
+
                 // ⚠ 交出去之前先把「防闪那层透明」去掉 —— 先确保它是藏的，再去透明。
                 // 顺序反了的话，一个 SW_HIDE 没生效的窗口会在去透明那一瞬间弹出来（比闪一下还难看）。
                 EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
@@ -707,12 +734,6 @@ namespace TabbedExplorer
                 Diag.Step(string.Format("Hub: 收下这个新开的文件夹窗口 cab=0x{0:X} pid={1}（防闪反应 {2}ms）",
                     h.ToInt64(), pid, react));
 
-                Guid d = VirtualDesktop.WindowDesktopId(h);
-                if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
-                EmbedForm f = EnsureForm(d);
-                if (f == null) { ReleaseIfAbandoned(h); return; }
-
-                f.RestoreRememberedTabs();      // 同上：新窗口先把本桌面记着的标签摆回来，再收下这一个
                 if (!f.NewAdoptedTab(h, pid))
                 {
                     Diag.Step("Hub: 这个窗口没能收进来（已经收过了 / 失败），保持原样");

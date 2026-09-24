@@ -2052,7 +2052,9 @@ namespace TabbedExplorer
                 Defer(delegate { NewTab(p); });
             }));
             m.Add(Mi("添加到书签栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
-            m.Add(Mi("重新打开刚关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
+            // 跟空白右键、工具行那一项用**同一个名字**：三处说的是同一件事，
+            // 名字不一致会让人以为是两个功能（用户报过）。
+            m.Add(Mi("恢复关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
@@ -2237,6 +2239,17 @@ namespace TabbedExplorer
                 Diag.Step(string.Format("EmbedForm: 「{0}」没有对应标签（现有 {1} 个）-> 新开一个", p, hosts.Count));
                 NewTab(p);
             }
+        }
+
+        /// <summary>
+        /// 某个路径是不是已经有标签了。
+        /// 给「收编外面新开的窗口」用的：外面开的那扇窗如果**本来就是我们的标签**，
+        /// 收下去就是第二个重复标签，应该改成切过去（见 `DesktopHub.AdoptWindow`）。
+        /// </summary>
+        internal bool HasTabForPath(string p)
+        {
+            if (IsDisposed || Disposing) return false;
+            return IndexOfPath(p) >= 0;
         }
 
         /// <summary>标签个数（诊断日志用）。</summary>

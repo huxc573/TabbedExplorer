@@ -1330,7 +1330,11 @@ namespace TabbedExplorer
         /// <summary>已经有标签开着这个路径就返回它的下标，否则 -1。</summary>
         private int IndexOfPath(string path)
         {
-            string want = PathRules.Norm(path);
+            // 进来的是**地址栏原文**（外面传的也是地址栏里那个字符串），可能是「下载」「此电脑」
+            // 这种虚拟名字；而标签里存的是 `Store` 过的那套（`shell:Downloads`）。
+            // 不 Store 一次，这两边永远比不相等 —— 明明开着同一个文件夹，还要再开一个标签。
+            string want = PathRules.Norm(PathRules.Store(path));
+            if (want.Length == 0) return -1;
             for (int i = 0; i < hosts.Count; i++)
             {
                 if (PathRules.Norm(LivePath(hosts[i])) == want) return i;
@@ -1996,7 +2000,18 @@ namespace TabbedExplorer
             return -1;
         }
 
-        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 左边 / 右边」—— 用户新增）。</summary>
+        /// <summary>
+        /// 「关掉它前面 / 后面的」那一项里那个方位词。
+        /// 横排看的是左右，竖排侧边栏里看的是上下 —— 竖排还写成「左边」就是在指错方向（用户报的）。
+        /// 日志也用同一个词，免得回头分不清用户点的是哪一项。
+        /// </summary>
+        private static string SideWord(bool before)
+        {
+            if (Settings.VTabs) return before ? "上方" : "下方";
+            return before ? "左边" : "右边";
+        }
+
+        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 前 / 后」—— 用户新增）。</summary>
         private void ShowTabMenu(int idx)
         {
             if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
@@ -2042,12 +2057,12 @@ namespace TabbedExplorer
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
             // ---- 用户新增的三条（跟浏览器右键对表）----
-            // 只剩一个标签 / 当前就在最左（右）时置灰 —— 点了什么也不发生的项还不如直接灰着
+            // 只剩一个标签 / 当前就在最前（最后）时置灰 —— 点了什么也不发生的项还不如直接灰着
             m.Add(Mi("关闭其它标签页", hosts.Count > 1
                 ? (Action)delegate { Defer(delegate { CloseOtherTabs(idx); }); } : null));
-            m.Add(Mi("关闭左边标签页", idx > 0
+            m.Add(Mi("关闭" + SideWord(true) + "标签页", idx > 0
                 ? (Action)delegate { Defer(delegate { CloseTabsBefore(idx); }); } : null));
-            m.Add(Mi("关闭右边标签页", idx < hosts.Count - 1
+            m.Add(Mi("关闭" + SideWord(false) + "标签页", idx < hosts.Count - 1
                 ? (Action)delegate { Defer(delegate { CloseTabsAfter(idx); }); } : null));
             m.Add(SepItem());
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
@@ -2076,11 +2091,11 @@ namespace TabbedExplorer
             if (n >= 0) Activate(n);
         }
 
-        /// <summary>关闭 idx 左边（不含）的所有标签。</summary>
+        /// <summary>关闭 idx 前面（不含）的所有标签。</summary>
         private void CloseTabsBefore(int idx)
         {
             if (idx <= 0 || idx >= hosts.Count) return;
-            Diag.Step("EmbedForm: 关闭左边标签页（idx=" + idx + " 左边共 " + idx + " 个）");
+            Diag.Step("EmbedForm: 关闭" + SideWord(true) + "标签页（idx=" + idx + " 前面共 " + idx + " 个）");
             int from = idx - 1;
             CloseTabsQuiet(delegate
             {
@@ -2089,11 +2104,11 @@ namespace TabbedExplorer
             if (hosts.Count > 0) Activate(0);
         }
 
-        /// <summary>关闭 idx 右边（不含）的所有标签。</summary>
+        /// <summary>关闭 idx 后面（不含）的所有标签。</summary>
         private void CloseTabsAfter(int idx)
         {
             if (idx < 0 || idx >= hosts.Count - 1) return;
-            Diag.Step("EmbedForm: 关闭右边标签页（idx=" + idx + " 右边共 " + (hosts.Count - 1 - idx) + " 个）");
+            Diag.Step("EmbedForm: 关闭" + SideWord(false) + "标签页（idx=" + idx + " 后面共 " + (hosts.Count - 1 - idx) + " 个）");
             CloseTabsQuiet(delegate
             {
                 for (int i = hosts.Count - 1; i > idx; i--) CloseTab(i, false);
@@ -2147,7 +2162,10 @@ namespace TabbedExplorer
         /// 用户报「右边空白菜单的功能还没实现」—— 两个原因，都在这儿收掉：
         ///   ① 真的定位错了：标签溢出时最后半个标签的矩形伸到了按钮底下，右键落在那一块被
         ///      `HitTest` 认成「标签」而不是「空白」（修在 TabStrip.HitTest）；
-        ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 书签栏 / 三个关标签 / 设置都放进来。
+        ///   ② 菜单里的东西太少。现在把新建 / 历史 / 恢复 / 书签栏 / 垂直侧边栏 / 设置都放进来。
+        ///
+        /// 「关闭其它 / 前 / 后」三条**只在标签右键里**（用户报：空白处不该有）—— 那三条是对
+        /// 某一个标签说的，摆在空白处还得让人猜作用于哪个；空白处换成布局开关更顺。
         /// 每条都从 `Mi` 建 —— 点下去日志里会留一行，以后不用再猜「到底点没点中」。
         /// </summary>
         private void ShowBlankMenu()
@@ -2168,15 +2186,12 @@ namespace TabbedExplorer
                 if (hub != null) hub.SetFavBar(!on);
             }, on));
 
-            // 三个关标签的动作（跟标签右键同一套，作用于**当前标签**）
-            int cur = activeIndex;
-            m.Add(SepItem());
-            m.Add(Mi("关闭其它标签页", (cur >= 0 && hosts.Count > 1)
-                ? (Action)delegate { Defer(delegate { CloseOtherTabs(cur); }); } : null));
-            m.Add(Mi("关闭左边标签页", (cur > 0)
-                ? (Action)delegate { Defer(delegate { CloseTabsBefore(cur); }); } : null));
-            m.Add(Mi("关闭右边标签页", (cur >= 0 && cur < hosts.Count - 1)
-                ? (Action)delegate { Defer(delegate { CloseTabsAfter(cur); }); } : null));
+            // 三个关标签的动作只在**标签右键**里有（它作用于某一个标签）。空白处放布局开关：
+            // 这一条跟设置里的「垂直侧边栏」是同一个开关，勾选状态现问 Settings。
+            m.Add(Mi("切换垂直侧边栏(" + Hotkeys.Combo("vtabs") + ")", delegate
+            {
+                if (hub != null) hub.SetVerticalTabs(!Settings.VTabs);
+            }, Settings.VTabs));
 
             m.Add(SepItem());
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
@@ -2212,9 +2227,23 @@ namespace TabbedExplorer
                 return;
             }
             int dup = IndexOfPath(p);
-            if (dup >= 0) Activate(dup);
-            else NewTab(p);
+            if (dup >= 0)
+            {
+                Diag.Step(string.Format("EmbedForm: 「{0}」已经有标签（第 {1} 个，共 {2} 个）-> 切过去", p, dup + 1, hosts.Count));
+                Activate(dup);
+            }
+            else
+            {
+                Diag.Step(string.Format("EmbedForm: 「{0}」没有对应标签（现有 {1} 个）-> 新开一个", p, hosts.Count));
+                NewTab(p);
+            }
         }
+
+        /// <summary>标签个数（诊断日志用）。</summary>
+        internal int TabCount { get { return hosts.Count; } }
+
+        /// <summary>当前选中的标签下标（诊断日志用），没有标签时 -1。</summary>
+        internal int ActiveIdx { get { return activeIndex; } }
 
         /// <summary>
         /// 书签栏开关。**所有入口都汇到这一条**（Ctrl+Shift+B、按钮、设置菜单、空白右键、栏上右键），

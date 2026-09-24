@@ -102,6 +102,13 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 标成「托盘菜单里不排」。用户：托盘右键的设置项太多了，去掉一些、设置窗口里有就行。
+        /// 一次性设置（主题 / 捕获方式 / 窗口记忆）、纯动作、能在别处点到的那些全归这里 ——
+        /// 托盘里那棵子树原来挤了二十来行，想找哪一项得从头数一遍。
+        /// </summary>
+        private static Node WinOnly(Node nd) { nd.WindowOnly = true; return nd; }
+
+        /// <summary>
         /// 纯动作项（没有勾选状态，点了就干活）—— 设置窗口里画成一个按钮，托盘菜单里是一条正常可点的项。
         /// `notice` 会给点完的界面一句反馈（设置窗口底部提示行），并且顺带把窗口重建一遍
         /// （文字里带实时数字的项要）。
@@ -120,40 +127,40 @@ namespace TabbedExplorer
             List<Node> n = new List<Node>();
 
             // ① 标签捕获方式（互斥）
-            n.Add(Leaf(Settings.Label(Settings.CaptureMode.PerDesktop),
+            n.Add(WinOnly(Leaf(Settings.Label(Settings.CaptureMode.PerDesktop),
                        () => Settings.Capture == Settings.CaptureMode.PerDesktop,
-                       () => hub.SetCaptureMode(Settings.CaptureMode.PerDesktop), "capture"));
-            n.Add(Leaf(Settings.Label(Settings.CaptureMode.Migrate),
+                       () => hub.SetCaptureMode(Settings.CaptureMode.PerDesktop), "capture")));
+            n.Add(WinOnly(Leaf(Settings.Label(Settings.CaptureMode.Migrate),
                        () => Settings.Capture == Settings.CaptureMode.Migrate,
-                       () => hub.SetCaptureMode(Settings.CaptureMode.Migrate), "capture"));
+                       () => hub.SetCaptureMode(Settings.CaptureMode.Migrate), "capture")));
             n.Add(Sep());
 
             // ② 颜色模式（互斥）
-            n.Add(Leaf(Settings.Label(Settings.ColorMode.System),
+            n.Add(WinOnly(Leaf(Settings.Label(Settings.ColorMode.System),
                        () => Settings.Color == Settings.ColorMode.System,
-                       () => hub.SetColorMode(Settings.ColorMode.System), "theme"));
-            n.Add(Leaf(Settings.Label(Settings.ColorMode.Light),
+                       () => hub.SetColorMode(Settings.ColorMode.System), "theme")));
+            n.Add(WinOnly(Leaf(Settings.Label(Settings.ColorMode.Light),
                        () => Settings.Color == Settings.ColorMode.Light,
-                       () => hub.SetColorMode(Settings.ColorMode.Light), "theme"));
-            n.Add(Leaf(Settings.Label(Settings.ColorMode.Dark),
+                       () => hub.SetColorMode(Settings.ColorMode.Light), "theme")));
+            n.Add(WinOnly(Leaf(Settings.Label(Settings.ColorMode.Dark),
                        () => Settings.Color == Settings.ColorMode.Dark,
-                       () => hub.SetColorMode(Settings.ColorMode.Dark), "theme"));
+                       () => hub.SetColorMode(Settings.ColorMode.Dark), "theme")));
             n.Add(Sep());
 
             // ③ 是否保留标签页
-            n.Add(Leaf("保留标签页（退出后记住、下次还原）",
+            n.Add(WinOnly(Leaf("保留标签页（退出后记住、下次还原）",
                        () => Settings.KeepTabs,
-                       () => hub.SetKeepTabs(!Settings.KeepTabs)));
+                       () => hub.SetKeepTabs(!Settings.KeepTabs))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。
             //    「恢复默认」是个动作而不是设置项，但一样收在 Spec 里 ——
             //    托盘菜单和设置窗口两处都能点到，不用各写一遍（这正是 Spec 存在的意义）。
-            n.Add(Leaf("记住窗口位置和大小（退出后下次照原样打开）",
+            n.Add(WinOnly(Leaf("记住窗口位置和大小（退出后下次照原样打开）",
                        () => Settings.WindowSize,
-                       () => hub.SetWindowSize(!Settings.WindowSize)));
-            n.Add(Act("恢复默认窗口位置和大小", delegate { hub.RestoreDefaultWindow(); },
-                      "窗口已恢复默认位置和大小。"));
+                       () => hub.SetWindowSize(!Settings.WindowSize))));
+            n.Add(WinOnly(Act("恢复默认窗口位置和大小", delegate { hub.RestoreDefaultWindow(); },
+                      "窗口已恢复默认位置和大小。")));
             n.Add(Sep());
 
             // ③″ 垂直侧边栏（用户：打开/关闭 Ctrl+Shift+,）。样式参考 Edge：
@@ -182,12 +189,12 @@ namespace TabbedExplorer
                       delegate(int w) { hub.SetTabWidth(w); }));
 
             // ⑤ 自适应宽度（用户要拆成两项：加宽 / 缩窄）
-            n.Add(Leaf("自适应宽度：名称过长时自动加宽",
+            n.Add(WinOnly(Leaf("自适应宽度：名称过长时自动加宽",
                        () => Settings.TabAutoWiden,
-                       () => hub.SetTabAutoWiden(!Settings.TabAutoWiden)));
-            n.Add(Leaf("自适应宽度：挤不下时自动缩窄",
+                       () => hub.SetTabAutoWiden(!Settings.TabAutoWiden))));
+            n.Add(WinOnly(Leaf("自适应宽度：挤不下时自动缩窄",
                        () => Settings.TabAutoFit,
-                       () => hub.SetTabAutoFit(!Settings.TabAutoFit)));
+                       () => hub.SetTabAutoFit(!Settings.TabAutoFit))));
             n.Add(Sep());
 
             // ⑥ 书签栏（Ctrl+Shift+B）
@@ -197,7 +204,7 @@ namespace TabbedExplorer
             // 用户：原来这条是「打开书签栏数据目录」，改成**管理书签** ——
             // 数据目录在他眼里只是个 json 文件，改不动也看不懂；给他一扇仿浏览器的管理窗更实用
             // （树 + 搜索 + 重命名 + 嵌套 + 「设为书签栏」）。窗口里那个「打开 json」按钮仍然直达文件。
-            n.Add(Leaf("管理书签…", null, () => hub.OpenFavManager()));
+            n.Add(WinOnly(Leaf("管理书签…", null, () => hub.OpenFavManager())));
             n.Add(Sep());
 
             // ⑦ 是否连「从开始菜单 / 桌面双击打开的文件夹」也收成标签
@@ -227,7 +234,7 @@ namespace TabbedExplorer
                        () => Settings.Debug,
                        () => hub.SetDebug(!Settings.Debug)));
             n.Add(Info("日志文件：data\\log.txt（现在 " + Diag.HumanSize() + "）"));
-            n.Add(Act("清理日志", delegate { Diag.Clear(); }, "日志已清空。"));
+            n.Add(WinOnly(Act("清理日志", delegate { Diag.Clear(); }, "日志已清空。")));
             n.Add(Sep());
 
             // ⑩ 常用动作 + 说明
@@ -235,7 +242,7 @@ namespace TabbedExplorer
             // 它跟上面「保留标签页」不是一回事：那个是**开关**（开=以后才记），
             // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有
             // （改动攒 800ms 落盘 + 退出前再存），所以手动这一下只在「怕它没来得及存」时用。
-            n.Add(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow()));
+            n.Add(WinOnly(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow())));
             n.Add(Info("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）"));
             // 用户问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
             // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：
@@ -277,23 +284,31 @@ namespace TabbedExplorer
         {
             TraySettings ts = new TraySettings();
             ts.Root = new MenuItem("设置");
-            ts.Root.MenuItems.AddRange(ToMenus(Spec(hub), ts));
-
-            // 用户：「右键设置 菜单最后加：更多选项」——
-            // 菜单里只留「在菜单里设着顺手」的那些，别的都去设置窗口；这一条就是入口。
-            // 同时也是「删掉那些不方便以菜单形式设置的内容」的兜底：删掉的东西窗口里都还能改。
-            ts.Root.MenuItems.Add(MenuFx.Sep());
+            // 用户：「更多选项放到第一条」。菜单里只留几个顺手能切的东西，其余全在设置窗口里，
+            // 所以这个入口必须一眼就在最上面 —— 原来压在二十来条下面，找它得先把整个菜单扫一遍。
             ts.Root.MenuItems.Add(MenuFx.Item("更多选项…（打开设置窗口）", delegate { hub.OpenSettings(); }));
+            ts.Root.MenuItems.Add(MenuFx.Sep());
+            ts.Root.MenuItems.AddRange(ToMenus(Spec(hub), ts));
             return ts;
         }
 
         private static MenuItem[] ToMenus(List<Node> nodes, TraySettings ts)
         {
             List<MenuItem> r = new List<MenuItem>();
+            List<bool> sep = new List<bool>();                    // 与 r 一一对应：这一条是不是分隔条
             foreach (Node nd in nodes)
             {
-                if (nd.WindowOnly) continue;                      // 只在设置窗口里出现（数值项 / 纯说明行）
-                if (nd.Text == null) { r.Add(MenuFx.Sep()); continue; }
+                if (nd.WindowOnly) continue;                      // 只在设置窗口里出现（数值项 / 说明行 / 一次性设置）
+
+                if (nd.Text == null)
+                {
+                    // 被 WindowOnly 摘掉的项一撤，原来夹在两段之间的分隔条就挨到一起了（甚至顶到最前、
+                    // 留在最后）—— 菜单里连着两条横线看着像出了 bug，这里合掉：首尾不留、连着只留一条。
+                    if (r.Count == 0 || sep[sep.Count - 1]) continue;
+                    r.Add(MenuFx.Sep());
+                    sep.Add(true);
+                    continue;
+                }
 
                 MenuItem mi = new MenuItem(nd.Text);
                 if (nd.Checked != null) mi.Checked = nd.Checked();   // 自绘时按这个画勾（见 MenuFx）
@@ -310,7 +325,10 @@ namespace TabbedExplorer
                 else if (nd.Checked != null && ts != null) ts.Bind(mi, nd);   // 只登记「会打勾」的那些
 
                 r.Add(mi);
+                sep.Add(false);
             }
+
+            while (r.Count > 0 && sep[sep.Count - 1]) { r.RemoveAt(r.Count - 1); sep.RemoveAt(sep.Count - 1); }
             return r.ToArray();
         }
     }

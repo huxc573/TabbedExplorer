@@ -426,7 +426,21 @@ namespace TabbedExplorer
                 // 只是读出它要去哪个目录、像用户点 × 一样关掉它，再用我们自己的 explorer 重开成标签
                 // （见 TakeOverShellWindow）。
                 bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
-                if (!shellTake && !IsHideCandidate(h)) return;
+                if (!shellTake && !IsHideCandidate(h))
+                {
+                    // 「看着像用户新开的文件夹窗口、却被整个放过」原来是全黑的 —— 川报「点打开文件夹没反应」
+                    // 时根本分不清是没收还是没收到。只记 shell 自己那种浏览窗口：我们自己的窗口、
+                    // 启动前就在的老窗口都会被 `IsHideCandidate` 就地挡掉，记它们纯噪声。
+                    string cls0 = EmbedApi.ClassOf(h);
+                    if (!shellTake && (cls0 == "CabinetWClass" || cls0 == "ExploreWClass") && EmbedApi.IsShellOwned(h))
+                        Diag.Step(string.Format(
+                            "Hub: 放过 shell 的浏览窗口 cab=0x{0:X}（接管开关={1} 基线={2} 已认领={3} 已嵌={4}）",
+                            h.ToInt64(), Settings.CaptureShell ? "开" : "关",
+                            EmbedApi.IsBaseline(h) ? "是" : "否",
+                            EmbedApi.IsClaimed(h) ? "是" : "否",
+                            EmbedApi.GetParent(h) != IntPtr.Zero ? "是" : "否"));
+                    return;
+                }
 
                 int react = Environment.TickCount - tick;      // 系统报事件 → 我们动手，差了多少毫秒
                 bool wasVisible = EmbedApi.IsWindowVisible(h);
@@ -631,8 +645,12 @@ namespace TabbedExplorer
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
                 // 这扇窗是**为了外面那个文件夹**才现建出来的：先把本桌面记着的标签摆回来，再加上它。
                 // 少了这一步，用户原来那一整排标签会被「只有这一个」的窗盖掉（退出时还会存进去）。
-                f.RestoreRememberedTabs();
+                bool fresh = f.RestoreRememberedTabs();
+                Diag.Step(string.Format(
+                    "Hub: 转生目标窗口 桌面={0} 记忆还原={1} 当时标签={2} 可见={3} 当前标签={4}",
+                    d, fresh ? "是" : "否（本来就有标签）", f.TabCount, f.Visible, f.ActiveIdx));
                 f.OpenPathAsTab(path);
+                Diag.Step(string.Format("Hub: 转生完成 标签={0} 当前标签={1}", f.TabCount, f.ActiveIdx));
                 // 这一步不能省：用户是在**别的程序**里点的「打开文件夹」，本该有一扇窗弹到最前面。
                 // 只 `OpenPathAsTab` 的话窗口只是被 `Show()` 出来、还压在那个程序后面，
                 // 用户看到的就只有「原生窗闪了一下 + 任务栏图标闪」= 像什么都没发生。

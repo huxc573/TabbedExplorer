@@ -629,6 +629,9 @@ namespace TabbedExplorer
                 EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);      // WM_SYSCOMMAND / SC_CLOSE
                 EmbedForm f = EnsureForm(d);
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
+                // 这扇窗是**为了外面那个文件夹**才现建出来的：先把本桌面记着的标签摆回来，再加上它。
+                // 少了这一步，用户原来那一整排标签会被「只有这一个」的窗盖掉（退出时还会存进去）。
+                f.RestoreRememberedTabs();
                 f.OpenPathAsTab(path);
                 // 这一步不能省：用户是在**别的程序**里点的「打开文件夹」，本该有一扇窗弹到最前面。
                 // 只 `OpenPathAsTab` 的话窗口只是被 `Show()` 出来、还压在那个程序后面，
@@ -691,6 +694,7 @@ namespace TabbedExplorer
                 EmbedForm f = EnsureForm(d);
                 if (f == null) { ReleaseIfAbandoned(h); return; }
 
+                f.RestoreRememberedTabs();      // 同上：新窗口先把本桌面记着的标签摆回来，再收下这一个
                 if (!f.NewAdoptedTab(h, pid))
                 {
                     Diag.Step("Hub: 这个窗口没能收进来（已经收过了 / 失败），保持原样");

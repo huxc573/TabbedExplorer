@@ -1085,7 +1085,21 @@ namespace TabbedExplorer
         /// </summary>
         private void EnsureFirstTab()
         {
-            if (restored || hosts.Count > 0) return;
+            if (RestoreRememberedTabs()) return;
+            NewTab(ExplorerView.ThisPcPath);
+        }
+
+        /// <summary>
+        /// 把本桌面记着的标签摆回来，返回「真摆上了没有」。**不兜底开「此电脑」** ——
+        /// 给「窗口是为了外面某个文件夹才现建出来」的那两条路用（shell 窗口转生、收编用户开的窗口）：
+        /// 它们接着就会把目标标签加上，再兜一个「此电脑」就是白多一页。
+        ///
+        /// ⚠ 这两条路以前漏了这一步：用户看到的是「一扇只有刚才那个文件夹的窗」，
+        /// 而且**退出时这 1 个标签会把记忆里原来的整套标签盖掉** —— 下次开就只剩这一个了。
+        /// </summary>
+        internal bool RestoreRememberedTabs()
+        {
+            if (restored || hosts.Count > 0) return false;
             restored = true;
 
             DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
@@ -1162,11 +1176,10 @@ namespace TabbedExplorer
                 if (hosts.Count > 0)
                 {
                     Activate(act >= 0 ? act : 0);
-                    return;
+                    return true;
                 }
             }
-
-            NewTab(ExplorerView.ThisPcPath);
+            return false;
         }
 
         /// <summary>

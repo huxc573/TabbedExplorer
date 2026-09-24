@@ -81,8 +81,9 @@ namespace TabbedExplorer
         private const int CaptureDelayMs = 700;
         /// <summary>
         /// shell 窗口「等地址栏填好」的上限。shell 通常是**先导航、再显示**，所以 SHOW 那一刻地址栏
-        /// 往往已经填好了（RegisterShellCandidate 里会当场试一次）。到点还读不出就当没这回事 ——
-        /// 我们本来就没碰过它，它还是那个正常窗口，用户自己关。
+        /// 往往已经填好了（RegisterShellCandidate 里会当场试一次）。现在从 CREATE 就开始等
+        /// （那 ~0.7 秒是白捡的），超时按**最近一次事件**重新起算，免得早那一次先把点耗光。
+        /// 到点还读不出就当没这回事 —— 我们本来就没碰过它，它还是那个正常窗口，用户自己关。
         /// </summary>
         private const int ShellResolveMs = 1200;
         private RegisteredWaitHandle sigWait;
@@ -475,7 +476,12 @@ namespace TabbedExplorer
                 }
 
                 // 后面的账（pendingCapture / 起定时器）回 UI 线程做 —— 那两个是 UI 线程的状态
-                if (isShow) Post(delegate { if (shellTake) RegisterShellCandidate(h, react); else RegisterCandidate(h, react); });
+                // ⚠ shell 那条**从 CREATE 就开始登记**：从 CREATE 到 SHOW 实测隔着 ~0.7 秒，那段时间窗口
+                //   还没画出来，越早读到地址栏就越可能在它露脸之前把 SC_CLOSE 发出去
+                //   （用户报的「多闪一下原生资源管理器」就是非等 SHOW 不可造成的）。
+                //   收编那条仍然只听 SHOW —— 那扇窗在 CREATE 就已经被我们置透明了，不急。
+                if (isShow || shellTake)
+                    Post(delegate { if (shellTake) RegisterShellCandidate(h, react); else RegisterCandidate(h, react); });
             }
             catch (Exception ex) { Diag.Log("Hub: 处理新窗口事件失败 " + ex.Message); }
         }
@@ -578,10 +584,17 @@ namespace TabbedExplorer
         private void RegisterShellCandidate(IntPtr h, int react)
         {
             if (quitting || !Settings.CaptureAll || !Settings.CaptureShell) return;
-            if (pendingShell.ContainsKey(h)) return;
             if (!NativeMethods.IsWindow(h)) return;
-            // 先当场试一次：shell 是先导航后显示，这一刻地址栏多半已经填好了 ——
-            // 能读出来就直线收，那扇窗在屏幕上只短暂露一下。
+            if (pendingShell.ContainsKey(h))
+            {
+                // 已经登记过了（CREATE 那一次）：SHOW 再来一次就把「等地址栏」的超时**重新起算** ——
+                // 早那一次可能一个字节都没读到，别让它的计时先耗光。
+                pendingShell[h].SeenAt = DateTime.Now;
+                return;
+            }
+            // 先当场试一次：shell 是先导航后显示，SHOW 那一刻地址栏多半已经填好了 ——
+            // 能读出来就直接收，那扇窗在屏幕上只短暂露一下。
+            // （CREATE 那一刻也走这条路：那时地址栏通常还没填，于是进 pendingShell、每 250ms 再看。）
             string now = EmbedApi.AddressPathOf(h);
             if (now != null) { TakeOverShellWindow(h, now, react); return; }
             pendingShell[h] = new ShellCandidate { SeenAt = DateTime.Now, ReactMs = react };
@@ -616,6 +629,11 @@ namespace TabbedExplorer
                     continue;
                 }
                 pendingShell.Remove(h);
+                // 这行专为回答「到底有没有赶在它露脸之前动手」：报「还没显示」就是抢在了 SHOW 前面
+                Diag.Step(string.Format(
+                    "Hub: shell 窗口地址栏就绪（登记后 {0}ms，当时{1}）cab=0x{2:X} -> {3}",
+                    (int)(now - kv.Value.SeenAt).TotalMilliseconds,
+                    EmbedApi.IsWindowVisible(h) ? "已可见" : "还没显示", h.ToInt64(), path));
                 TakeOverShellWindow(h, path, kv.Value.ReactMs);
             }
         }

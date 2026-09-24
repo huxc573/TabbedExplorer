@@ -1085,6 +1085,13 @@ namespace TabbedExplorer
         /// </summary>
         private void EnsureFirstTab()
         {
+            // 已经有标签就直接收工。**这句不能省**：`RestoreRememberedTabs` 在「窗口里已经有标签」时
+            // 同样返回 false（它只在窗口为空时才动手），把那句 false 读成「没有记忆、得兜一个」
+            // 就会**每按一次 Win+E 白开一个「此电脑」标签**（用户连按几次就刷出一屏），
+            // 而调用点下面那句「已经开着、切过去」的判重在它之后，拦不住（日志里先「用掉备用标签」
+            // 再「已经开着 idx=3」就是这个顺序）。只在窗口真的空着时才需要兜底。
+            if (hosts.Count > 0) return;
+
             if (RestoreRememberedTabs()) return;
             NewTab(ExplorerView.ThisPcPath);
         }

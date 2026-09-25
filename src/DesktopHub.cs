@@ -137,6 +137,10 @@ namespace TabbedExplorer
             // ⚠ 设置窗口里那条「立即记住当前标签」**保留**（用户明确说的：只删托盘这条）。
             MenuItem miFav = new MenuItem("书签管理器", delegate { OpenFavManager(); });
             MenuItem miHist = new MenuItem("历史记录管理器", delegate { OpenHistoryManager(); });
+            // 重启本程序放在**主菜单**、紧挨着「退出」上面（用户点名要的位置）：
+            // 改完设置 / 换完皮肤想让程序从头走一遍时，它就在手边。
+            // ⚠ `SettingsMenu.Spec` 里那一条套了 `WinOnly`（托盘里不排）—— 就是为了不在这里再排一遍。
+            MenuItem miRestart = new MenuItem("重启本程序", delegate { RestartApp(); });
             MenuItem miQuit = new MenuItem("退出", delegate { Quit("托盘菜单"); });
 
             // 设置子菜单跟齿轮那份**同一份内容**（SettingsMenu 里生成），别各写一遍 ——
@@ -145,7 +149,7 @@ namespace TabbedExplorer
 
             trayMenu = new ContextMenu(new MenuItem[]
             {
-                miShow, miFav, miHist, traySettings.Root, new MenuItem("-"), miQuit
+                miShow, miFav, miHist, traySettings.Root, new MenuItem("-"), miRestart, miQuit
             });
             // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（用户报的「没和其它选项一样居左对齐」）
             MenuFx.Hook(trayMenu);
@@ -460,6 +464,20 @@ namespace TabbedExplorer
                     Diag.Step(string.Format(
                         "Hub: 新窗口 -> shell 自己的（不碰样式）（{0}，事件后 {1}ms）cab=0x{2:X}",
                         isShow ? "SHOW" : "CREATE", react, h.ToInt64()));
+                }
+                else if (!wasVisible && HiddenByUs(h))
+                {
+                    // 已经被前一个回调处理过了。同一次「窗口显示」会被 **N 个** watcher 各报一遍
+                    // （每个标签一份 `WinShowWatcher`，外加 Hub 自己那份），而我们排到时常常已经晚了一秒多
+                    // （前面十几个回调加上 UI 线程上正在跑的收编一起排队），那时窗口早被藏掉了。
+                    // 这一刀不再重复发**跨进程**的 `MakeTransparent` / `ShowWindow`、也不再写日志：
+                    // 实测那一串重复的「Hub: 新窗口 -> 藏起来（SHOW，事件后 985~1140ms）」就是这么来的，
+                    // 一轮还原能刷出几十行，全压在 UI 线程上 ⇒ 反过来把后面的事件处理堵住一秒多。
+                    //
+                    // ⚠ 判据必须是「已被我们藏过 **且** 现在不可见」两件一起看：
+                    //   只看 `!wasVisible` 会把 CREATE 那次唯一的早机会误杀 —— CREATE 时窗口本来就不可见，
+                    //   而那一刻的 `MakeTransparent` 才是「一点不闪」的关键（见 OnWindowShown 类注释①）。
+                    //   只看 `HiddenByUs` 也不行：用户手动重新显示那扇窗时它还在集合里，那一下必须再藏。
                 }
                 else
                 {

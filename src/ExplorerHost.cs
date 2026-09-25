@@ -31,6 +31,16 @@ namespace TabbedExplorer
         /// <summary>正在收编（SetParent 那一套）—— 这一步只能在 UI 线程上串行做，上层拿它当「忙」看。</summary>
         public bool Attaching { get; private set; }
 
+        /// <summary>
+        /// 这个标签「落定」了：要么已经嵌好，要么已经失败 —— 总之它的窗口不会再漂在外面。
+        ///
+        /// 用途：Hub 那道「起标签期间先别收编别人的窗口」的闸（见 `EmbedForm.LaunchInFlight`）。
+        /// 为什么不能用「窗口认下来了」当判据：**认窗口**（地址栏读得出来）到**嵌好**之间还有
+        /// 一秒多的收编工作，那段时间窗口虽然被 `Claim` 登记过，但闸一松 Hub 就可能把它
+        /// 当成「用户新开的」再收一个重复标签进来。
+        /// </summary>
+        public bool Settled { get { return embedded || LastError != null; } }
+
         /// <summary>嵌好了（此时才看得到内容）。</summary>
         public event EventHandler Ready;
         /// <summary>
@@ -192,9 +202,24 @@ namespace TabbedExplorer
             poll.Interval = 25;
             poll.Start();
 
-            // 系统广播那条路更快（0ms 级），两条一起用
-            watcher.WindowShown += OnAnyWindowShown;
-            watcher.Start();
+            // 系统广播那条路更快（0ms 级），两条一起用。
+            //
+            // ⚠ 但**并行起标签时不给每个标签挂这一份**（2026-09-25 实测，这是「还原慢+卡」的主因）：
+            //   这份是装在 **UI 线程**上的（`WINEVENT_OUTOFCONTEXT` 的回调投到注册它的那个线程的消息队列），
+            //   而并行时一次同时冒出 4 个窗口、每个标签又各挂一份 hook ⇒ 一次「窗口显示」的广播
+            //   在 UI 线程上要被处理十几遍，每遍都得跨进程 `ShowWindow`（对方正在建视图时单次几百毫秒）。
+            //   实测 10 个标签还原：UI 线程从 12:12:26.4 一直忙到 12:12:30.8 整整 **4.4 秒**全在处理这些回调，
+            //   连 25ms 的 `poll`（发现新窗口）和 200ms 的 `pumpTimer`（放行下一格并发）都排不上队 ——
+            //   于是「第一个窗口被发现」被推到第 4.5 秒、下一批 explorer 也跟着晚起 3.5 秒。
+            //   Hub 自己那份**装在专用线程上**（`StartDedicated`，见 WinShowWatcher 类注释），
+            //   0ms 就把同一个窗口藏掉了、完全不占 UI 线程 ⇒ 并行时这一份是**纯冗余**。
+            //   ⇒ 只在「串行」或「Hub 不管这摊事（`CaptureAll` 关）」时才挂 —— 那时它才是唯一的防闪。
+            //   ⚠ 串行时它还兼任「当场认领」（见 OnAnyWindowShown 尾部），那条路只在串行下走。
+            if (!Settings.ParallelLaunch || !Settings.CaptureAll)
+            {
+                watcher.WindowShown += OnAnyWindowShown;
+                watcher.Start();
+            }
         }
 
         /// <summary>
@@ -320,16 +345,21 @@ namespace TabbedExplorer
                 //   12 秒仍远早于下面 25 秒的失败兜底。
                 bool relax = (DateTime.Now - startedAt).TotalSeconds > 12;
                 int pid;
+                bool byPath;
                 // 并发起 explorer 时把「我要开哪个路径」交给扫描器，让它**只认地址栏对得上的那个窗口**
                 //（一次冒出好几个，不这么判就会抢到别人的窗口）；串行时传 null，走老路不判。
                 IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax,
-                    Settings.ParallelLaunch ? TargetPath : null, out pid);
-                if (cab != IntPtr.Zero && !relax && !CabMatches(cab, TargetPath))
+                    Settings.ParallelLaunch ? TargetPath : null, out pid, out byPath);
+                // `byPath` = 上面那一扇是**按地址栏内容**命中的：也就是说「它就是我要开的那扇窗」
+                // 已经有硬证据了（那份内容由后台线程读的，见 `EmbedApi.ProbePath`）。那就别再在这里
+                // 重读一遍地址栏 —— 这一下是跨进程 `SendMessage`，对方忙的时候要几百毫秒，
+                // 白花在 UI 线程上。复核留给「没走路径判据」的那两种：串行模式 / relax。
+                if (cab != IntPtr.Zero && !relax && !byPath && !CabMatches(cab, TargetPath))
                 {
                     // 找到了一个窗口，但地址栏显示的不是我们要开的那个 —— 十有八九是
                     // **同时开了好几个标签**，把别人的窗口扫到自己这儿了（用户报的「有时候标签页
                     // 点开是空的」就是这个：真窗口被别的标签嵌走，这个标签就永远等不到东西）。
-                    // 先别嵌，继续等；4 秒后 relax 打开就不再挑了（宁可就近凑一个，也别永远空着）。
+                    // 先别嵌，继续等；12 秒后 relax 打开就不再挑了（宁可就近凑一个，也别永远空着）。
                     Diag.Step("Embed: 扫到的窗口地址对不上，继续等：" + cab.ToInt64().ToString("X"));
                     cab = IntPtr.Zero;
                 }
@@ -401,6 +431,15 @@ namespace TabbedExplorer
             if (EmbedApi.IsShellOwned(h)) return;
 
             // 先藏再写日志（日志是文件 IO，虽然只有零点几毫秒，但防闪这种事越早越好）
+            //
+            // ⚠ 藏之前先问一句「它现在是可见的吗」—— 这一句是**进程内**查询（读窗口样式，不发消息），
+            //   省下的那一下 `ShowWindow` 却是**跨进程**的。
+            //   为什么省得出手：同一次「窗口显示」Hub 那份 watcher（专用线程）已经先一步藏掉了同一个窗口，
+            //   而这份 watcher 装在 UI 线程上、排到时常常已经晚了一秒多 —— 那时候窗口早不可见了，
+            //   再发一次跨进程 `ShowWindow` + 写一行日志纯属白干。实测一整轮还原能刷出几十行重复的
+            //   「新窗口刚显示就藏掉」，全压在 UI 线程上，反过来把 `poll` 和 `pumpTimer` 挤掉。
+            //   （并行时这份 watcher 干脆不挂，见 Start 里的注释；串行时它才需要在场。）
+            if (!EmbedApi.IsWindowVisible(h)) return;
             EmbedApi.ShowWindow(h, SW_HIDE);
             Diag.Step(string.Format("Embed: 新窗口刚显示就藏掉 cab=0x{0:X} pid={1}（事件后 {2}ms）",
                 h.ToInt64(), pid, Environment.TickCount - tick));

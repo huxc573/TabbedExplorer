@@ -256,11 +256,12 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow())));
             // 重启本程序：改完设置想让它从头走一遍（比如验「懒加载」到底有没有生效）时点它。
             // 它是**动作**不是开关；记忆由退出那条路落盘，重启后原样还原。
-            // ⚠ 不套 `WinOnly` —— 那是「托盘菜单里不排」的意思。这一项恰恰要在托盘右键里能点到
-            //   （用户报「托盘右键菜单重启程序你好像没做」，就是当初顺手套了 WinOnly 把它排出去了）。
+            // ⚠ `WinOnly` 在这里是**故意**的：托盘右键里那一份在**主菜单**上、就排在「退出」上面
+            //   （见 `DesktopHub.SetupTray`）。不套它就是同一件事在「设置」子菜单里再排一遍。
+            //   设置窗口不受影响（`SettingsForm` 渲染全部节点），「改完设置顺手重启」照样够得着。
             // ⚠ notice 给 null：重启就是当场退出，那句提示根本来不及显示（RebuildAfter 会推后一轮重建，
             //    而退出消息已经在队里了）。
-            n.Add(Act("重启本程序", delegate { hub.RestartApp(); }, null));
+            n.Add(WinOnly(Act("重启本程序", delegate { hub.RestartApp(); }, null)));
             n.Add(Info("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）"));
             // 用户问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
             // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：

@@ -98,34 +98,50 @@ namespace TabbedExplorer
         /// <summary>「收进托盘」那条提示只弹一次（原来靠 Hub 的 once 参数，现在提示归我们自己管）。</summary>
         private bool trayTipShown;
 
-        // ---- 起 explorer 的串行队列（见 PumpLaunch）----
+        // ---- 起 explorer 的队列（见 PumpLaunch）----
         private sealed class Launch
         {
             public ExplorerHost Host;
             public string Path;
             /// <summary>这一趟起的是**备用窗口**（预热），不是某个标签 —— 见 WarmUp。</summary>
             public bool Warm;
+            /// <summary>这一趟是什么时候发出去的 —— 并发窗口靠它按时间放行，见 <see cref="SpawnSlotMs"/>。</summary>
+            public DateTime SpawnedAt = DateTime.MinValue;
         }
         private readonly Queue<Launch> launchQueue = new Queue<Launch>();
-        /// <summary>
-        /// 现在正在起（还没 Ready / Failed）的那批 —— 同时最多 <see cref="MaxConcurrentLaunch"/> 个。
-        ///
-        /// 从前这里是「一个 `ExplorerHost launching`、一次只放一个」。改成一批的理由：串行时
-        /// 一个标签要 1.2 秒（起进程 0.5s + 等地址栏/文件列表 0.5s+），7 个标签就是 8.4 秒，实测过。
-        /// 并发之后那一秒几乎全被叠掉了。
-        ///
-        /// ⚠ 并发的**代价**在归属判定上：一个一个来的时候「新出现的窗口就是我的」不证自明；
-        /// 一次冒出好几个就必须让每个标签**自己证明**哪个窗口是它的 —— 见
-        /// `EmbedApi.FindNewCab` 的 wantedPath 与 `ExplorerHost.OnPoll`。
-        /// 所以关了 `Settings.ParallelLaunch` 就是退回那套最简（也最慢）的老路。
-        /// </summary>
-        private readonly HashSet<ExplorerHost> launchingSet = new HashSet<ExplorerHost>();
 
         /// <summary>
-        /// 一批最多同时起几个 explorer。不设上限的话「还原 20 个标签」会一口气冒出 20 个
+        /// 「起进程」这一格被谁占着（值 = 它什么时候开工的）。同时最多 <see cref="MaxConcurrentLaunch"/> 格。
+        ///
+        /// 从前这里是「一个标签一个格，认到窗口才算用完」。改成**按时间**放行（见 <see cref="SpawnSlotMs"/>），
+        /// 因为占着格等「认到窗口」会让实际并发度衰减成 1 —— 那正是用户看到的
+        /// 「等一批加载完，再处理另一批」。
+        /// </summary>
+        private readonly Dictionary<ExplorerHost, DateTime> launching = new Dictionary<ExplorerHost, DateTime>();
+
+        /// <summary>
+        /// 一批最多同时**起进程**几个。不设上限的话「还原 20 个标签」会一口气冒出 20 个
         /// explorer.exe（每个几十 MB），而且它们全在同一秒里抢着建窗口，判定压力也白涨。
         /// </summary>
         private const int MaxConcurrentLaunch = 4;
+
+        /// <summary>
+        /// 一格并发窗口最多占多久 —— 到点就放行下一个，**不等**「认到窗口」。
+        ///
+        /// 为什么必须按时间放行：认到窗口要等地址栏可读，而地址栏要等 explorer 把视图建完 ——
+        /// 本机实测从起进程到认领 0.5~1.3 秒。原来占着格等认领 ⇒ 头一批 4 个之后，
+        /// 后面每个都得等前一个加载完才开工，实际并发度衰减成 1（用户报的
+        /// 「它是等一批加载完，再处理另一批，不应该是动态窗口的并发吗」就是它）。
+        ///
+        /// 这一格管的是**起进程**（真正的资源开销在这儿），跟「谁认到哪个窗口」无关：
+        /// 窗口认领是各标签自己按地址栏内容认的（见 `EmbedApi.FindNewCab`），同时多漂几个不会认错。
+        /// 900ms 略短于「窗口最晚 1.3 秒出现」，所以在飞的 explorer 是个位数 ——
+        /// 跟 `probe/launch_concurrency_bench.py` 量出来的「4 并发最快」那张表对得上。
+        /// </summary>
+        private const int SpawnSlotMs = 900;
+
+        /// <summary>起进程的格到点放行：队列里还有人时每 200ms 推一把（见 <see cref="SpawnSlotMs"/>）。</summary>
+        private readonly Timer pumpTimer = new Timer();
 
         /// <summary>
         /// 预热好的备用窗口（已经嵌好、藏在容器里不显示）。
@@ -371,6 +387,15 @@ namespace TabbedExplorer
                 },
                 ScrollStrip = delegate(int delta) { Defer(delegate { TabBar.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); }); }
             });
+
+            // 起进程的并发窗口按**时间**放行，所以得有个人定期推一把队列
+            //（放行本身不产生事件，光靠 LaunchDone 推不动它，见 SpawnSlotMs）。
+            pumpTimer.Interval = 200;
+            pumpTimer.Tick += delegate
+            {
+                if (launchQueue.Count == 0) pumpTimer.Stop();
+                else PumpLaunch();
+            };
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
             trimTimer.Interval = 3000;
@@ -1185,16 +1210,23 @@ namespace TabbedExplorer
                     return false;
                 }
 
-                // ---- 不懒加载：建标签的顺序 = 该激活的打头，其余照记忆里的顺序 ----
-                // 用户：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
-                // 串行队列（PumpLaunch）是**按入队顺序**起 explorer 的 —— 先建谁谁先出来。
-                // 所以这里先建「该激活的那个」，等其余都建完再把它挪回原来的位置（见 MoveTabSynced）。
+                // ---- 不懒加载（默认）：**先把标签全部摆出来，再在后台并发把内容灌进去** ----
+                //
+                // 用户：「不能把并发做成伪懒加载吗？就是先显示标签名，后台实际在并发加载，
+                // 这样界面没什么变化，等到用户点过去，也不卡。」
+                // 所以顺序反过来：先一口气建好 N 个标签（标题直接取记忆里那个文件夹的名字、
+                // 第二行摆路径），explorer 全交给后面的并发队列慢慢填。
+                //   · 标签条从第一帧起就是完整的（不再一格格往外蹦「打开中…」再改名）；
+                //   · 用户随便点哪个都行 —— 内容早就在后台加载，不是点一下才开始；
+                //   · 「当时选中那个」仍然第一个起（串行那会儿是为了抢时间，现在留着是因为
+                //     它是用户最可能马上要看的那个）。
                 List<string> order = new List<string>();
                 if (activeAt >= 0) order.Add(want[activeAt]);
                 for (int i = 0; i < want.Count; i++)
                     if (i != activeAt) order.Add(want[i]);
 
-                for (int i = 0; i < order.Count; i++) NewTab(order[i]);
+                for (int i = 0; i < order.Count; i++)
+                    NewTab(order[i], PathRules.Friendly(PathRules.Store(order[i])), false);
 
                 // active 现在是第 0 个（它最先建），挪回它该在的位置
                 if (activeAt > 0 && hosts.Count > 0)
@@ -1468,21 +1500,64 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        private void NewTab(string path)
+        /// <summary>用户按 + / Ctrl+T、或从书签/历史开一个 —— 起个新标签并立刻切过去。</summary>
+        private void NewTab(string path) { NewTab(path, null, true); }
+
+        /// <summary>
+        /// 开一个新标签（内容由 `launchQueue` 在后台填）。
+        ///
+        /// <paramref name="initialTitle"/> = 标签条上**第一帧**就显示的名字。还原记忆标签时传
+        /// 「这个文件夹的名字」（见 `RestoreRememberedTabs`）—— 用户要的「先显示标签名，后台实际在
+        /// 并发加载，这样界面没什么变化」：先把名字摆好，内容后填，标签条从头到尾不再变样。
+        /// null = 「打开中…」（用户当场开新标签，他看见的就是这一步在转）。
+        ///
+        /// <paramref name="activate"/> = false 时不切过去（还原时一次摆 N 个，只在最后切一次）。
+        /// </summary>
+        private ExplorerHost NewTab(string path, string initialTitle, bool activate)
         {
             // 有预热好的备用窗口就直接用（几乎瞬时），没有才现起一个
-            if (UseReserve(path)) return;
+            if (UseReserve(path)) return null;
 
             ExplorerHost h = AddHost();
             int i = hosts.IndexOf(h);
+            if (!string.IsNullOrEmpty(initialTitle)) tabStrip.SetTitle(i, initialTitle);
             // 第二行先摆上要去的路径 —— explorer 要 3 秒才起得来，这 3 秒里也别让第二行空着
             tabStrip.SetPath(i, TabStrip.PathLine(PathRules.Store(path)));
             h.PresetTarget(path);     // 排队期间也得知道要去哪儿（否则中途保存记忆会把它丢掉）
             Diag.Step("EmbedForm: 排入队列 " + path);
             launchQueue.Enqueue(new Launch { Host = h, Path = path });
             PumpLaunch();
-            Activate(i);
+            if (activate) Activate(i);
             MarkDirty();
+            return h;
+        }
+
+        /// <summary>
+        /// 把某个还没轮到的标签**提到队头**。
+        ///
+        /// 用在「用户点到了一个还在排队的标签」：他点它 = 现在就要它（伪懒加载下这是常态，
+        /// 标签名字先摆着、内容还在后台排队）。不提的话它得等前面几个全起完 —— 点了跟没点一样。
+        /// 队列里的地位换了，但归属判定不受影响（每个标签认的是自己那条路径的窗口）。
+        /// </summary>
+        private void PromoteLaunch(ExplorerHost h)
+        {
+            if (h == null || launchQueue.Count == 0) return;
+            if (launchQueue.Peek().Host == h) return;
+            bool present = false;
+            foreach (Launch r in launchQueue) { if (r.Host == h) { present = true; break; } }
+            if (!present) return;      // 不在队里 = 已经开工了（或已经被关掉），没什么可提的
+
+            Queue<Launch> rest = new Queue<Launch>();
+            Launch hit = null;
+            while (launchQueue.Count > 0)
+            {
+                Launch j = launchQueue.Dequeue();
+                if (hit == null && j.Host == h) { hit = j; continue; }
+                rest.Enqueue(j);
+            }
+            launchQueue.Enqueue(hit);
+            while (rest.Count > 0) launchQueue.Enqueue(rest.Dequeue());
+            Diag.Step("EmbedForm: 用户点到了还在排队的标签，把它提到队头");
         }
 
         /// <summary>
@@ -1502,7 +1577,10 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 把懒加载的占位标签真起起来（用户切到它了）。
-        /// 照样进**同一条串行队列** —— 已经在起别的标签时就排在后面，不会两个 explorer 互相认错。
+        /// 照样进**同一条队列** —— 已经在起别的标签时就排在后面，不会两个 explorer 互相认错。
+        /// ⚠ 标题**不改成「打开中…」**：名字早在摆占位的时候就写好了（`AddDeferredTab`），
+        ///   加载完 `OnHostReady` 写回来的还是同一个名字。这中间一改反而让标签条闪一下 ——
+        ///   用户要的就是「界面没什么变化」。
         /// </summary>
         private void StartDeferred(int idx)
         {
@@ -1511,61 +1589,108 @@ namespace TabbedExplorer
             if (h == null || !h.Deferred) return;
             h.Deferred = false;
             Diag.Step("EmbedForm: 懒加载标签开始加载「" + h.TargetPath + "」");
-            tabStrip.SetTitle(idx, "打开中…");
             launchQueue.Enqueue(new Launch { Host = h, Path = h.TargetPath });
             PumpLaunch();
         }
 
         /// <summary>
-        /// 起 explorer —— **一次只起一个**，排成队依次来。
+        /// 把队列里的 explorer 放出去 —— 一次最多 <see cref="MaxConcurrentLaunch"/> 个在飞。
         ///
-        /// 这是「有时候标签页点开是空的」的**根治**（）：
-        /// 原来还原 6 个标签就是**一口气起 6 个 explorer**，6 个窗口几乎同时冒出来，
-        /// 而每个标签都只能靠「扫一个刚出现的新窗口」来认自己那个 —— 于是互相认错，
-        /// 或者谁都认不到、空等 25 秒超时（日志里就是这么演的）。
-        /// 串起来之后，任何时刻只有一个标签在找窗口，**一一对应**是确定的，不用再猜。
+        /// 历史上这里是「一次只起一个，排成队依次来」，为的是修「有时候标签页点开是空的」：
+        /// 一口气起 6 个 explorer、6 个窗口同时冒出来，而每个标签只能靠「扫一个刚出现的新窗口」
+        /// 认自己那个 ⇒ 互相认错、或者谁都认不到空等 25 秒超时。
+        /// 现在并发能开，是因为归属判据换成了硬的：**地址栏内容必须等于我要开的路径**
+        ///（见 `EmbedApi.FindNewCab` / `ExplorerHost.OnPoll`），一次冒几个都不会认错。
+        /// 关掉 `Settings.ParallelLaunch` 就退回那套最简（也最慢）的串行。
         ///
-        /// 代价是「还原 6 个标签」要 6 次 × 大约一两秒。可以接受：标签是**立刻**就出来的
-        /// （显示「打开中…」+ 目标路径），内容各填各的 —— 浏览器也是这个样子。
+        /// 队满之后**什么时候腾位置**是这套并发快不快的分水岭：见 <see cref="SpawnSlotMs"/>
+        /// （按时间放行，不按「认到窗口」）。
         ///
         /// 队列空了就去**预热一个备用窗口**（见 WarmUp）：下次「新建标签页」不用再等进程起来。
-        ///
-        /// `Settings.ParallelLaunch` 开着时一次放 `MaxConcurrentLaunch` 个（互相认错的问题由
-        /// 「地址栏内容必须对上」那条判据兜住，见 `EmbedApi.FindNewCab`）。
         /// </summary>
         private void PumpLaunch()
         {
             if (IsDisposed || Disposing) return;
+            ReleaseSpawnSlots();
+
             int cap = Settings.ParallelLaunch ? MaxConcurrentLaunch : 1;
-            while (launchQueue.Count > 0 && launchingSet.Count < cap)
+            while (launchQueue.Count > 0 && launching.Count < cap)
             {
                 Launch j = launchQueue.Dequeue();
                 if (j.Host == null) continue;
                 // 备用窗口不在 hosts 里，别把它当「排队期间被关掉了」扔掉
                 if (!j.Warm && !hosts.Contains(j.Host)) continue;
-                if (!launchingSet.Add(j.Host)) continue;
-                Diag.Step("EmbedForm: 起 explorer" + (Settings.ParallelLaunch ? "（并发 " + launchingSet.Count + "/" + cap + "）" : "（串行）") + j.Path);
+                if (launching.ContainsKey(j.Host)) continue;
+                j.SpawnedAt = DateTime.Now;
+                launching[j.Host] = j.SpawnedAt;
+                Diag.Step("EmbedForm: 起 explorer" + (Settings.ParallelLaunch ? "（并发 " + launching.Count + "/" + cap + "）" : "（串行）") + j.Path);
                 j.Host.Start(j.Path);
             }
             // 只要有标签还在「起」这条道上，就把那笔昂贵的 shell 登记挂起来（见 ShellBrowserReg.KeepQuiet）。
             // 还原 8 个标签时它累计要 5 秒多、还全压在一个 UI 线程上 —— 那就是「非激活标签还在加载时
             // 整个程序几乎不可用」。挂起来之后由 500ms 心跳在这一批结束的 2 秒内补上。
-            if (launchQueue.Count > 0 || launchingSet.Count > 0) ShellBrowserReg.KeepQuiet(1500);
+            if (launchQueue.Count > 0 || launching.Count > 0) ShellBrowserReg.KeepQuiet(1500);
             // 队列空、手里也没有在起的 → 预热下一个「新建标签页」的窗口
-            if (launchQueue.Count == 0 && launchingSet.Count == 0) WarmUp();
+            if (launchQueue.Count == 0 && launching.Count == 0) WarmUp();
+            // 队列还没走完 ⇒ 让 pumpTimer 每 200ms 回来放行到点的那些格
+            if (launchQueue.Count > 0) pumpTimer.Start();
+            else pumpTimer.Stop();
         }
 
-        /// <summary>一个标签起完了（成了 / 失败了）—— 给队列里的下一个腾位置。</summary>
+        /// <summary>
+        /// 把占了 `SpawnSlotMs` 的那些格放掉（窗口早该出来了，格不该继续被占着）。
+        /// 见 <see cref="SpawnSlotMs"/> —— 这一步就是「动态窗口的并发」和「等一批加载完再下一批」的分界。
+        /// </summary>
+        private void ReleaseSpawnSlots()
+        {
+            if (launching.Count == 0) return;
+            // 串行模式（用户关掉了并发）就老老实实等「认到窗口」再放行 —— 那正是那个开关的含义
+            //（「一次只起一个」），不能靠时间偷偷并起来。
+            if (!Settings.ParallelLaunch) return;
+            DateTime now = DateTime.Now;
+            List<ExplorerHost> done = null;
+            foreach (KeyValuePair<ExplorerHost, DateTime> kv in launching)
+            {
+                if ((now - kv.Value).TotalMilliseconds < SpawnSlotMs) continue;
+                if (done == null) done = new List<ExplorerHost>();
+                done.Add(kv.Key);
+            }
+            if (done == null) return;
+            for (int i = 0; i < done.Count; i++)
+            {
+                launching.Remove(done[i]);
+                Diag.Step("EmbedForm: 起进程的格到点放行（这一格占了 " + SpawnSlotMs + "ms）");
+            }
+        }
+
+        /// <summary>一个标签起完了（成了 / 失败了 / 认到窗口了）—— 现在就给它腾位置。</summary>
         private void LaunchDone(ExplorerHost h)
         {
-            if (!launchingSet.Remove(h)) return;
+            if (!launching.Remove(h)) return;
             PumpLaunch();
         }
 
-        /// <summary>现在手里还有正在起的 explorer（Hub 收编窗口前要看这个，见 DrainCapture）。</summary>
+        /// <summary>
+        /// 还有标签正等着 explorer 起来吗（Hub 收编窗口前要看这个，见 `DrainCapture`）。
+        ///
+        /// 判据是「**有没有标签还没落定**」而不是「起进程的格有没有占满」：窗口认下来（更别说嵌好）
+        /// 之前它都还漂在桌面上、没被登记成我们的，这时候去收编别人的窗口就可能把我们自己刚起的
+        /// 那个当成「用户新开的」再收一个重复标签回来。落定 = 嵌好或失败（见 `ExplorerHost.Settled`）。
+        /// </summary>
         internal bool LaunchInFlight
         {
-            get { return launchingSet.Count > 0 || launchQueue.Count > 0; }
+            get
+            {
+                if (launchQueue.Count > 0) return true;
+                for (int i = 0; i < hosts.Count; i++)
+                {
+                    ExplorerHost h = hosts[i];
+                    if (h == null || h.Deferred || h.Settled) continue;
+                    return true;
+                }
+                // 备用窗口不在 hosts 里，它那张也得算 —— 不然预热那一秒里它会被 Hub 收成一张真标签
+                return reserve != null && !reserve.Settled;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -1584,15 +1709,13 @@ namespace TabbedExplorer
         {
             if (IsDisposed || Disposing || Quitting) return false;
             if (reserve != null || reserveReady) return false;
-            if (launchingSet.Count != 0 || launchQueue.Count != 0) return false;
-            // 已经认下来、还在收编路上的那些也算「忙」：收编是整条流水线最贵的一步，
+            // 还有标签没落定（在起 / 在等窗口 / 在收编）就一律不预热。
+            // 判据跟 Hub 那道闸同源（见 `LaunchInFlight`）—— 收编是整条流水线最贵的一步，
             // 这时候再塞一个备用窗口进去，就是在一堆刚起来的 explorer 上又加一个，
             // 只会把最后几个标签拖慢。
-            for (int i = 0; i < hosts.Count; i++)
-            {
-                if (hosts[i].Attaching) return false;
-            }
-            return true;
+            // ⚠ 从前这里判的是「起进程的格有没有占满」，那已经不够了：格是按时间放的
+            //   （见 SpawnSlotMs），放掉之后窗口可能还在外面漂着。
+            return !LaunchInFlight;
         }
 
         private void WarmUp()
@@ -1614,7 +1737,7 @@ namespace TabbedExplorer
             reserve = null;
             reserveReady = false;
             if (h == null) return;
-            launchingSet.Remove(h);
+            launching.Remove(h);
             try
             {
                 content.Controls.Remove(h.Host);
@@ -1846,6 +1969,8 @@ namespace TabbedExplorer
             // 得排在下面那句 `Host.Visible` 之前 —— 先把队列上的活派出去，界面这一帧先显示空面板，
             // 内容出来时 `OnHostReady` 会把标题 / 图标 / 路径再刷一遍。
             if (hosts[idx].Deferred) StartDeferred(idx);
+            // 伪懒加载下「标签已经在、内容还在后台排队」是常态，用户点它 = 现在就要它，提到队头。
+            else PromoteLaunch(hosts[idx]);
             for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);
             tabStrip.SetActive(idx);
             if (vPane != null && verticalOn) vPane.ScrollActiveIntoView();   // 竖排那份也要把选中的那行拉进视线
@@ -1917,8 +2042,8 @@ namespace TabbedExplorer
             }
             catch (Exception ex) { Diag.Log("EmbedForm: 关标签失败 " + ex.Message); }
 
-            // 关掉的正好是「正在起」的那几个之一：给队列里的下一个腾位置，不然后面排着的全卡住
-            if (launchingSet.Remove(h))
+            // 关掉的正好占着「起进程」那一格：放掉它、给队列里的下一个腾位置，不然后面排着的全卡住
+            if (launching.Remove(h))
             {
                 Diag.Step("EmbedForm: 正在起的那个被关了，队列继续");
                 PumpLaunch();

@@ -440,6 +440,166 @@ namespace TabbedExplorer
         private static readonly object scanLock = new object();
         private const int ScanFreshMs = 40;
 
+        // ------------------------------------------------------------------
+        // 每个「正在等着被认领的窗口」的账 —— 地址栏**不在 UI 线程上读**。
+        //
+        // 这里有两条实测硬事实：
+        //   1. 扫描本身很便宜（一遍 `EnumWindows` + 逐窗类名，723 个顶层窗 4.5ms）；
+        //   2. 读地址栏很贵 —— 跨进程 `SendMessage(WM_GETTEXT)`，对方正在建视图那阵子
+        //      **一次 100~400ms**（本机量到过一轮扫描 822ms 里 799ms 全在两次读上面）。
+        //
+        // 而等待窗口的轮询是 25ms 一跳、一屏可能有七八个候选窗口、全跑在同一个 UI 线程上 ⇒
+        // 不节流就是每 25ms 拿几十上百毫秒去读它，界面被按在 `SendMessage` 里等对方 ——
+        // 用户报的「非激活标签还在加载时程序几乎不可用」就是这个。
+        //
+        // 所以：**读的动作交给后台线程**（`ProbeWorkerLoop`，默认 `ProbeWorkers` 条），UI 线程只负责
+        // 「决定该不该读」和「读回来没有」，一秒都不等它。同时：
+        //   · 新窗口先晾 `AddressSettleMs` 再去读（它这会儿正在建视图，读了也是白读）；
+        //   · 读到就记住（`Path`），**重读间隔按读到的次数翻倍**（刚看到时值可能是旧值，
+        //     勤快点；稳了就别去烦它）；
+        //   · 读空就退避着再试（退避上限很小 —— 读空是它没准备好，不是我们付不起）。
+        //
+        // 归属判据一点没松：还是「地址栏内容 == 我要开的路径」（见 `FindNewCab`），
+        // 只是把「谁来读」从 UI 线程换成了后台线程。
+        // 窗口被认领/嵌进去之后就离开候选名单，账本跟着清掉（见 ScanCabs 尾部）。
+        // ------------------------------------------------------------------
+        private sealed class CabProbe
+        {
+            public DateTime NextProbe;      // 早于这个时刻就别去读它的地址栏
+            public string Path;             // 读到过的路径
+            public int Oks;                 // 读到过几次（重读间隔按它翻倍）
+            public int Fails;               // 读空过几次（退避用）
+            public bool Busy;               // 后台线程正拿着它去读，别重复派活
+        }
+        private static readonly Dictionary<IntPtr, CabProbe> probes = new Dictionary<IntPtr, CabProbe>();
+
+        /// <summary>新出现的窗口先晾这么久再去读地址栏（它这会儿正在建视图，读了也是白读）。</summary>
+        private const int AddressSettleMs = 300;
+        /// <summary>读到过 1/2/3 次之后，隔多久才允许再读一次（防止读到「还没导航过去时的旧值」）。</summary>
+        private static readonly int[] AddressRecheckMs = new int[] { 0, 1000, 2000, 4000 };
+        /// <summary>读到第 3 次以后就不再勤读了，按这个间隔兜底。</summary>
+        private const int AddressSteadyMs = 8000;
+        /// <summary>
+        /// 读空（地址栏还没值）之后第一次隔多久再试，以及退避的上限。
+        /// ⚠ 上限**不能**开太大：地址栏大约在窗口出现 1 秒后才可读，退避到 3 秒就等于把「发现」
+        ///   往后推 3 秒（实测过：一轮还原从 9 秒涨到 10 秒）。读空是它没准备好，不是我们付不起。
+        /// </summary>
+        private const int AddressRetryMs = 150;
+        private const int AddressRetryMaxMs = 600;
+
+        private static readonly object probeLock = new object();
+        private static readonly Queue<IntPtr> probeQueue = new Queue<IntPtr>();
+        /// <summary>
+        /// 派活信号 —— 用**计数信号量**而不是 `AutoResetEvent`：后者一次 `Set` 只唤醒一条线程，
+        /// 于是两条读线程里有一条会一直睡到下次入队，白占着不算数。这里「入队几次就 Release 几次」，
+        /// 几条线程谁先醒谁取一个，正好按需分配。
+        /// </summary>
+        private static readonly System.Threading.Semaphore probeSem =
+            new System.Threading.Semaphore(0, 1000);
+        /// <summary>
+        /// 后台读地址栏的线程条数。
+        ///
+        /// ⚠ 为什么不是 1 条（2026-09-25 实测）：一个候选一次读要么 4~8ms（对方闲）、要么几百 ms
+        ///   （对方在建视图）。还原时 4 个 explorer 同时在建视图 ⇒ 4 个候选**串行**读就要 1.2~1.3 秒，
+        ///   而「第一次发现窗口」直接决定整轮还原什么时候开始收编。实测单线程时首次发现要等到
+        ///   起进程后 2.6 秒，总时长卡在 9.6 秒。
+        ///   加线程的收益来自「读的是**不同 explorer 进程**」—— 每个标签一个 explorer，读 A 不会挡住读 B，
+        ///   所以并行读是纯赚（同进程的多个候选自然还是被那个进程的 UI 线程串行处理，没坏处）。
+        ///   定 2 条：够把首次发现拉近一半，又不会把正在建视图的 explorer 一起压得更慢。
+        /// </summary>
+        private const int ProbeWorkers = 2;
+        private static int probeWorkersStarted;
+
+        private static void EnsureProbeWorker()
+        {
+            // ⚠ 这个函数是在 `probeLock` **里面**被调的，所以里面绝对不能再取 `probeLock`（会死锁）。
+            //   `Interlocked` 天然无锁，够用。
+            if (System.Threading.Interlocked.Increment(ref probeWorkersStarted) > ProbeWorkers) return;
+            System.Threading.Thread t = new System.Threading.Thread(ProbeWorkerLoop);
+            t.IsBackground = true;        // 主程序退出时别拦着
+            t.Name = "TBE-地址栏读取";
+            t.Start();
+        }
+
+        /// <summary>
+        /// 后台读地址栏的线程。**取一个、读一个**：取不到就回去等信号。
+        /// 读完把结果记回账本上，UI 线程下一轮扫描就能用上。
+        /// </summary>
+        private static void ProbeWorkerLoop()
+        {
+            while (true)
+            {
+                probeSem.WaitOne();
+                IntPtr h;
+                lock (probeLock)
+                {
+                    // 可能被另一条线程先取走了（我们两条线程抢同一个队列）—— 那这轮就没活干了
+                    if (probeQueue.Count == 0) continue;
+                    h = probeQueue.Dequeue();
+                }
+                string got = null;
+                try { got = AddressPathOf(h); }
+                catch { }
+                lock (probeLock)
+                {
+                    CabProbe p;
+                    if (probes.TryGetValue(h, out p))
+                    {
+                        if (got != null)
+                        {
+                            p.Path = got;
+                            p.Oks++;
+                            p.NextProbe = DateTime.Now.AddMilliseconds(
+                                (p.Oks < AddressRecheckMs.Length) ? AddressRecheckMs[p.Oks] : AddressSteadyMs);
+                        }
+                        else
+                        {
+                            p.Fails++;
+                            int wait = AddressRetryMs << Math.Min(p.Fails - 1, 3);   // 150 → 300 → 600
+                            p.NextProbe = DateTime.Now.AddMilliseconds(Math.Min(wait, AddressRetryMaxMs));
+                        }
+                        p.Busy = false;
+                    }
+                }
+            }
+        }
+
+        /// <summary>一轮扫描里的统计（只用来打日志）。</summary>
+        private sealed class ScanStat { public int Disp; public int Busy; }
+
+        /// <summary>
+        /// 决定「这一轮要不要去读这个窗口的地址栏」，要读就**派给后台线程**，立刻返回手上有的值（可能为 null）。
+        /// 一律不阻塞调用方 —— 调用方是 UI 线程上的轮询。
+        /// </summary>
+        private static string ProbePath(IntPtr h, ScanStat st)
+        {
+            lock (probeLock)
+            {
+                CabProbe p;
+                if (!probes.TryGetValue(h, out p))
+                {
+                    p = new CabProbe();
+                    p.NextProbe = DateTime.Now.AddMilliseconds(AddressSettleMs);
+                    probes[h] = p;
+                }
+                st.Busy += p.Busy ? 1 : 0;
+                if (p.Busy || DateTime.Now < p.NextProbe) return p.Path;
+                // 视图还没建出来的窗口一定读不到（实测文件列表比地址栏早约 0.2 秒；地址栏文本要等视图
+                // 建好才有值）—— 这一下不派活也不发消息，白省一轮。
+                if (WinFind.ByClass(h, "SHELLDLL_DefView") == IntPtr.Zero) return p.Path;
+
+                // 派活。`NextProbe` 先按「读空」的退避推到最近的一档：万一这条读回来是空，
+                // 也不会隔一轮就又派一次；读到值了后台线程会把它改成按倍数拉的间隔。
+                p.Busy = true;
+                p.NextProbe = DateTime.Now.AddMilliseconds(AddressRetryMs);
+                probeQueue.Enqueue(h);
+                st.Disp++;
+                EnsureProbeWorker();
+                probeSem.Release();      // 计数信号量：入队几次就放几个，两条线程谁先醒谁取
+                return p.Path;
+            }
+        }
+
         /// <summary>
         /// 扫一遍顶层窗口，把「新出现、不是 shell 自己的、还没被谁认领」的文件夹窗口连同
         /// 各自地址栏里的路径一起交出来。结果缓存 `ScanFreshMs`，让同时等窗口的几个标签
@@ -460,6 +620,9 @@ namespace TabbedExplorer
                     return scanCache;
             }
 
+            DateTime t0 = DateTime.Now;
+            ScanStat st = new ScanStat();
+            HashSet<IntPtr> stillThere = new HashSet<IntPtr>();
             List<CabSighting> list = new List<CabSighting>();
             EnumWindowsProc cb = null;
             cb = delegate(IntPtr h, IntPtr l)
@@ -474,13 +637,36 @@ namespace TabbedExplorer
                 if (IsShellOwned(h)) return true;
                 int p = ProcessIdOf(h).ToInt32();
                 if (p == 0) return true;
-                list.Add(new CabSighting { H = h, Pid = p, Path = AddressPathOf(h) });
+
+                stillThere.Add(h);
+                list.Add(new CabSighting { H = h, Pid = p, Path = ProbePath(h, st) });
                 return true;
             };
             EnumWindows(cb, IntPtr.Zero);
             GC.KeepAlive(cb);
 
+            // 这轮没见到的账清掉（窗口关了、或者已经被认领/嵌进去了）—— 账本别无限长
+            lock (probeLock)
+            {
+                if (probes.Count > stillThere.Count)
+                {
+                    List<IntPtr> gone = null;
+                    foreach (IntPtr k in probes.Keys)
+                    {
+                        if (stillThere.Contains(k)) continue;
+                        if (gone == null) gone = new List<IntPtr>();
+                        gone.Add(k);
+                    }
+                    if (gone != null)
+                        for (int i = 0; i < gone.Count; i++) probes.Remove(gone[i]);
+                }
+            }
+
             lock (scanLock) { scanCache = list; scanAt = DateTime.Now; }
+            // 这一笔直接花在 UI 线程上，超过 20ms 就是界面在等它（debug 打开时才写）
+            int cost = (int)(DateTime.Now - t0).TotalMilliseconds;
+            if (cost >= 20) Diag.Step("EmbedApi: 扫一遍顶层窗 " + cost + "ms（候选 " + list.Count
+                + " 扇，派出读地址栏 " + st.Disp + " 次，在途 " + st.Busy + "）");
             return list;
         }
 
@@ -489,11 +675,15 @@ namespace TabbedExplorer
         ///
         /// `pidsBefore` 参数留着不用了 —— 按进程判会串台（见 `IsBaseline` 那段）。
         /// `relax` 的含义是「不做地址校验」；`wantedPath` 为 null 时也不校验（串行时只有一个候选）。
+        ///
+        /// <paramref name="matchedByPath"/> = 这一扇是**按地址栏内容**命中的（也就是说已经有一份
+        /// 「它就是我要的那个」的硬证据了）。调用方靠它决定还要不要再复核一遍 — 见 `ExplorerHost.OnPoll`。
         /// </summary>
         public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
-            bool relax, string wantedPath, out int pidOfFound)
+            bool relax, string wantedPath, out int pidOfFound, out bool matchedByPath)
         {
             pidOfFound = 0;
+            matchedByPath = false;
             string wanted = (wantedPath != null && !relax) ? PathRules.Store(wantedPath) : null;
             List<CabSighting> list = ScanCabs();
             for (int i = 0; i < list.Count; i++)
@@ -510,6 +700,7 @@ namespace TabbedExplorer
                 {
                     if (string.IsNullOrEmpty(c.Path)) continue;
                     if (!PathRules.Same(c.Path, wanted)) continue;
+                    matchedByPath = true;
                 }
                 pidOfFound = c.Pid;
                 return c.H;
@@ -618,7 +809,7 @@ namespace TabbedExplorer
         {
             try
             {
-                IntPtr band = FindAddressBand(cab);
+                IntPtr band = CachedAddressBand(cab);
                 if (band == IntPtr.Zero) return null;
                 string raw = WindowTextOf(band);
                 // 「地址: <当前地址>」——前缀跟着系统语言变，所以只认第一个冒号加空格
@@ -630,6 +821,53 @@ namespace TabbedExplorer
                 return PathRules.Restorable(stored) ? stored : null;
             }
             catch { return null; }
+        }
+
+        /// <summary>cab → 它的地址栏（`ToolbarWindow32`）；`Band == Zero` = 找过了，这个窗口当时还没有。见 <see cref="CachedAddressBand"/>。</summary>
+        private sealed class BandRef { public IntPtr Band; public DateTime At; }
+        private static readonly Dictionary<IntPtr, BandRef> bandCache = new Dictionary<IntPtr, BandRef>();
+        /// <summary>「这个窗口还没有地址栏」这个结论能信多久 —— 窗口还在长的时候别每轮重找一遍。</summary>
+        private const int BandMissTtlMs = 1200;
+
+        /// <summary>
+        /// 取（并缓存）某个窗口的地址栏句柄，拿不到返回 `Zero`。
+        ///
+        /// 为什么要缓存：找它得把整棵子树 `EnumChildWindows` 走一遍 + 读几个 toolbar 的文本
+        ///（跨进程 `SendMessage`，对方忙的时候几百毫秒），而这个函数是被**25ms 一轮的扫描**反复调用的
+        ///（见 `ScanCabs`）—— 每轮重走一遍纯属白烧。句柄可能被系统回收后复用，所以用之前一律
+        /// `IsDescendant` 复核（那个函数本来就是为它写的）。
+        ///
+        /// ⚠ 加锁是必须的：现在**后台线程**也会调 `AddressPathOf`（见 `ProbePath`），而这个表是两级字典，
+        /// 一边读一边写会把它写坏。但**找句柄那一步（`FindAddressBand`）绝不能抱锁做** ——
+        /// 它有几百毫秒的跨进程读，抱着锁做就等于 UI 线程反过来被后台线程挡住
+        ///（实测：一轮扫描因此涨到 915ms，比不加后台线程还糟）。
+        /// </summary>
+        private static IntPtr CachedAddressBand(IntPtr cab)
+        {
+            DateTime now = DateTime.Now;
+            lock (probeLock)
+            {
+                BandRef r;
+                if (bandCache.TryGetValue(cab, out r))
+                {
+                    if (r.Band != IntPtr.Zero)
+                    {
+                        if (NativeMethods.IsWindow(r.Band) && IsDescendant(cab, r.Band)) return r.Band;
+                        bandCache.Remove(cab);                                  // 句柄没了 / 被复用 → 重找
+                    }
+                    else if ((now - r.At).TotalMilliseconds < BandMissTtlMs) return IntPtr.Zero;
+                    else bandCache.Remove(cab);
+                }
+            }
+
+            IntPtr band = FindAddressBand(cab);           // ← 不抱锁：这一步可能要几百毫秒
+
+            lock (probeLock)
+            {
+                if (bandCache.Count > 128) bandCache.Clear();   // 窗口换了一茬就整批丢掉，别让它无限长
+                bandCache[cab] = new BandRef { Band = band, At = DateTime.Now };
+            }
+            return band;
         }
 
         /// <summary>

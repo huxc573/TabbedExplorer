@@ -2288,6 +2288,18 @@ namespace TabbedExplorer
                 string p = target;
                 Defer(delegate { NewTab(p); });
             }));
+            // 交给系统开一扇**原生**窗口（不是我们的标签）：用户要拿它跟我们的嵌法做对照。
+            // 关键是 Hub 那边要开一个短暂的让行期 —— 否则这扇窗会在零点几秒后被我们自己的
+            // 捕获逻辑收编成标签，点一下就白点了（见 DesktopHub.OpenNative）。
+            // 所以这里不判 `Restorable`：`shell:Downloads` / `::{GUID}` 这类虚拟位置
+            // explorer.exe 自己也认得，交出去它就能开。
+            m.Add(Mi("用原生资源管理器打开", string.IsNullOrEmpty(target)
+                ? (Action)null
+                : delegate
+                {
+                    string p = target;
+                    Defer(delegate { if (hub != null) hub.OpenNative(p); });
+                }));
             m.Add(Mi("添加到书签栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
             // 跟空白右键、工具行那一项用**同一个名字**：三处说的是同一件事，
             // 名字不一致会让人以为是两个功能（用户报过）。

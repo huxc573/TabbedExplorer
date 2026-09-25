@@ -86,6 +86,19 @@ namespace TabbedExplorer
         /// 到点还读不出就当没这回事 —— 我们本来就没碰过它，它还是那个正常窗口，用户自己关。
         /// </summary>
         private const int ShellResolveMs = 1200;
+        /// <summary>
+        /// 「用原生资源管理器打开」的让行期（见 <see cref="OpenNative"/>）。
+        ///
+        /// 用户在标签右键里点这一项，要的是**一扇真正的原生窗口**；可我们默认「只要是新冒出来的
+        /// 文件夹窗口就收成标签」，不挡一下就把这个功能本身吃掉了。
+        /// 写 `int` 而不是 `DateTime`：这字段会被 watcher 线程读、UI 线程写，int 的读写天然是原子的。
+        /// </summary>
+        private int nativeOpenUntilTick;
+        /// <summary>
+        /// 让行期的长度。只用来兜底「一个窗都没等到」的情况（比如 shell 直接复用了已有的原生窗、
+        /// 根本不建新窗）—— 真等到窗口就立刻作废，所以不会一直压着后面的事件。
+        /// </summary>
+        private const int NativeOpenMs = 4000;
         private RegisteredWaitHandle sigWait;
         private RegisteredWaitHandle quitWait;
         private EventWaitHandle quitEvent;
@@ -431,7 +444,17 @@ namespace TabbedExplorer
                 // 只是读出它要去哪个目录、像用户点 × 一样关掉它，再用我们自己的 explorer 重开成标签
                 // （见 TakeOverShellWindow）。
                 bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
-                if (!shellTake && !IsHideCandidate(h))
+                bool candidate = shellTake || IsHideCandidate(h);
+                // ★ 用户刚点了「用原生资源管理器打开」：这一扇正是他要的 —— 原样放过。
+                //   放在 candidate 之后判：只有「本来会被我们动手」的窗口才吃这笔凭据，
+                //   否则让行期会被一个不相干的事件（比如一个对话框）白白耗掉。
+                if (candidate && ConsumeNativeOpen())
+                {
+                    Diag.Step(string.Format(
+                        "Hub: 让行（用原生资源管理器打开）cab=0x{0:X}（不藏、不登记、不转生）", h.ToInt64()));
+                    return;
+                }
+                if (!candidate)
                 {
                     // 「看着像用户新开的文件夹窗口、却被整个放过」原来是全黑的 —— 川报「点打开文件夹没反应」
                     // 时根本分不清是没收还是没收到。只记 shell 自己那种浏览窗口：我们自己的窗口、
@@ -613,7 +636,7 @@ namespace TabbedExplorer
             // 先当场试一次：shell 是先导航后显示，SHOW 那一刻地址栏多半已经填好了 ——
             // 能读出来就直接收，那扇窗在屏幕上只短暂露一下。
             // （CREATE 那一刻也走这条路：那时地址栏通常还没填，于是进 pendingShell、每 250ms 再看。）
-            string now = EmbedApi.AddressPathOf(h);
+            string now = EmbedApi.AddressPathOf(h, true);
             if (now != null) { TakeOverShellWindow(h, now, react); return; }
             pendingShell[h] = new ShellCandidate { SeenAt = DateTime.Now, ReactMs = react };
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
@@ -635,7 +658,9 @@ namespace TabbedExplorer
                     pendingShell.Remove(h);
                     continue;                                 // 它自己没了（被关掉）——没什么可做的
                 }
-                string path = EmbedApi.AddressPathOf(h);
+                // force：别吃「这个窗口还没有地址栏」那条 1.2 秒的负缓存 —— 我们正 250ms 一轮
+                // 盯着它看，而超时也是 1.2 秒，缓存一命中就注定读不出来（见 AddressPathOf）。
+                string path = EmbedApi.AddressPathOf(h, true);
                 if (path == null)
                 {
                     // 还没填好地址栏（少见：正常是 SHOW 之前就填好了）—— 再看看，到点就不管它了
@@ -693,6 +718,50 @@ namespace TabbedExplorer
                 f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: shell 窗口转生失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 「用原生资源管理器打开」—— 把 path 交给系统的资源管理器开一扇**独立的原生窗口**。
+        ///
+        /// 为什么需要它：我们默认「只要是新冒出来的文件夹窗口就收成标签」（`Settings.CaptureAll`），
+        /// 所以直接 `Process.Start("explorer.exe", path)` 的话，那扇窗会在零点几秒后被自己收编 ——
+        /// 用户右键点一下就为了看一眼原生的样子，结果什么都没看到。
+        /// 所以先开一个短暂的「让行期」（见 `nativeOpenUntilTick`），这段时间里新出现的候选窗口
+        /// 一律不藏、不登记、不转生，原样留在桌面上。
+        ///
+        /// 让行期是**一次性**的：真等到那一扇就立刻作废；等不到（shell 复用了已有的原生窗、
+        /// 压根没建新窗）就由 `NativeOpenMs` 兜底到期。
+        /// </summary>
+        public void OpenNative(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                nativeOpenUntilTick = Environment.TickCount + NativeOpenMs;
+                Diag.Step("Hub: 用原生资源管理器打开 " + path);
+                ProcessStartInfo si = new ProcessStartInfo("explorer.exe");
+                si.Arguments = path.IndexOf(' ') >= 0 ? "\"" + path + "\"" : path;
+                si.UseShellExecute = false;
+                Process.Start(si);
+            }
+            catch (Exception ex)
+            {
+                nativeOpenUntilTick = 0;
+                Diag.Log("Hub: 原生打开失败 " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 吃掉（一次性的）让行凭据 —— 只有真来了一个够格的候选窗口才吃（调用点在 `OnWindowShown`）。
+        /// 用减法和 `Environment.TickCount` 比较：它 24.9 天会翻一次，减法写法在翻越时仍然成立。
+        /// </summary>
+        private bool ConsumeNativeOpen()
+        {
+            int until = nativeOpenUntilTick;
+            if (until == 0) return false;
+            if (Environment.TickCount - until >= 0) { nativeOpenUntilTick = 0; return false; }
+            nativeOpenUntilTick = 0;
+            return true;
         }
 
         /// <summary>shell 窗口的转生开关。跟捕获开关一样：开关立刻生效，不用装/卸钩子。</summary>
@@ -757,7 +826,7 @@ namespace TabbedExplorer
                 //   ⚠ 必须排在 `RestoreRememberedTabs` 之后 —— 那个「原来的标签」可能刚被记忆摆回来。
                 //   ⚠ 也排在防闪那两步之前：这里只**关**、不藏；万一没关成，留在屏幕上的是一扇正常窗，
                 //     而不是一扇隐形窗（隐形窗会毒坏 shell，见 v1.13.1 那个「Win+E 没反应」的教训）。
-                string incoming = EmbedApi.AddressPathOf(h);
+                string incoming = EmbedApi.AddressPathOf(h, true);
                 if (incoming != null && f.HasTabForPath(incoming))
                 {
                     Diag.Step(string.Format(

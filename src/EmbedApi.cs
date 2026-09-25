@@ -135,6 +135,12 @@ namespace TabbedExplorer
         /// <summary>GW_OWNER —— 取属主窗口。</summary>
         public const uint GW_OWNER = 4;
 
+        /// <summary>GW_CHILD —— 第一个子窗口（配 <c>GW_HWNDNEXT</c> 走一圈就是「直接子窗口」列表）。</summary>
+        public const uint GW_CHILD = 5;
+
+        /// <summary>GW_HWNDNEXT —— 同层的下一个窗口。</summary>
+        public const uint GW_HWNDNEXT = 2;
+
         public static uint GetExStyle(IntPtr h)
         {
             long v = (IntPtr.Size == 8) ? GetWindowLongPtr64(h, GWL_EXSTYLE).ToInt64()
@@ -826,11 +832,21 @@ namespace TabbedExplorer
         /// 之所以宁可 null 也不能把原文交出去：调用方是**先关窗再开标签**（`TakeOverShellWindow`），
         /// 交一个开不了的路径进去 = 原生窗没了、标签也没出来，比不动它糟得多。
         /// </summary>
-        public static string AddressPathOf(IntPtr cab)
+        public static string AddressPathOf(IntPtr cab) { return AddressPathOf(cab, false); }
+
+        /// <summary>
+        /// 同上，但 <paramref name="force"/> = `true` 时**不信**「这个窗口还没有地址栏」那条负缓存。
+        ///
+        /// 给「正盯着一个窗口、等它长出地址栏」的调用方用（shell 转生那种 250ms 轮询）：
+        /// 负缓存的寿命是 `BandMissTtlMs`(1200ms)，而 `DrainShell` 的超时也是 1200ms ——
+        /// 第一次没读到就把整个等待期盖住了，表现就是「从开始菜单点资源管理器，原生窗先在屏幕上
+        /// 待一秒多才闪进我们的程序」（用户报的「捕获变慢好多」）。
+        /// </summary>
+        public static string AddressPathOf(IntPtr cab, bool force)
         {
             try
             {
-                IntPtr band = CachedAddressBand(cab);
+                IntPtr band = CachedAddressBand(cab, force);
                 if (band == IntPtr.Zero) return null;
                 string raw = WindowTextOf(band);
                 // 「地址: <当前地址>」——前缀跟着系统语言变，所以只认第一个冒号加空格
@@ -863,7 +879,7 @@ namespace TabbedExplorer
         /// 它有几百毫秒的跨进程读，抱着锁做就等于 UI 线程反过来被后台线程挡住
         ///（实测：一轮扫描因此涨到 915ms，比不加后台线程还糟）。
         /// </summary>
-        private static IntPtr CachedAddressBand(IntPtr cab)
+        private static IntPtr CachedAddressBand(IntPtr cab, bool force)
         {
             DateTime now = DateTime.Now;
             lock (probeLock)
@@ -876,7 +892,9 @@ namespace TabbedExplorer
                         if (NativeMethods.IsWindow(r.Band) && IsDescendant(cab, r.Band)) return r.Band;
                         bandCache.Remove(cab);                                  // 句柄没了 / 被复用 → 重找
                     }
-                    else if ((now - r.At).TotalMilliseconds < BandMissTtlMs) return IntPtr.Zero;
+                    // 负缓存只服务「一轮扫一大片窗口」那种调用方；`force` 的调用方正等着这个窗口
+                    // 长出地址栏，错过这一次就等于把它的等待期整个盖掉（见 AddressPathOf 的注释）。
+                    else if (!force && (now - r.At).TotalMilliseconds < BandMissTtlMs) return IntPtr.Zero;
                     else bandCache.Remove(cab);
                 }
             }
@@ -886,7 +904,10 @@ namespace TabbedExplorer
             lock (probeLock)
             {
                 if (bandCache.Count > 128) bandCache.Clear();   // 窗口换了一茬就整批丢掉，别让它无限长
-                bandCache[cab] = new BandRef { Band = band, At = DateTime.Now };
+                // `force` 的调用方不吃自己的负结果：它下一轮（250ms 后）还要再来问，
+                // 存进去就变成「自己要等 1.2 秒」，等于 back 到刚修掉的那个 bug。
+                if (band != IntPtr.Zero || !force)
+                    bandCache[cab] = new BandRef { Band = band, At = DateTime.Now };
             }
             return band;
         }
@@ -1033,6 +1054,119 @@ namespace TabbedExplorer
                 return d > 0 ? d : 0;
             }
             catch { return 0; }
+        }
+
+        // ==================================================================
+        // 收起内嵌窗口里那条「文件(F) 编辑(E) 查看(V) 工具(T)」菜单栏
+        //
+        // 用户报的「多出这个白条，我关不掉」。结构（探针 `probe/cab_tree_dump.py` 实测，
+        // 2026-09-25，拿我们的内嵌窗口和同一命令起的原生窗口逐层对表）：
+        //
+        //   CabinetWClass
+        //     ├ WorkerW                      ← 地址栏那一行（ReBar 里有 Travel/Up/Address/Search 四条 band）
+        //     └ ShellTabWindowClass          ← 文件视图的容器
+        //         ├ DUIViewWndClassName      ← 文件列表
+        //         ├ WorkerW (20px)           ← ★ 菜单栏：里面是一条 ReBarWindow32
+        //         └ msctls_statusbar32       ← 状态栏（默认收着）
+        //
+        // 原生窗口里那个 WorkerW 的**高度是 0**（收着的，菜单栏不占位置）。
+        // 我们内嵌的窗口里它被撑成 20px —— 因为原生窗口顶上有 Ribbon（`UIRibbonCommandBarDock`
+        // 25px），而降级成 `WS_CHILD` 之后 Ribbon 根本没建出来，explorer 就退回「显示菜单栏」。
+        //
+        // 为什么不能只 `ShowWindow(SW_HIDE)`：位置是 explorer 自己摆的，藏掉它文件视图仍留在
+        // y=+20，那条位置由 `ShellTabWindowClass` 自己刷成一片底色 —— **白条还在**。
+        // 所以必须同时把 DUIView 撑回容器整个高度（就是 explorer 原生那种「菜单栏高度 0」的样子）。
+        //
+        // ⚠ 只对我们自己那扇 cab 调（`ExplorerHost`）；shell 的窗口一个字节都不能碰。
+        // ==================================================================
+        private sealed class MenuBarRef
+        {
+            public IntPtr Container;     // ShellTabWindowClass
+            public IntPtr Menu;          // 菜单栏的宿主 WorkerW
+            public IntPtr View;          // DUIViewWndClassName（文件列表）
+        }
+
+        /// <summary>cab → 它那三个窗口。收过一次就记着：窗口缩放的每一帧都要复核，不能每帧重找一遍。
+        /// 句柄失效（窗口关掉 / 句柄被复用）就整条丢掉重找。</summary>
+        private static readonly Dictionary<IntPtr, MenuBarRef> menuBarCache = new Dictionary<IntPtr, MenuBarRef>();
+
+        /// <summary>
+        /// 收起 <paramref name="cab"/> 里那条菜单栏，并把文件视图补满。
+        /// 幂等：已经收着（原生那种 h=0 的状态）时只做两次进程内查询，不写任何东西。
+        /// 返回 true = 这一趟真的动了手（第一次收 / explorer 又把它立起来了）。
+        /// </summary>
+        public static bool CollapseMenuBar(IntPtr cab)
+        {
+            if (cab == IntPtr.Zero) return false;
+            try
+            {
+                MenuBarRef r;
+                if (!menuBarCache.TryGetValue(cab, out r)
+                    || !NativeMethods.IsWindow(r.Menu) || !NativeMethods.IsWindow(r.View)
+                    || !NativeMethods.IsWindow(r.Container))
+                {
+                    r = FindMenuBar(cab);
+                    if (r == null) return false;
+                    if (menuBarCache.Count > 64) menuBarCache.Clear();
+                    menuBarCache[cab] = r;
+                }
+
+                bool acted = false;
+                if (IsWindowVisible(r.Menu))
+                {
+                    ShowWindow(r.Menu, SW_HIDE);
+                    acted = true;
+                }
+                WRECT cr, vr;
+                if (GetWindowRect(r.Container, out cr) && GetWindowRect(r.View, out vr))
+                {
+                    if (vr.Top != cr.Top || vr.Height != cr.Height || vr.Width != cr.Width)
+                    {
+                        SetWindowPos(r.View, IntPtr.Zero, 0, 0, cr.Width, cr.Height,
+                            SWP_NOZORDER | SWP_NOACTIVATE);
+                        acted = true;
+                    }
+                }
+                return acted;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 按结构找那三个窗口：`ShellTabWindowClass` 底下「子窗口是 ReBarWindow32 的那个 WorkerW」
+        /// 就是菜单栏 —— 用**结构**判，不看类名以外的任何东西（跟系统语言无关，也不看高度阈值）。
+        /// </summary>
+        private static MenuBarRef FindMenuBar(IntPtr cab)
+        {
+            IntPtr st = IntPtr.Zero;
+            IntPtr c = GetWindow(cab, GW_CHILD);
+            int guard = 0;
+            while (c != IntPtr.Zero && guard++ < 32)
+            {
+                if (string.Compare(ClassOf(c), "ShellTabWindowClass", StringComparison.OrdinalIgnoreCase) == 0)
+                {
+                    st = c;
+                    break;
+                }
+                c = GetWindow(c, GW_HWNDNEXT);
+            }
+            if (st == IntPtr.Zero) return null;
+
+            IntPtr menu = IntPtr.Zero, view = IntPtr.Zero;
+            c = GetWindow(st, GW_CHILD);
+            guard = 0;
+            while (c != IntPtr.Zero && guard++ < 32)
+            {
+                string cn = ClassOf(c);
+                if (string.Compare(cn, "DUIViewWndClassName", StringComparison.OrdinalIgnoreCase) == 0)
+                    view = c;
+                else if (string.Compare(cn, "WorkerW", StringComparison.OrdinalIgnoreCase) == 0
+                         && WinFind.ByClass(c, "ReBarWindow32") != IntPtr.Zero)
+                    menu = c;
+                c = GetWindow(c, GW_HWNDNEXT);
+            }
+            if (menu == IntPtr.Zero || view == IntPtr.Zero) return null;
+            return new MenuBarRef { Container = st, Menu = menu, View = view };
         }
 
         // ==================================================================

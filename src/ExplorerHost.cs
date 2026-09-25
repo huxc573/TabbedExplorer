@@ -506,6 +506,12 @@ namespace TabbedExplorer
                 int tb = EmbedApi.TopBlankOf(cab);
                 if (tb != TopBlank) { TopBlank = tb; LayoutCab(true); }
                 Diag.Step("Embed: 顶部空白 = " + TopBlank + "px");
+
+                // 收起 explorer 自己冒出来的那条菜单栏（原生窗口里它是收着的、高度 0）——
+                // 用户报的「多出这个白条、我关不掉」就是它。详见 EmbedApi.CollapseMenuBar 的类注释。
+                // 必须在「现身之后」做：藏着的窗口 explorer 还没排版，那时量到的位置不可信。
+                if (EmbedApi.CollapseMenuBar(cab))
+                    Diag.Step("Embed: 收起菜单栏（原生窗口里这条是收着的，内嵌之后 explorer 把它立起来了）");
                 settle.Start();
 
                 DateTime tE = DateTime.Now;
@@ -537,6 +543,7 @@ namespace TabbedExplorer
         /// <summary>
         /// 嵌入 250ms 后再量一次顶部空白。explorer 对隐藏窗口有惰性布局（有的子窗口要等显示才排），
         /// 所以「现身那一刻」量到的值仍可能是 0；变了就重摆一次，免得那条空白留在容器里变成死白。
+        /// 顺便再收一次菜单栏：explorer 的惰性排版也可能在这一刻才把菜单栏立起来。
         /// </summary>
         private void OnSettle(object sender, EventArgs e)
         {
@@ -549,6 +556,8 @@ namespace TabbedExplorer
                 TopBlank = tb;
                 LayoutCab(true);
             }
+            if (EmbedApi.CollapseMenuBar(CabWindow))
+                Diag.Step("Embed: 又收起了一次菜单栏（explorer 惰性排版把它立起来过）");
         }
 
         /// <summary>
@@ -687,6 +696,12 @@ namespace TabbedExplorer
             // 上移一个 TopBlank，把 explorer 留的那条空白（原标题栏位置）顶到容器外面裁掉；
             // 高度补回来，免得底部的状态栏被切。我们的自绘工具栏就画在那条位置上方。
             EmbedApi.SetWindowPos(CabWindow, IntPtr.Zero, 0, -TopBlank, w, h + TopBlank, flags);
+
+            // 一改尺寸 explorer 就会自己重排：它会把菜单栏那条重新立起来、文件视图又往下挪 20px，
+            // 白条就回来了。当场补一次之外，再让 settle 定时器兑一次 —— 它的重排是**异步**的
+            //（要等它处理完 WM_SIZE），只补当场那一下就赶在它前面了。
+            EmbedApi.CollapseMenuBar(CabWindow);
+            if (!settle.Enabled) settle.Start();
         }
 
         /// <summary>
@@ -782,6 +797,13 @@ namespace TabbedExplorer
             // 挂在每个标签的 500ms 心跳上，是为了兜住两种「登记可能不作数」的情况 ——
             // 收编那一刻句柄可能还没转过弯、以及标签换过目录（见 ShellBrowserReg 的类注释）。
             ShellBrowserReg.ExcludeOurs();
+
+            // 兜住「explorer 自己重排之后又把菜单栏立起来」：改窗口尺寸就会发生一次，
+            // 而它的重排是异步的（`LayoutCab` 当场补那一下常常赶在它前面）。
+            // 这行平时只是几条便宜的查询 —— `GetWindowRect` / `IsWindowVisible` 都不发消息，
+            // 真要动手时才写窗口（藏 + 把文件视图撑回去）。
+            if (EmbedApi.CollapseMenuBar(CabWindow))
+                Diag.Step("Embed: 又收起了一次菜单栏（explorer 重排把它立起来过）");
 
             string t = CurrentDisplayName;
 

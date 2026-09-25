@@ -865,17 +865,21 @@ namespace TabbedExplorer
         /// <summary>
         /// 从上面那份扫描结果里挑出「这个标签要的那一扇」。
         ///
-        /// `pidsBefore` 参数留着不用了 —— 按进程判会串台（见 `IsBaseline` 那段）。
+        /// `pidsBefore` 参数留着不用了 —— 老的「按进程判」会串台（见 `IsBaseline` 那段）。
+        /// ⓪ 用的是另一种 pid 判据：`expectPids` = 「我起进程前后多出来的那批 explorer 进程」，
+        /// 跟「进程是不是启动前就有的」不是一回事（后者会把桌面 shell 也算进来）。
         /// `relax` 的含义是「不做地址校验」；`wantedPath` 为 null 时也不校验（串行时只有一个候选）。
         ///
         /// <paramref name="matchedByPath"/> = 这一扇是**按地址栏内容**命中的（也就是说已经有一份
         /// 「它就是我要的那个」的硬证据了）。调用方靠它决定还要不要再复核一遍 — 见 `ExplorerHost.OnPoll`。
         /// </summary>
         public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
-            bool relax, string wantedPath, int expectPid, out int pidOfFound, out bool matchedByPath)
+            bool relax, string wantedPath, HashSet<int> expectPids, out int pidOfFound,
+            out bool matchedByPath, out bool matchedByPid)
         {
             pidOfFound = 0;
             matchedByPath = false;
+            matchedByPid = false;
             string wanted = (wantedPath != null && !relax) ? PathRules.Store(wantedPath) : null;
             List<CabSighting> list = ScanCabs();
 
@@ -884,13 +888,15 @@ namespace TabbedExplorer
             //    「地址栏内容 == 我要开的路径」对它们**全都**成立，于是先认到窗的标签会把别人的窗抢走，
             //    其余的要么等到 12 秒 relax 后就近凑一个（标签开成别的目录），要么 25 秒超时。
             //    （实测：记忆里 10 个同目标的标签 ⇒ 8 次「等 explorer 窗口超时（25s）」+ 4 次「标签打开失败」。）
-            //    ⚠ `expectPid` 为 0、或者它是个「我们起之前就已经在跑的」进程，整段跳过 —— 行为跟从前一模一样。
-            if (expectPid != 0 && !pidsBefore.Contains(expectPid))
+            //    ⚠ `expectPids` = 「我起进程前后多出来的那批 explorer 进程」（见 `ExplorerHost.NewExplorerPids`）。
+            //      别只塞 `Process.Start` 返回的那个 pid —— 实测 278 次起进程它**一次都没中**。
+            //      空集合（没捞到）就整段跳过 —— 行为跟从前一模一样，零回归。
+            if (expectPids != null && expectPids.Count > 0)
             {
                 for (int i = 0; i < list.Count; i++)
                 {
                     CabSighting c = list[i];
-                    if (c.Pid != expectPid) continue;
+                    if (!expectPids.Contains(c.Pid)) continue;
                     if (cabsBefore.Contains(c.H)) continue;
                     if (IsClaimed(c.H)) continue;
                     if (wanted != null)
@@ -906,6 +912,7 @@ namespace TabbedExplorer
                         matchedByPath = true;
                     }
                     pidOfFound = c.Pid;
+                    matchedByPid = true;
                     return c.H;
                 }
             }

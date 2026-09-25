@@ -80,10 +80,20 @@ namespace TabbedExplorer
         private IntPtr pendingCab = IntPtr.Zero;   // 已发现、已藏起、在等它加载完的那个窗口
         private int pendingPid;
         /// <summary>
-        /// 我们`Process.Start` 起出来的那个 explorer 的 pid —— 归属判定的**第一判据**（见 `EmbedApi.FindNewCab`）。
-        /// 光看「地址栏内容 == 目标路径」在有重复目标时分不出谁是谁；0 = 没留住（那就退回老路）。
+        /// 「这一扇是我起的」那批候选进程 pid —— 归属判定的**第一判据**（见 `EmbedApi.FindNewCab`）。
+        /// 光看「地址栏内容 == 目标路径」在有重复目标时分不出谁是谁。
+        ///
+        /// ⚠ 别只存 `Process.Start` 返回的那个 pid：实测 278 次起进程、「按进程命中」**一次都没中** ——
+        ///   那个 pid 跟真正拥有窗口的进程不是同一个（`explorer.exe /n,/separate` 会把请求转交/另孵一个）。
+        ///   ⇒ 真正的判据是**差分**：起进程前后多出来的 explorer 进程（见 `NewExplorerPids`）。
+        ///   空集合 = 什么都没捞到，那就退回老路（地址栏内容）。
         /// </summary>
-        private int launchedPid;
+        private readonly HashSet<int> launchPids = new HashSet<int>();
+        /// <summary>pid 差分做过了几轮；`pidDiffFound` = 已经捞到了（每标签最多两轮）。</summary>
+        private int pidPings;
+        private bool pidDiffFound;
+        /// <summary>差分时点：250ms 先捞一次、800ms 补一次（窗口通常 200~1500ms 就被发现）。</summary>
+        private static readonly int[] pidPingMs = { 250, 800 };
         private DateTime cabSeenAt;
 
         /// <summary>
@@ -205,7 +215,9 @@ namespace TabbedExplorer
         {
             TargetPath = path;
             startedAt = DateTime.Now;
-            launchedPid = 0;
+            launchPids.Clear();
+            pidPings = 0;
+            pidDiffFound = false;
             pidsBefore.Clear();
             foreach (Process p in Process.GetProcessesByName("explorer"))
             {
@@ -222,12 +234,13 @@ namespace TabbedExplorer
             {
                 Diag.Step("Embed: 起 explorer " + arg);
                 Process sp = Process.Start("explorer.exe", arg);
-                // 留住 pid：并发起好几个、或者几个标签开着同一个目录时，只有它能分得清「哪扇窗是我的」
-                //（见 `EmbedApi.FindNewCab` 里的 ⓪）。留不到也不影响 —— 那边会退回老路。
+                // 留住 pid 当**候选之一**（见 `launchPids` 注释）：并发起好几个、或者几个标签开着同一个
+                // 目录时，只有进程能把「哪扇窗是我的」分清楚（见 `EmbedApi.FindNewCab` 里的 ⓪）。
+                // ⚠ 它多半中不了 —— 真正的属主要靠 `OnPoll` 里那两轮 pid 差分（`NewExplorerPids`）捞。
                 if (sp != null)
                 {
-                    try { launchedPid = sp.Id; }
-                    catch { launchedPid = 0; }
+                    try { launchPids.Add(sp.Id); }
+                    catch { }
                     finally { sp.Dispose(); }
                 }
             }
@@ -314,7 +327,9 @@ namespace TabbedExplorer
 
             adopted = true;
             TargetPath = null;
-            launchedPid = 0;          // 这扇不是我们起的，没有「我起的那个进程」可认
+            launchPids.Clear();       // 这扇不是我们起的，没有「我起的那个进程」可认
+            pidPings = pidPingMs.Length;    // 也别再做 pid 差分（那是给「我起的那条道」用的）
+            pidDiffFound = false;
             startedAt = DateTime.Now;
             pendingCab = cab;
             pendingPid = pid;
@@ -364,6 +379,27 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 「起进程前后多出来的 explorer 进程」= `/n,/separate` 真正建出来、拥有那个窗口的那个进程。
+        ///
+        /// ⚠ 为什么不能直接信 `Process.Start` 返回的 pid：日志实证 278 次起进程、「按进程命中」**0 次**。
+        ///   那个 pid 跟我们真正要的那个不是同一个 —— `explorer.exe /n,/separate` 有时把请求**转交给
+        ///   已存在的 explorer 进程**，有时另孵一个（见 `ExplorerHasOtherWindows` 那段注释）。
+        ///   差分取「现在有、`pidsBefore` 里没有」的那批，正好覆盖正常情形。
+        /// ⚠ 「转交给老进程」那种差集为空、捞不到 —— 那不是回归：老办法（地址栏内容）照旧兜住。
+        /// </summary>
+        private HashSet<int> NewExplorerPids()
+        {
+            HashSet<int> now = new HashSet<int>();
+            foreach (Process p in Process.GetProcessesByName("explorer"))
+            {
+                try { now.Add(p.Id); } catch { }
+                finally { p.Dispose(); }
+            }
+            now.ExceptWith(pidsBefore);
+            return now;
+        }
+
+        /// <summary>
         /// 等窗口出现 → 发现就藏 → 等它加载完 → 嵌进来。
         ///
         /// 为什么要「藏」：`explorer.exe /n,/separate` 起的窗口会**先在桌面上画出来**，
@@ -386,17 +422,31 @@ namespace TabbedExplorer
                 //   （实测看到过「起的是 pt-seeder、标题却是 SelfDeviceCheck」）。宁可多等，也别配错。
                 //   12 秒仍远早于下面 25 秒的失败兜底。
                 bool relax = (DateTime.Now - startedAt).TotalSeconds > 12;
+
+                // pid 差分（`launchPids` 的正主）：`/n,/separate` 真正建出来的那个 explorer 进程
+                // 在起进程之后才出现，所以按点捞一到两次。只在前 800ms 内做、每标签最多 2 次 ——
+                // 这是 UI 线程上的进程枚举，不值当每 25ms 问一遍。
+                if (!pidDiffFound && pidPings < pidPingMs.Length
+                    && (DateTime.Now - startedAt).TotalMilliseconds >= pidPingMs[pidPings])
+                {
+                    pidPings++;
+                    HashSet<int> extra = NewExplorerPids();
+                    if (extra.Count > 0) { launchPids.UnionWith(extra); pidDiffFound = true; }
+                }
+
                 int pid;
                 bool byPath;
+                bool byPid;
                 // 并发起 explorer 时把「我要开哪个路径」交给扫描器，让它**只认地址栏对得上的那个窗口**
                 //（一次冒出好几个，不这么判就会抢到别人的窗口）；串行时传 null，走老路不判。
                 IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax,
-                    Settings.ParallelLaunch ? TargetPath : null, launchedPid, out pid, out byPath);
+                    Settings.ParallelLaunch ? TargetPath : null, launchPids, out pid, out byPath, out byPid);
                 // `byPath` = 上面那一扇是**按地址栏内容**命中的：也就是说「它就是我要开的那扇窗」
                 // 已经有硬证据了（那份内容由后台线程读的，见 `EmbedApi.ProbePath`）。那就别再在这里
                 // 重读一遍地址栏 —— 这一下是跨进程 `SendMessage`，对方忙的时候要几百毫秒，
-                // 白花在 UI 线程上。复核留给「没走路径判据」的那两种：串行模式 / relax。
-                if (cab != IntPtr.Zero && !relax && !byPath && !CabMatches(cab, TargetPath))
+                // 白花在 UI 线程上。复核留给既没按路径、也没按进程命中的那几种：串行模式 / relax。
+                // （`byPid` = 按「我起的那个进程」命中的，比地址栏内容还硬，照样免复核。）
+                if (cab != IntPtr.Zero && !relax && !byPath && !byPid && !CabMatches(cab, TargetPath))
                 {
                     // 找到了一个窗口，但地址栏显示的不是我们要开的那个 —— 十有八九是
                     // **同时开了好几个标签**，把别人的窗口扫到自己这儿了（用户报的「有时候标签页
@@ -420,9 +470,7 @@ namespace TabbedExplorer
 
                 Diag.Step(string.Format("Embed: 发现 cab=0x{0:X} pid={1}{2}，先藏起来（别让它闪）",
                     cab.ToInt64(), pid,
-                    (launchedPid != 0 && pid == launchedPid)
-                        ? "（按进程命中）"
-                        : (relax ? "（已放宽 pid 条件）" : "")));
+                    byPid ? "（按进程命中）" : (relax ? "（已放宽 pid 条件）" : "")));
                 pendingCab = cab;
                 pendingPid = pid;
                 EmbedApi.Claim(cab);       // 登记：Hub 那个「谁来都抓」的监听看见已登记就放手

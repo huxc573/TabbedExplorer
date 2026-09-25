@@ -589,6 +589,10 @@ namespace TabbedExplorer
             }
             pendingCapture[h] = new CaptureCandidate { SeenAt = DateTime.Now, ReactMs = react };
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
+            // ★ 此刻没有标签在起 ⇒ 不用等那一跳 250ms 的定时器，当场收（`IsCapturable` 那套
+            //   已经判过它确实是我们该收的窗口）。实测省下约 0.25 秒 —— 从开始菜单打开的那扇窗，
+            //   早一拍收下去就早一拍出内容。
+            if (!AnyLaunchInFlight()) DrainCapture();
         }
 
         // hiddenByUs 是双线程访问的（watcher 线程藏、UI 线程收尾）—— 一律走这三个口
@@ -717,11 +721,16 @@ namespace TabbedExplorer
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
                 // 这扇窗是**为了外面那个文件夹**才现建出来的：先把本桌面记着的标签摆回来，再加上它。
                 // 少了这一步，用户原来那一整排标签会被「只有这一个」的窗盖掉（退出时还会存进去）。
-                bool fresh = f.RestoreRememberedTabs();
+                // ⚠ 记忆里那批**只摆名字**：用户要的这个得第一个起（它在 `OpenPathAsTab` 里进队、
+                //   排到队头），其余等它落定再排（见 StartRestLaunches）。原来那顺序
+                //   「先把 8 个全摆上、全塞进队，再 OpenPathAsTab」等于把它排在第 8 位，
+                //   要等 7 个 explorer 起完才轮到 —— 转生一条路实测 6 秒以上。
+                int staged = f.StageRememberedTabs();
                 Diag.Step(string.Format(
-                    "Hub: 转生目标窗口 桌面={0} 记忆还原={1} 当时标签={2} 可见={3} 当前标签={4}",
-                    d, fresh ? "是" : "否（本来就有标签）", f.TabCount, f.Visible, f.ActiveIdx));
+                    "Hub: 转生目标窗口 桌面={0} 摆上 {1} 个记忆标签 当时标签={2} 可见={3} 当前标签={4}",
+                    d, staged, f.TabCount, f.Visible, f.ActiveIdx));
                 f.OpenPathAsTab(path);
+                f.StartRestLaunches(path, true);   // 用户在等这一个：其余等它落定再排
                 Diag.Step(string.Format("Hub: 转生完成 标签={0} 当前标签={1}", f.TabCount, f.ActiveIdx));
                 // 这一步不能省：用户是在**别的程序**里点的「打开文件夹」，本该有一扇窗弹到最前面。
                 // 只 `OpenPathAsTab` 的话窗口只是被 `Show()` 出来、还压在那个程序后面，
@@ -803,7 +812,11 @@ namespace TabbedExplorer
             {
                 foreach (KeyValuePair<IntPtr, CaptureCandidate> kv in new List<KeyValuePair<IntPtr, CaptureCandidate>>(pendingCapture))
                 {
-                    if ((now - kv.Value.SeenAt).TotalMilliseconds < CaptureDelayMs) continue;
+                    // ⚠ 这里**不再等** `CaptureDelayMs`：那 700ms 原本是给「我们自己刚起的窗口还没
+                    //   被认领」留的缓冲，而上面那道闸已经保证「此刻没有任何标签在起」—— 不存在那种窗口
+                    //   （我们起的窗口在 `Start` 之前就 `Claim` 了，见 EmbedApi.IsClaimed）。
+                    //   从开始菜单打开的那扇窗因此能立刻收 —— 实测这一刀省掉整整 0.7 秒：
+                    //   原来「触发 -> 我们的窗口出来」要 1.9 秒，其中 0.7 秒就是这么白等的。
                     if (ready == null) ready = new List<IntPtr>();
                     ready.Add(kv.Key);
                 }
@@ -821,6 +834,8 @@ namespace TabbedExplorer
         private void AdoptWindow(IntPtr h, int react)
         {
             if (quitting || !Settings.CaptureAll) { ReleaseIfAbandoned(h); return; }
+            EmbedForm f = null;
+            string incoming = null;
             try
             {
                 if (!IsCapturable(h)) { ReleaseIfAbandoned(h); return; }   // 这一轮里可能已经变了（被认领 / 关掉 / 藏了）
@@ -828,19 +843,23 @@ namespace TabbedExplorer
 
                 Guid d = VirtualDesktop.WindowDesktopId(h);
                 if (d == Guid.Empty) d = VirtualDesktop.CurrentDesktopId();
-                EmbedForm f = EnsureForm(d);
+                f = EnsureForm(d);
                 if (f == null) { ReleaseIfAbandoned(h); return; }
 
-                f.RestoreRememberedTabs();      // 同上：新窗口先把本桌面记着的标签摆回来，再收下这一个
+                // ★ 记忆里那批标签**只摆名字、先不起 explorer**（见 EmbedForm.StageRememberedTabs）：
+                //   两个原因 —— ① 判重（下面 `HasTabForPath`）得靠那些名字先存在；
+                //   ② 用户此刻要的是**这一扇窗**，8 个 explorer 一起起舞会把 UI 线程占住 400ms、
+                //      还把它挤到队尾。其余的等它落定再排（见本函数最后的 finally）。
+                f.StageRememberedTabs();
 
                 // ★ 这扇新窗的目标**本来就是我们某个标签**（他原来就开着这个文件夹，只是没切到前面）：
                 //   shell 不会去复用那扇窗，而是又开一扇；我们照单全收就成了**两个一模一样的标签**，
                 //   而他真正要的是「切到原来那个」（用户报的就是这个）。
                 //   所以：把这扇现建出来的窗关掉，切过去、把窗口顶到前台。
-                //   ⚠ 必须排在 `RestoreRememberedTabs` 之后 —— 那个「原来的标签」可能刚被记忆摆回来。
+                //   ⚠ 必须排在 `StageRememberedTabs` 之后 —— 那个「原来的标签」刚被摆回来。
                 //   ⚠ 也排在防闪那两步之前：这里只**关**、不藏；万一没关成，留在屏幕上的是一扇正常窗，
                 //     而不是一扇隐形窗（隐形窗会毒坏 shell，见 v1.13.1 那个「Win+E 没反应」的教训）。
-                string incoming = EmbedApi.AddressPathOf(h, true);
+                incoming = EmbedApi.AddressPathOf(h, true);
                 if (incoming != null && f.HasTabForPath(incoming))
                 {
                     Diag.Step(string.Format(
@@ -871,6 +890,16 @@ namespace TabbedExplorer
                 f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: 捕获新窗口失败 " + ex.Message); }
+            finally
+            {
+                // ★ 收尾那一刀：不管上面是收下了、判重切过去了、还是失败了，记忆里其余标签
+                //   这时才排进启动队列 —— 用户要的那一扇已经落定，不跟它抢（用户原话：
+                //   「优先处理激活标签，延迟后续并发伪懒加载」）。
+                if (f != null && !f.IsDisposed)
+                {
+                    try { f.StartRestLaunches(incoming, true); } catch { }
+                }
+            }
         }
 
         /// <summary>

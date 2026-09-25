@@ -63,6 +63,19 @@ namespace TabbedExplorer
         private readonly List<ExplorerHost> hosts = new List<ExplorerHost>();
         private int activeIndex = -1;
         private bool restored;
+        /// <summary>`StageRememberedTabs` 摆下的那串路径（按记忆里的顺序）/ 其中当时选中的那个 ——
+        /// 给 `StartRestLaunches` 决定「谁先起」用。</summary>
+        private List<string> stagedPaths;
+        private string stagedActive;
+        /// <summary>第二步（真起 explorer）已经走过了 —— 别让异常路径把它走两遍。</summary>
+        private bool restLaunched;
+        /// <summary>记忆里其余的标签还等着「优先那个落定」再排队（见 StartRestLaunches）。</summary>
+        private bool restPending;
+        private ExplorerHost restFirstHost;
+        private System.Windows.Forms.Timer restFallback;
+        /// <summary>刚被收编进来的那个标签（用户在等的就是它）。收编进来的 host 还没读过地址栏，
+        /// 按路径查不到，所以 `StartRestLaunches` 靠这个引用认它。</summary>
+        private ExplorerHost lastAdopted;
         /// <summary>窗口的位置和大小已经从记忆里还原过了（一次性的，别每次按 Win+E 都去搬）。</summary>
         private bool boundsDone;
         /// <summary>这个窗口真给用户看过（决定要不要把它的位置大小记进记忆 —— 没见过的窗口不许覆盖旧值）。</summary>
@@ -1152,9 +1165,24 @@ namespace TabbedExplorer
         /// ⚠ 这两条路以前漏了这一步：用户看到的是「一扇只有刚才那个文件夹的窗」，
         /// 而且**退出时这 1 个标签会把记忆里原来的整套标签盖掉** —— 下次开就只剩这一个了。
         /// </summary>
-        internal bool RestoreRememberedTabs()
+        // ==================================================================
+        // 记忆标签的还原拆成「摆」和「起」两步 —— 见 StageRememberedTabs / StartRestLaunches
+        //
+        // 为什么拆（用户报「从开始菜单打开目录，加载慢得有点离谱」时量的）：
+        //   收编 / 转生那条路原来是「先把本桌面记着的 N 个标签全摆出来、全塞进启动队列，
+        //   再去收用户那扇窗」：8 个标签一起起舞、UI 线程被占 400ms，而用户要的那扇窗排在
+        //   队尾 —— 转生那条路得等 6 秒以上才轮到它。
+        //   拆开之后：**先把名字摆出来**（判重需要它们先存在，用户第一眼也能看到完整标签条），
+        //   收完用户那扇窗，**才**让其余的排进启动队列。
+        // ==================================================================
+
+        /// <summary>
+        /// 第一步：把本桌面记着的标签**摆成占位**（标题/路径立刻写好，explorer 先不起）。
+        /// 返回摆上了几个。⚠ 只做一次，`restored` 守着。
+        /// </summary>
+        internal int StageRememberedTabs()
         {
-            if (restored || hosts.Count > 0) return false;
+            if (restored) return 0;
             restored = true;
 
             DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
@@ -1163,91 +1191,135 @@ namespace TabbedExplorer
                 Diag.Step("记忆: 「保留标签页」关着 -> 不还原，直接开一个「此电脑」");
                 b = null;
             }
-            if (b != null && b.Paths.Count > 0)
+            if (b == null || b.Paths.Count == 0) return 0;
+
+            int skipped = 0;
+
+            // ---- 先把记忆里的值过一遍筛子，得到「真能开出来、且不重复」的那一串 ----
+            // ⚠ 记忆里的值**不能直接拿去判能不能开**：地址栏给的常常是**显示名**（「视频」「此电脑」
+            //   「下载」），而 `Restorable` 只认「`::` / `shell:` 前缀」或「绝对且真实存在的目录」——
+            //   显示名两条都不占，会被整条跳过（用户报的「还原时有个标签报错」就是这个）。
+            //   所以一律先 `Store`（显示名 → 真路径 / shell 标识）再判。
+            List<string> want = new List<string>();
+            for (int i = 0; i < b.Paths.Count; i++)
             {
-                int skipped = 0;
-
-                // ---- 先把记忆里的值过一遍筛子，得到「真能开出来、且不重复」的那一串 ----
-                // ⚠ 记忆里的值**不能直接拿去判能不能开**：地址栏给的常常是**显示名**（「视频」「此电脑」
-                //   「下载」），而 `Restorable` 只认「`::` / `shell:` 前缀」或「绝对且真实存在的目录」——
-                //   显示名两条都不占，会被整条跳过（用户报的「还原时有个标签报错」就是这个）。
-                //   所以一律先 `Store`（显示名 → 真路径 / shell 标识）再判。
-                string activeStored = PathRules.Store(b.Active);
-                List<string> want = new List<string>();
-                for (int i = 0; i < b.Paths.Count; i++)
+                string p = PathRules.Store(b.Paths[i]);
+                if (!PathRules.Restorable(p))
                 {
-                    string p = PathRules.Store(b.Paths[i]);
-                    if (!PathRules.Restorable(p))
-                    {
-                        skipped++;
-                        Diag.Step("记忆: 跳过开不了的项「" + b.Paths[i] + "」（可能是个库/虚拟文件夹，没有真实路径）");
-                        continue;
-                    }
-                    // 同一个路径已经有标签了就别再开一个。
-                    // 记忆文件里偶尔会有重复行（老版本并发开标签时写坏的），去重放在这儿最稳：
-                    // 不管文件脏成什么样，界面上都不会冒出两个一模一样的标签。
-                    if (IndexOfPath(p) >= 0)
-                    {
-                        skipped++;
-                        Diag.Step("记忆: 「" + p + "」已经有标签了，跳过重复项");
-                        continue;
-                    }
-                    want.Add(p);
+                    skipped++;
+                    Diag.Step("记忆: 跳过开不了的项「" + b.Paths[i] + "」（可能是个库/虚拟文件夹，没有真实路径）");
+                    continue;
                 }
-
-                // 记忆里当时选中的那个在 `want` 里的位置（找不到就是 -1）
-                int activeAt = -1;
-                for (int i = 0; i < want.Count; i++)
-                    if (!string.IsNullOrEmpty(activeStored) && PathRules.Same(want[i], activeStored)) { activeAt = i; break; }
-
-                if (Settings.LazyTabs)
+                // 同一个路径已经有标签了就别再开一个。
+                // 记忆文件里偶尔会有重复行（老版本并发开标签时写坏的），去重放在这儿最稳：
+                // 不管文件脏成什么样，界面上都不会冒出两个一模一样的标签。
+                if (IndexOfPath(p) >= 0)
                 {
-                    // 懒加载：先把全部标签**摆出来**（都只是占位，不起 explorer），再把当时选中那个真起起来。
-                    // 起 explorer 要排队一个一个来（约 1.2 秒一个），这样开程序只等一个标签的时间。
-                    for (int i = 0; i < want.Count; i++) AddDeferredTab(want[i]);
-                    int la = (activeAt >= 0) ? activeAt : -1;
-                    Diag.Step(string.Format("记忆: 桌面 {0} 懒加载摆上 {1} 个标签（跳过 {2} 个），只起第 {3} 个",
-                        DesktopKey, hosts.Count, skipped, la));
-                    if (hosts.Count > 0)
-                    {
-                        Activate(la >= 0 ? la : 0);   // 碰到占位标签时 `Activate` 会把它真起起来
-                        return true;
-                    }
-                    return false;
+                    skipped++;
+                    Diag.Step("记忆: 「" + p + "」已经有标签了，跳过重复项");
+                    continue;
                 }
-
-                // ---- 不懒加载（默认）：**先把标签全部摆出来，再在后台并发把内容灌进去** ----
-                //
-                // 用户：「不能把并发做成伪懒加载吗？就是先显示标签名，后台实际在并发加载，
-                // 这样界面没什么变化，等到用户点过去，也不卡。」
-                // 所以顺序反过来：先一口气建好 N 个标签（标题直接取记忆里那个文件夹的名字、
-                // 第二行摆路径），explorer 全交给后面的并发队列慢慢填。
-                //   · 标签条从第一帧起就是完整的（不再一格格往外蹦「打开中…」再改名）；
-                //   · 用户随便点哪个都行 —— 内容早就在后台加载，不是点一下才开始；
-                //   · 「当时选中那个」仍然第一个起（串行那会儿是为了抢时间，现在留着是因为
-                //     它是用户最可能马上要看的那个）。
-                List<string> order = new List<string>();
-                if (activeAt >= 0) order.Add(want[activeAt]);
-                for (int i = 0; i < want.Count; i++)
-                    if (i != activeAt) order.Add(want[i]);
-
-                for (int i = 0; i < order.Count; i++)
-                    NewTab(order[i], PathRules.Friendly(PathRules.Store(order[i])), false);
-
-                // active 现在是第 0 个（它最先建），挪回它该在的位置
-                if (activeAt > 0 && hosts.Count > 0)
-                    MoveTabSynced(0, Math.Min(activeAt, hosts.Count - 1));
-
-                int act = (activeAt < 0) ? -1 : IndexOfPath(want[activeAt]);
-                Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个），优先起的是第 {3} 个",
-                    DesktopKey, hosts.Count, skipped, act));
-                if (hosts.Count > 0)
-                {
-                    Activate(act >= 0 ? act : 0);
-                    return true;
-                }
+                want.Add(p);
             }
-            return false;
+            if (want.Count == 0) return 0;
+
+            // **按记忆里的顺序**摆 —— 标签条从第一帧起就是用户上次离开时的样子；
+            // 「谁先起」交给第二步，不再靠「先建一个再挪回去」。
+            for (int i = 0; i < want.Count; i++) AddDeferredTab(want[i]);
+            stagedPaths = want;
+            stagedActive = PathRules.Store(b.Active);
+
+            Diag.Step(string.Format("记忆: 桌面 {0} 摆上 {1} 个标签占位（跳过 {2} 个），explorer 等第二步再起",
+                DesktopKey, want.Count, skipped));
+            return want.Count;
+        }
+
+        /// <summary>
+        /// 第二步：把摆好的占位按优先级真起 explorer。
+        ///
+        /// <paramref name="first"/> = 用户**此刻正等着**的那一个（收编 / 转生那条路传进来的路径），
+        /// 它排第一个；其余按记忆里的顺序跟在后面 —— 这就是用户说的「优先处理激活标签、
+        /// 延迟后续并发伪懒加载」：名字早摆好了，内容一个个填（一轮 900ms 一格，见 `PumpLaunch`）。
+        /// 不传就退回「记忆里当时选中的那个」优先。
+        ///
+        /// <paramref name="waitForHead"/> = 其余的**等第一个落定**再放。只有「用户正在等一扇窗」
+        /// 那两条路（`DesktopHub` 的收编 / 转生）传 true —— 提前放会让十几个 explorer 一起抢
+        /// CPU、把用户那个的收编拖慢；后台还原（`RestoreRememberedTabs`）则是越早并上越好，传 false。
+        /// </summary>
+        internal void StartRestLaunches(string first, bool waitForHead)
+        {
+            if (restLaunched) return;
+            if (stagedPaths == null || stagedPaths.Count == 0) return;
+            restLaunched = true;
+
+            int firstIdx = -1;
+            // ★ 刚从外面收进来的那扇窗就是用户此刻在等的：先认它。
+            //   （收编进来的 host 还没读过地址栏 —— `LivePath` 拿不到路径，按路径查不到它。）
+            if (lastAdopted != null) { firstIdx = hosts.IndexOf(lastAdopted); lastAdopted = null; }
+            if (firstIdx < 0 && !string.IsNullOrEmpty(first)) firstIdx = IndexOfPath(PathRules.Store(first));
+            if (firstIdx < 0) firstIdx = IndexOfPath(stagedActive);
+
+            if (Settings.LazyTabs)
+            {
+                // 真懒加载：只起选中那个，其余保持占位、点到才起（见 StartDeferred）
+                if (firstIdx >= 0) StartDeferred(firstIdx);
+                Diag.Step("记忆: 懒加载模式，只起第 " + (firstIdx + 1) + " 个");
+                return;
+            }
+
+            if (firstIdx < 0) firstIdx = 0;
+            if (hosts.Count == 0) return;
+            ExplorerHost head = hosts[firstIdx];
+            StartDeferred(firstIdx);          // 不管它排第几，先起（收编进来的不是占位，会自动跳过）
+
+            // ★ 其余的**等它落定**再放。放早了就是十几个 explorer 一起起舞抢 CPU，
+            //   它自己的收编会被拖慢（实测 196ms → 687ms —— 用户看到的就是「还是在打开中」）。
+            restFirstHost = head;
+            restPending = true;
+            if (!waitForHead || head == null || head.Settled) { StartRestNow(); return; }
+            StartRestFallback();              // 它要是一直不回来（起失败卡超时），别把其余饿死
+        }
+
+        /// <summary>兜底：优先那个迟迟没落定（起失败卡超时之类），照旧把其余的放出去。</summary>
+        private void StartRestFallback()
+        {
+            if (restFallback != null) return;
+            restFallback = new System.Windows.Forms.Timer();
+            restFallback.Interval = 10000;
+            restFallback.Tick += delegate
+            {
+                restFallback.Stop();
+                restFallback.Dispose();
+                restFallback = null;
+                if (restPending) { Diag.Step("记忆: 优先那个迟迟没落定，其余标签照常出发"); StartRestNow(); }
+            };
+            restFallback.Start();
+        }
+
+        /// <summary>把记忆里剩余的占位标签排进启动队列（优先那个落定之后才调，见 StartRestLaunches）。</summary>
+        private void StartRestNow()
+        {
+            if (!restPending) return;
+            restPending = false;
+            if (Settings.LazyTabs) return;
+            for (int i = 0; i < hosts.Count; i++)
+                if (hosts[i] != restFirstHost) StartDeferred(i);
+            Diag.Step("记忆: 优先那个已落定，其余标签开始排队（共 " + hosts.Count + " 个）");
+        }
+
+        /// <summary>
+        /// 还原记忆标签（老入口，把两步串起来）——「摆名字 + 记忆里选中那个优先起」。
+        /// ⚠ 收编 / 转生那条路**不要**用它：它们要在两步之间插一次「收下用户那扇窗」，
+        ///   见 `DesktopHub.AdoptWindow` / `TakeOverShellWindow`。
+        /// </summary>
+        internal bool RestoreRememberedTabs()
+        {
+            if (StageRememberedTabs() == 0) return false;
+            StartRestLaunches(null, false);      // 后台还原：不用等谁，越早并上越好（见 waitForHead）
+            if (hosts.Count == 0) return false;
+            int act = IndexOfPath(stagedActive);
+            Activate(act >= 0 ? act : 0);
+            return true;
         }
 
         /// <summary>
@@ -1594,7 +1666,7 @@ namespace TabbedExplorer
             ExplorerHost h = hosts[idx];
             if (h == null || !h.Deferred) return;
             h.Deferred = false;
-            Diag.Step("EmbedForm: 懒加载标签开始加载「" + h.TargetPath + "」");
+            Diag.Step("EmbedForm: 标签开始加载「" + h.TargetPath + "」");
             launchQueue.Enqueue(new Launch { Host = h, Path = h.TargetPath });
             PumpLaunch();
         }
@@ -1813,6 +1885,7 @@ namespace TabbedExplorer
             int i = hosts.IndexOf(h);
             tabStrip.SetPath(i, "（收进来的窗口）");
             h.Adopt(cab, pid);
+            lastAdopted = h;          // 见 StartRestLaunches：用户在等的就是它
             Activate(i);
             MarkDirty();
             return true;
@@ -1885,6 +1958,9 @@ namespace TabbedExplorer
                 Text = tabStrip.Tabs[i].Title;       // 任务栏 / Alt+Tab 的显示名
                 h.Focus();
             }
+            // ★ 用户要的那一个**落定**了 ⇒ 这时候才让记忆里其余的标签排进启动队列
+            //   （见 StartRestLaunches）：提前放会把它自己的收编拖慢近 0.5 秒。
+            if (restPending && h == restFirstHost) StartRestNow();
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
             LaunchDone(h);   // 兜底：正常早就在 `Claimed` 那一步放行过了（见那个事件的注释）
         }

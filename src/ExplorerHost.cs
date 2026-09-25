@@ -134,6 +134,15 @@ namespace TabbedExplorer
         private IntPtr addressBand;
         private string currentPath;
 
+        /// <summary>
+        /// 备用窗口被「导航复用」过去的目标 —— **还没换到位之前**，这个标签的路径就算它。
+        /// 不记的话 `LivePath` 会一直读到旧目录（此电脑），于是 `IndexOfPath` 认不出这个新标签：
+        /// 用户从开始菜单连开两次同一个文件夹就会开出两个标签（实测 182~411ms 内连着两次
+        /// 「没有对应标签」，第二次还写着「现有 7 个」—— 第一个明明已经进来了）。
+        /// 地址栏真的报出这个路径时自动清掉（见 `RefreshPath`）。
+        /// </summary>
+        public string PendingPath { get; set; }
+
         private uint origStyle;
         private WRECT origRect;
         private bool embedded;
@@ -718,6 +727,8 @@ namespace TabbedExplorer
                 if (string.Equals(s, currentPath, StringComparison.Ordinal)) return;
 
                 currentPath = s;
+                // 「导航复用」的目标已经换到位了 —— 以后路径以地址栏为准（见 PendingPath）
+                if (!string.IsNullOrEmpty(PendingPath) && PathRules.Same(s, PendingPath)) PendingPath = null;
                 Diag.Step("Embed: 现在在 " + s);
                 EventHandler e = PathChanged;
                 if (e != null) e(this, EventArgs.Empty);

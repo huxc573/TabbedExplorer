@@ -1533,9 +1533,11 @@ namespace TabbedExplorer
             Activate(zeroBased);
         }
 
-        /// <summary>Ctrl+W：关当前标签；这是最后一个就收进托盘（不退进程）。</summary>
+        /// <summary>Ctrl+W：关当前标签；这是最后一个就收进托盘（不退进程）。
+        /// 标签条上 Ctrl / Shift 挑了一批的话，这一下关的是**那一批**（用户 2026-09-25）。</summary>
         private void HotkeyCloseTab()
         {
+            if (tabStrip.HasMultiSelection) { CloseSelectedTabs(); return; }
             int i = activeIndex >= 0 ? activeIndex : hosts.Count - 1;
             Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo("closetab") + " -> 关标签 idx=" + i);
             if (i < 0) { HideToTray(); return; }
@@ -1559,7 +1561,12 @@ namespace TabbedExplorer
         private static string LivePath(ExplorerHost h)
         {
             if (h == null) return "";
-            string p = h.CurrentPath;
+            // ⚠ 备用窗口刚被「导航复用」过去、还没换到位时，`CurrentPath` 还停在旧目录（此电脑）——
+            //   这时它的路径得算**要去的那一个**，否则 `IndexOfPath` 认不出这个新标签：
+            //   用户从开始菜单连开两次同一个文件夹就会开出两个标签（实测 182~411ms 内连着两次
+            //   「没有对应标签」，第二次还写着「现有 7 个」—— 第一个明明已经进来了）。
+            string p = h.PendingPath;
+            if (string.IsNullOrEmpty(p)) p = h.CurrentPath;
             if (string.IsNullOrEmpty(p)) p = h.TargetPath;
             return PathRules.Store(p) ?? "";
         }
@@ -2029,6 +2036,8 @@ namespace TabbedExplorer
                 // ⚠ 表**先起**：这一段等的是 explorer 换目录，不该排在下面 `Activate` 那些界面活后面
                 //   —— 否则「已经在等的」和「还没开始等」会白白差掉一整个 Activate 的耗时。
                 RevealNow();       // 上一个还在等露面的先放出来（只记得住一个，不放开它就永远藏着）
+                // 换到位之前，这个标签的路径就算「要去的那一个」（不记会开出重复标签，见 LivePath）
+                h.PendingPath = stored;
                 revealPending = h;
                 revealWant = stored;
                 revealAt = DateTime.Now;
@@ -2089,6 +2098,7 @@ namespace TabbedExplorer
             ExplorerHost h = revealPending;
             revealPending = null;
             BeatReveal(false);
+            if (h != null) h.PendingPath = null;   // 到位了，路径以地址栏为准（见 LivePath）
             if (h == null || IsDisposed || Disposing) return;
             if (!hosts.Contains(h)) return;
             h.Host.Visible = true;
@@ -2638,6 +2648,11 @@ namespace TabbedExplorer
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
+            // ---- 多选了一批（Ctrl / Shift 点出来的）→ 给一条「一次关掉它们」----
+            // 只在「右键点的这一个也在选中里」时出现 —— 否则用户会以为关的是他点的那一个。
+            if (tabStrip.HasMultiSelection && tabStrip.IsSelected(idx))
+                m.Add(Mi("关闭选中的 " + tabStrip.SelectedCount + " 个标签页",
+                    delegate { Defer(CloseSelectedTabs); }));
             // ---- 用户新增的三条（跟浏览器右键对表）----
             // 只剩一个标签 / 当前就在最前（最后）时置灰 —— 点了什么也不发生的项还不如直接灰着
             m.Add(Mi("关闭其它标签页", hosts.Count > 1
@@ -2653,6 +2668,41 @@ namespace TabbedExplorer
             Point at = TabBar.PointToScreen(new Point(b.Left + b.Width / 2, b.Bottom));
             PopMenu.Show(m.ToArray(), TabBar, TabBar.PointToClient(at),
                 "标签右键 idx=" + idx);
+        }
+
+        /// <summary>
+        /// 关掉标签条上被 Ctrl / Shift 挑中的那一批（用户 2026-09-25 要的「选中一批一起关」）。
+        /// 走 `CloseTabsQuiet` —— 中间那几次 `Activate` 是「关一个闪一下」的来源；
+        /// 而且要**从后往前关**，下标才不会在关的过程中错位。
+        /// </summary>
+        private void CloseSelectedTabs()
+        {
+            int[] selIdx = tabStrip.SelectedIndices;
+            if (selIdx.Length == 0) return;
+            // 全选中 = 至少留一个（跟「关闭其它标签页」同一个规矩：窗口不能没有标签）
+            if (selIdx.Length >= hosts.Count)
+            {
+                tabStrip.ClearSelection();
+                Toast.Show("留一个", "标签全被选中了，至少得留一个。");
+                return;
+            }
+            // 当前标签不在这一批里的话，关完要切回它（在的话就就近落一个）
+            ExplorerHost keep = (activeIndex >= 0 && activeIndex < hosts.Count
+                                 && !tabStrip.IsSelected(activeIndex)) ? hosts[activeIndex] : null;
+            tabStrip.ClearSelection();
+            Diag.Step("EmbedForm: 关掉选中的 " + selIdx.Length + " 个标签页");
+            CloseTabsQuiet(delegate
+            {
+                for (int k = selIdx.Length - 1; k >= 0; k--)
+                {
+                    int i = selIdx[k];
+                    if (i >= 0 && i < hosts.Count) CloseTab(i, false);
+                }
+            });
+            int n = keep == null ? -1 : IndexOfHost(keep);
+            if (n < 0) n = hosts.Count - 1;
+            if (n >= 0) Activate(n);
+            MarkDirty();
         }
 
         /// <summary>关闭除了 keep 之外的所有标签。</summary>

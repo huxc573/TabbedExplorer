@@ -88,6 +88,15 @@ namespace TabbedExplorer
         private readonly ToolTip tips = new ToolTip();
 
         private int hoverIndex = -1;
+        /// <summary>
+        /// 多选（Ctrl 单个加/减、Shift 连一段）—— 用户 2026-09-25 要的「挑一批一起关」。
+        /// 空集合 = 没多选，一切行为跟从前完全一样。
+        /// ⚠ 它跟「当前标签」（`TabItem.Active`）**是两件事**：多选不动当前标签，当前标签也不自动进多选。
+        /// ⚠ 标签增删移之后下标会错位，所以这三处一律把选择清掉（见 AddTab / RemoveTab / MoveTab）。
+        /// </summary>
+        private readonly HashSet<int> sel = new HashSet<int>();
+        /// <summary>Shift 连选那一段的锚点（最近一次落在哪个标签上）。-1 = 还没有锚点。</summary>
+        private int selAnchor = -1;
         private int hoverCloseIndex = -1;
         private bool hoverNew;
         private int hoverTool = -1;
@@ -353,6 +362,7 @@ namespace TabbedExplorer
         public void AddTab(string title)
         {
             tabs.Add(new TabItem { Title = title ?? "", TextW = MeasureTitle(title) });
+            sel.Clear(); selAnchor = -1;   // 下标全变了，选择作废（见 sel 那段说明）
             Redraw();
         }
 
@@ -409,6 +419,7 @@ namespace TabbedExplorer
         {
             if (index < 0 || index >= tabs.Count) return;
             tabs.RemoveAt(index);
+            sel.Clear(); selAnchor = -1;   // 后面的下标都往前挪了一位，选择作废
             if (hoverIndex == index) hoverIndex = -1;
             // 不用把 scrollX 归零：下一次 EnsureLayout 会把它夹到新的 maxScroll 上
             // （归零反而会让用户刚滑到的位置白滑 —— 关一个标签不该把视口弹回最左边）。
@@ -419,6 +430,79 @@ namespace TabbedExplorer
         {
             for (int i = 0; i < tabs.Count; i++) tabs[i].Active = (i == index);
             ScrollActiveIntoView();   // 选中的标签不许停在屏幕外（浏览器都这么做）
+            Redraw();
+        }
+
+        // ------------------------------------------------------------------
+        // 多选（Ctrl / Shift）
+        // ------------------------------------------------------------------
+
+        /// <summary>选中的标签个数（0 = 没多选）。</summary>
+        public int SelectedCount { get { return sel.Count; } }
+
+        /// <summary>现在是不是有多个标签被选中（调用方据此决定要不要给「一批一起关」）。</summary>
+        public bool HasMultiSelection { get { return sel.Count > 1; } }
+
+        /// <summary>选中的标签下标（从小到大）。关的时候**从后往前**用，下标才不会错位。</summary>
+        public int[] SelectedIndices
+        {
+            get
+            {
+                int[] a = new int[sel.Count];
+                sel.CopyTo(a);
+                Array.Sort(a);
+                return a;
+            }
+        }
+
+        /// <summary>某个下标现在被多选选中了吗。</summary>
+        public bool IsSelected(int index) { return sel.Contains(index); }
+
+        /// <summary>清掉多选。返回「本来有没有选中的」（`false` 就不用重画了）。</summary>
+        public bool ClearSelection()
+        {
+            selAnchor = -1;
+            if (sel.Count == 0) return false;
+            sel.Clear();
+            Redraw();
+            return true;
+        }
+
+        /// <summary>
+        /// Ctrl / Shift 点在一个标签上要做什么（横排竖排共用一个入口）。
+        /// 返回 true = 这一下是「挑标签」，调用方别再当成「切到它」、也别当拖排序。
+        /// </summary>
+        private bool ApplyMultiSelect(int idx)
+        {
+            bool ctrl = (ModifierKeys & Keys.Control) == Keys.Control;
+            bool shift = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            if (!ctrl && !shift) return false;
+
+            if (shift && selAnchor >= 0)
+            {
+                // Shift：从锚点连到这儿一段（锚点 = 上一次点过的那个）
+                sel.Clear();
+                int a = Math.Min(selAnchor, idx), b = Math.Max(selAnchor, idx);
+                for (int i = a; i <= b; i++) sel.Add(i);
+            }
+            else
+            {
+                // Ctrl（或还没有锚点时的 Shift）：单个加 / 减
+                if (!sel.Remove(idx)) sel.Add(idx);
+                selAnchor = idx;
+            }
+            dragFromIndex = -1;
+            dragOverIndex = -1;
+            Redraw();
+            return true;
+        }
+
+        /// <summary>普通点一下标签 / 点空白 = 退出多选（浏览器都这样）。</summary>
+        private void DropSelectionOnPlainClick()
+        {
+            selAnchor = -1;
+            if (sel.Count == 0) return;
+            sel.Clear();
             Redraw();
         }
 
@@ -467,6 +551,7 @@ namespace TabbedExplorer
             TabItem it = tabs[from];
             tabs.RemoveAt(from);
             tabs.Insert(to, it);
+            sel.Clear(); selAnchor = -1;   // 顺序变了，选择作废
             Redraw();
         }
 
@@ -952,7 +1037,8 @@ namespace TabbedExplorer
                 if (tab.Right < 0 || tab.Left > Width) continue;
 
                 Color fill = tabs[i].Active ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
-                             : (i == hoverIndex ? Theme.Hover : bar);
+                             : (sel.Contains(i) ? Theme.AccentDim
+                                : (i == hoverIndex ? Theme.Hover : bar));
                 g.FillRectangle(new SolidBrush(fill), tab);
 
                 // 选中标签那条蓝线**不在这儿画** —— 见循环后面那一段（挪到底部，避开顶部滚动条）。
@@ -1151,7 +1237,8 @@ namespace TabbedExplorer
                 if (row.Bottom <= tabsTopV || row.Top >= tabsBottomV) continue;
 
                 Color fill = tabs[i].Active ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
-                             : (i == hoverIndex ? Theme.Hover : bar);
+                             : (sel.Contains(i) ? Theme.AccentDim
+                                : (i == hoverIndex ? Theme.Hover : bar));
                 // 半透明态下「底色那一档」不再补一刀：底下已经按不透明度铺过底色了，
                 // 再叠一次那几行就更实（标签区比工具行更不透，一眼就看出来）；只补高亮那一档。
                 if (Glass == null || !Glass.On || fill != bar)
@@ -1687,9 +1774,11 @@ namespace TabbedExplorer
                 // 窗格空白（工具行右侧、标签下面那些地方）—— 也当标题栏拖一把
                 blankDrag = true;
                 blankFrom = e.Location;
+                DropSelectionOnPlainClick();
                 return;
             }
-            dragFromIndex = idx;
+            // 按住 Ctrl / Shift 是要「挑一批一起关」，不是要拖排序（本条的响应在 VMouseUp）
+            dragFromIndex = ((ModifierKeys & (Keys.Control | Keys.Shift)) != Keys.None) ? -1 : idx;
         }
 
         private void VMouseUp(MouseEventArgs e)
@@ -1745,14 +1834,17 @@ namespace TabbedExplorer
             dragOverIndex = -1;
 
             int idx = VHitTest(e.Location);
-            if (idx < 0) { blankDrag = false; return; }
+            if (idx < 0) { blankDrag = false; DropSelectionOnPlainClick(); return; }
             if (!collapsed && VCloseBounds(bounds[idx]).Contains(e.Location))
             {
                 if (TabCloseClicked != null) TabCloseClicked(this, idx);
                 return;
             }
+            if (ApplyMultiSelect(idx)) { blankDrag = false; return; }
+            DropSelectionOnPlainClick();
             blankDrag = false;
             if (TabClicked != null) TabClicked(this, idx);
+            selAnchor = idx;
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -1823,8 +1915,12 @@ namespace TabbedExplorer
             {
                 // 空白处按下 —— 先记着位置；真拖动了（OnMouseMove 里过阈值）才走系统那套
                 // 「拖标题栏」（贴边吸附、双击最大化都白拿）。
-                // 不在按下时就拖，是为了保住「双击空白 = 新标签」这一条。
-                if (e.Button == MouseButtons.Left) { blankDrag = true; blankFrom = e.Location; }
+                // 不在按下时就拖，是为了保住「双击空白 = 最大化 / 还原」这一条。
+                if (e.Button == MouseButtons.Left)
+                {
+                    blankDrag = true; blankFrom = e.Location;
+                    DropSelectionOnPlainClick();   // 点空白也算「退出多选」
+                }
                 return;
             }
 
@@ -1838,8 +1934,11 @@ namespace TabbedExplorer
                 if (TabCloseClicked != null) TabCloseClicked(this, idx);
                 return;
             }
+            if (ApplyMultiSelect(idx)) return;     // Ctrl / Shift = 挑标签：不切过去、也不拖排序
+            DropSelectionOnPlainClick();
             if (TabClicked != null) TabClicked(this, idx);
 
+            selAnchor = idx;                        // Shift 连选从这儿开始数
             dragFromIndex = idx;
         }
 

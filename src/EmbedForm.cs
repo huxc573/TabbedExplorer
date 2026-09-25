@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -181,7 +182,11 @@ namespace TabbedExplorer
         /// <summary>等它换目录最多等多久；到点还没换过来就先露面（宁可有一下过渡，也别让用户干等）。</summary>
         private const int RevealMaxMs = 1500;
         /// <summary>查「换过来没有」的节拍。只读一次清单项的 LocationURL，很便宜。</summary>
-        private readonly Timer revealTimer = new Timer();
+        private System.Threading.Timer revealBeat;
+        /// <summary>0/1：上一拍还没轮到就别再排（否则界面卡一下会攒出一串，见 <see cref="revealBeat"/>）。</summary>
+        private int revealPosting;
+        /// <summary>已经问过几拍了（只在头几拍写日志，见 <see cref="OnRevealTick"/>）。</summary>
+        private int revealTick;
 
         /// <summary>
         /// 连着几次「抓不到备用窗口的 shell 清单项」。抓不到时要白等一个超时（见 `ExplorerHost` 里
@@ -446,8 +451,24 @@ namespace TabbedExplorer
             // 备用窗口导航之后，等它换到目标目录再露面（见 UseReserve 里那段）。
             // 40ms 一问：这一问只是读一次清单项的 LocationURL（跨进程的一次属性读），很便宜；
             // 用它而不是用标签那条 500ms 心跳，是因为心跳太粗 —— 那会让新标签白等半秒才露面。
-            revealTimer.Interval = 40;
-            revealTimer.Tick += delegate { OnRevealTick(); };
+            // ⚠ 定时器必须用**后台**的 + `BeginInvoke`，不能用 `Timer`：`WM_TIMER` 是低优先级消息，
+            //   界面一忙就被饿死（实测第一拍迟到 **799ms** —— 一个 40ms 的表本该 40ms 就响，那一拍
+            //   直接变成「点书签 800ms」的全部差额，且它既不阻塞、也不报错，只能靠打点看出来）。
+            //   `BeginInvoke` 交的是投递队列，界面只要还在抽消息就一定轮得到。
+            //   ⚠ 读 `LocationURL` 仍然在界面线程做（跨进程 COM，不能在别的线程用同一个代理）。
+            revealBeat = new System.Threading.Timer(delegate
+            {
+                if (System.Threading.Interlocked.CompareExchange(ref revealPosting, 1, 0) != 0) return;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        try { OnRevealTick(); }
+                        finally { revealPosting = 0; }
+                    });
+                }
+                catch { revealPosting = 0; }   // 窗体句柄还没建 / 正在销毁
+            }, null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
             trimTimer.Interval = 3000;
@@ -1975,6 +1996,7 @@ namespace TabbedExplorer
             if (!isThisPc && !realFolder) return false;
 
             bool navigated = false;
+            Stopwatch swR = Stopwatch.StartNew();
             if (realFolder)
             {
                 if (!ShellBrowserReg.NavigateTo(h.ShellTarget, stored))
@@ -1986,6 +2008,7 @@ namespace TabbedExplorer
                 }
                 navigated = true;
             }
+            long tNav = swR.ElapsedMilliseconds;
 
             reserve = null;
             reserveReady = false;
@@ -1999,17 +2022,28 @@ namespace TabbedExplorer
             tabStrip.SetPath(i, TabStrip.PathLine(line));
             History.Add(line);
             Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i + (navigated ? "（导航复用）" : "（秒开）"));
-            Activate(i);
             if (navigated)
             {
                 // 导航是 explorer 那边的异步动作，立刻现身会先闪一下它原来那个目录（此电脑）。
                 // 标签条上它已经选中、名字也对了，只是先把内容藏起来，等它真换过去再放出来（见 OnRevealTick）。
+                // ⚠ 表**先起**：这一段等的是 explorer 换目录，不该排在下面 `Activate` 那些界面活后面
+                //   —— 否则「已经在等的」和「还没开始等」会白白差掉一整个 Activate 的耗时。
                 RevealNow();       // 上一个还在等露面的先放出来（只记得住一个，不放开它就永远藏着）
-                h.Host.Visible = false;
                 revealPending = h;
                 revealWant = stored;
                 revealAt = DateTime.Now;
-                revealTimer.Start();
+                revealTick = 0;
+                BeatReveal(true);
+            }
+            long tPreAct = swR.ElapsedMilliseconds;
+            Activate(i);
+            long tAct = swR.ElapsedMilliseconds;
+            if (navigated)
+            {
+                // 上面那句 Activate 把它设成可见了，按回去；但若表已经在 Activate 里提前放出来了就别再藏
+                if (revealPending == h) h.Host.Visible = false;
+                Diag.Step("EmbedForm: 导航复用拆账 发导航" + tNav + "ms 记账" + (tPreAct - tNav)
+                    + "ms Activate" + (tAct - tPreAct) + "ms");
             }
             MarkDirty();
             PumpLaunch();      // 立刻再备一个
@@ -2023,13 +2057,29 @@ namespace TabbedExplorer
         private void OnRevealTick()
         {
             ExplorerHost h = revealPending;
-            if (h == null) { revealTimer.Stop(); return; }
+            if (h == null)
+            {
+                BeatReveal(false);
+                return;
+            }
+            revealTick++;
 
+            Stopwatch swRead = Stopwatch.StartNew();
             string got = ShellBrowserReg.PathOfEntry(h.ShellTarget);
+            long tRead = swRead.ElapsedMilliseconds;
             bool ok = got != null && PathRules.Same(got, revealWant);
-            if (!ok && (DateTime.Now - revealAt).TotalMilliseconds < RevealMaxMs) return;
+            if (!ok && (DateTime.Now - revealAt).TotalMilliseconds < RevealMaxMs)
+            {
+                // 前 4 拍记一下：能看出「表多久才响第一下」和「读一次 LocationURL 多贵」
+                if (revealTick <= 4)
+                    Diag.Step("EmbedForm: reveal 第 " + revealTick + " 拍 @"
+                        + (long)(DateTime.Now - revealAt).TotalMilliseconds + "ms 读URL" + tRead
+                        + "ms got=" + (string.IsNullOrEmpty(got) ? "(空)" : got));
+                return;
+            }
 
-            Diag.Step("EmbedForm: 备用窗口换目录" + (ok ? "到位" : "超时（先露面）") + " " + revealWant);
+            Diag.Step("EmbedForm: 备用窗口换目录" + (ok ? "到位" : "超时（先露面）") + " " + revealWant
+                + "（第 " + revealTick + " 拍 @" + (long)(DateTime.Now - revealAt).TotalMilliseconds + "ms）");
             RevealNow();
         }
 
@@ -2038,11 +2088,22 @@ namespace TabbedExplorer
         {
             ExplorerHost h = revealPending;
             revealPending = null;
-            revealTimer.Stop();
+            BeatReveal(false);
             if (h == null || IsDisposed || Disposing) return;
             if (!hosts.Contains(h)) return;
             h.Host.Visible = true;
             if (hosts.IndexOf(h) == activeIndex) h.Focus();
+        }
+
+        /// <summary>
+        /// 起 / 停那支「等备用窗口换目录」的拍子（见 <see cref="revealBeat"/>）。
+        /// 包一层 try 是因为窗体销毁之后还可能有一拍排在那里 —— 直接 `Change` 会抛，那就成了崩溃。
+        /// </summary>
+        private void BeatReveal(bool on)
+        {
+            if (revealBeat == null) return;
+            int ms = on ? 40 : System.Threading.Timeout.Infinite;
+            try { revealBeat.Change(ms, ms); } catch { }
         }
 
         /// <summary>
@@ -2243,18 +2304,33 @@ namespace TabbedExplorer
             // 得排在下面那句 `Host.Visible` 之前 —— 先把队列上的活派出去，界面这一帧先显示空面板，
             // 内容出来时 `OnHostReady` 会把标题 / 图标 / 路径再刷一遍。
             // urgent：用户点的就是「现在要」——插队头，别排在还原那十几个后面（见 EnqueueFront）。
+            Stopwatch sw = Stopwatch.StartNew();
             if (hosts[idx].Deferred) StartDeferred(idx, true);
             // 伪懒加载下「标签已经在、内容还在后台排队」是常态，用户点它 = 现在就要它，提到队头。
             else PromoteLaunch(hosts[idx]);
-            for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);
+            long tPrep = sw.ElapsedMilliseconds;
+            // ⚠ 还在等导航到位的那个标签（见 UseReserve / OnRevealTick）**先别露面**：
+            //   让它 Visible 一下再藏回去，白付一次「跨进程把 explorer 窗口显示出来」的钱（实测 85~165ms），
+            //   而那一下还正好撞在 explorer 忙的时候。到点露面时 `RevealNow` 会把它放出来。
+            for (int i = 0; i < hosts.Count; i++)
+                hosts[i].Host.Visible = (i == idx) && hosts[i] != revealPending;
             tabStrip.SetActive(idx);
             if (vPane != null && verticalOn) vPane.ScrollActiveIntoView();   // 竖排那份也要把选中的那行拉进视线
-            hosts[idx].Focus();
+            long tUi = sw.ElapsedMilliseconds;
+            // 同理：内容还没换过来，这时候把键盘焦点塞给它是白等一次跨进程 SetFocus（实测 70~172ms）；
+            // 它露面时 `RevealNow` 会补上（那一下它已经是 active 了）。
+            if (hosts[idx] != revealPending) hosts[idx].Focus();
+            long tFocus = sw.ElapsedMilliseconds;
             Text = tabStrip.Tabs[idx].Title;   // 任务栏 / Alt+Tab 的显示名（自绘标题栏删了，就剩这一处用途）
             MarkDirty();     // 「当时选中那个」也要记
             // 刚离开的那个标签先别动：过 3 秒还没被切回来，才当它真的凉了。
             trimTimer.Stop();
             trimTimer.Start();
+            long tEnd = sw.ElapsedMilliseconds;
+            // 只记慢的：正常切标签是几毫秒，超过 30ms 就说明某一步卡住了（点书签为什么慢的拆账）
+            if (tEnd >= 30)
+                Diag.Step("EmbedForm: Activate 拆账 派活" + tPrep + "ms 可见性+标签条" + (tUi - tPrep)
+                    + "ms Focus" + (tFocus - tUi) + "ms 收尾" + (tEnd - tFocus) + "ms（合计 " + tEnd + "ms）");
         }
 
         /// <summary>
@@ -2868,6 +2944,7 @@ namespace TabbedExplorer
             // 设置窗口现在归 Hub 管（它会在自己 Dispose 时收）—— 这里不再碰。
             try { trimTimer.Stop(); trimTimer.Dispose(); } catch { }
             try { peekTimer.Stop(); peekTimer.Dispose(); } catch { }
+            try { if (revealBeat != null) revealBeat.Dispose(); } catch { }
             DropGlass();
             base.OnFormClosed(e);   // 托盘/钩子/事件都不在这个类里（在 DesktopHub）
         }

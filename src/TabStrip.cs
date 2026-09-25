@@ -1936,18 +1936,12 @@ namespace TabbedExplorer
         {
             base.OnDoubleClick(e);
             Point p = PointToClient(Cursor.Position);
-            if (Vertical)
-            {
-                // 竖排里整条窗格就是标题栏：空白处双击 = 最大化 / 还原。
-                // 不自己改 WindowState，而是补一条 WM_NCLBUTTONDBLCLK(HTCAPTION) 交给系统 ——
-                // 跟拖拽那条路一样走原生标题栏处理，行为（以及以后的调整）都跟真标题栏一致。
-                if (VOnBlank(p)) MaximizeFromTitle();
-                return;
-            }
-            if (OnBlank(p))
-            {
-                if (NewTabClicked != null) NewTabClicked(this, EventArgs.Empty);
-            }
+            // 空白处双击 = 最大化 / 还原，**横排竖排一样**（用户 2026-09-25：横排那条从前是
+            // 「新开一个标签页」，他不认 —— 标题栏该有的动作就是放大缩小；开标签页本来就有那颗 `+`
+            // 和 Ctrl+T）。竖排整条窗格是标题栏，横排这条标签带也是。
+            // 不自己改 WindowState，而是补一条 WM_NCLBUTTONDBLCLK(HTCAPTION) 交给系统 ——
+            // 跟拖拽那条路一样走原生标题栏处理，行为（以及以后的调整）都跟真标题栏一致。
+            if (Vertical ? VOnBlank(p) : OnBlank(p)) MaximizeFromTitle();
         }
 
         /// <summary>

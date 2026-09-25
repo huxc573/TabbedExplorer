@@ -163,29 +163,39 @@ namespace TabbedExplorer
         /// 「事件后 0ms，**当时已可见**」：WinEvent 是投递到消息队列的，等我们收到 SHOW，
         /// explorer 那一帧**已经画在屏幕上了**。加了这层之后，无论它怎么 Show，画面都是透明的。
         ///
-        /// ★ 顺带还管住了**任务栏**：光置透明只解决「画面闪」，那扇窗在收编之前仍是个正常顶层窗口，
+        /// ★ 顺带还管住了**任务栏**（光置透明只解决「画面闪」）：那扇窗在收编之前仍是个正常顶层窗口，
         ///   任务栏上会多出一个「文件资源管理器」按钮，直到 `SetParent` 成子窗口才消失（川报的
-        ///   「加载时状态栏显示系统资源管理器图标、完成后消失」）。所以这里同时打上 `WS_EX_TOOLWINDOW`
-        ///   并摘掉 `WS_EX_APPWINDOW` —— 带 TOOLWINDOW 的窗口任务栏和 Alt+Tab 都不收。
-        ///   两件事必须在**同一个时刻**做：都是「趁这扇窗还没露脸把它按住」，拆成两步就有一帧的空档。
+        ///   「加载时状态栏显示系统资源管理器图标、完成后消失」）。带 `WS_EX_TOOLWINDOW` 的窗口
+        ///   任务栏与 Alt+Tab 都不收，所以顺手打上它、摘掉 `WS_EX_APPWINDOW`。
+        ///
+        /// ★ `taskbarBits` = 要不要动任务栏那两位。**调用方只在 SHOW 那一次传 true**：
+        ///   ⚠ explorer 建窗时看到 `WS_EX_TOOLWINDOW` 就**不建 Ribbon**，于是退回显示老式菜单栏
+        ///   —— 内嵌窗口顶上那条 `文件(F) 编辑(E) 查看(V) 工具(T)` 白条就是这么来的。
+        ///   物证：`probe/embed_menubar_state.py` 逐版回代，v1.14.0（还没打这一位）内嵌窗口顶上
+        ///   和原生窗口一样是 Ribbon 25px、没有老式菜单栏；从打了这一位的那版起变成
+        ///   「没有 Ribbon + 老式菜单栏 20px」，一直到现在。
+        ///   放到 SHOW 那一次再打就没事 —— Ribbon 那会儿早建好了，而窗口是被 CREATE 那次就置了
+        ///   透明的、紧接着还会被 `SW_HIDE`，所以任务栏那一刀照样来得及。
         ///
         /// ⚠ 收编进标签之前 / 放它走之前**必须** `ClearTransparent`，
         ///   否则嵌进来的窗口会永远是隐形的（这个坑比闪一下严重得多）。
         /// </summary>
-        public static void MakeTransparent(IntPtr h)
+        public static void MakeTransparent(IntPtr h, bool taskbarBits)
         {
             try
             {
                 uint ex = GetExStyle(h);
-                if ((ex & WS_EX_LAYERED) != 0) return;      // 已经是分层的，别重复设
-                SetExStyle(h, (ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
-                SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+                uint want = ex | WS_EX_LAYERED;
+                if (taskbarBits) want = (want | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+                if (want != ex) SetExStyle(h, want);
+                if ((ex & WS_EX_LAYERED) == 0) SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
             }
             catch { }
         }
 
         /// <summary>
-        /// 把 <see cref="MakeTransparent"/> 加的那两层去掉：透明与「不进任务栏」。
+        /// 把 <see cref="MakeTransparent"/> 加的那两层去掉：透明与「不进任务栏」（后者只在
+        /// 打过 `WS_EX_TOOLWINDOW` 的窗口上才存在，见那边 `taskbarBits` 的注释）。
         /// 顺手把 `WS_EX_APPWINDOW` 还回去 —— explorer 的浏览窗口本来就是任务栏窗口，
         /// 放手让它回桌面时得能重新出现在任务栏里（收编成子窗口后这一位本来也不起作用）。
         /// </summary>
@@ -1162,8 +1172,20 @@ namespace TabbedExplorer
         /// 幂等：已经收着（原生那种 h=0 的状态）时只做两次进程内查询，不写任何东西。
         /// 返回 true = 这一趟真的动了手（收了 / 还回去了）。
         /// </summary>
+        /// <summary>
+        /// 菜单栏这块（压高度 + Alt/F10 让行）的总闸。**当前是关的**。
+        ///
+        /// 关掉的原因：内嵌窗口里「先冒一条白条、过一会儿自己消失」—— 我们这套是**事后**才压的
+        /// （收编之后 + 250ms settle + 500ms 心跳），而改容器/子窗口尺寸会让 explorer 惰性重排、
+        /// 先把菜单栏立起来，于是先看见那 20px、等下一趟心跳才被压掉。
+        /// 停掉这块是为了做对照：白条到底是这段代码引起的，还是收编本身就有的。
+        /// 开回来把这里改成 true 即可（`WinEHook` 里 Alt/F10 的递话一并随之失效，它只写让行时刻）。
+        /// </summary>
+        public static bool MenuBarWork = false;
+
         public static bool CollapseMenuBar(IntPtr cab)
         {
+            if (!MenuBarWork) return false;
             if (cab == IntPtr.Zero) return false;
             try
             {

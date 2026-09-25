@@ -510,8 +510,10 @@ namespace TabbedExplorer
                 }
                 else
                 {
-                    // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE
-                    EmbedApi.MakeTransparent(h);
+                    // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE。
+                    // ⚠ 传 isShow：「不进任务栏」那两位只能在 SHOW 那一次打 —— CREATE 就打上的话
+                    //   explorer 会不建 Ribbon、退回老式菜单栏（内嵌窗口顶上那条白条，见 MakeTransparent）。
+                    EmbedApi.MakeTransparent(h, isShow);
                     bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
                     if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
 

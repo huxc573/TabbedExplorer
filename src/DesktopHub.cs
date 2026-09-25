@@ -99,6 +99,17 @@ namespace TabbedExplorer
         /// </summary>
         private const int ShellResolveMs = 1200;
         /// <summary>
+        /// 盯梢线程读到路径之后**再等这么久才 `SC_CLOSE`**（2026-09-25 实测定案，见 <see cref="WatchShellWindow"/>）。
+        ///
+        /// 那扇窗从开出来到被抽掉太快，会让系统在**关窗后约 0.6s** 发一声提示音（用户报的「咚」——
+        /// 音频会话探头按「出声率」量的：立刻关 21 次响 9 次，等 800ms 再关 **16 次响 0 次**；
+        /// 同一轮里换成 `WM_CLOSE`、或干脆不 `SW_HIDE`，都照样响 ⇒ 与**关法**无关，只与**关得太早**有关）。
+        ///
+        /// 代价：一扇已经被按住（`SW_HIDE`，隐形）+ 绘制区已清空的窗，在 shell 进程里多活 800ms ——
+        /// 用户看不见，标签也**不会**因此晚开（路径在关窗之前就交给 UI 线程了，见 `WatchShellWindow`）。
+        /// </summary>
+        private const int ShellSettleMs = 800;
+        /// <summary>
         /// 「用原生资源管理器打开」的让行期（见 <see cref="OpenNative"/>）。
         ///
         /// 用户在标签右键里点这一项，要的是**一扇真正的原生窗口**；可我们默认「只要是新冒出来的
@@ -705,6 +716,14 @@ namespace TabbedExplorer
         ///   于是它一露脸就是**有绘制区**的，实打实画了 ~110ms（我们那一下 `SW_HIDE` 同步落在
         ///   explorer 正忙的线程上，实测就要 110ms）。这就是用户报的「从开始菜单点文件夹还是会闪」
         ///   剩下的那一层：清空绘制区只负责到「关掉它」为止。
+        ///
+        /// ⚠ **关窗要等它「落定」**（`ShellSettleMs`，2026-09-25 实测定案）：shell 那扇窗刚开出来
+        ///   就被我们 `SC_CLOSE` 抽掉，会让系统在**关窗后约 0.6s**发出一声提示音（`pid=0` 的
+        ///   «System Sounds» 会话，用户报的「咚」）。用音频会话探头按出声率量：
+        ///   读到路径即关 = 21 次里响 9 次；**推迟 800ms 再关 = 16 次里响 0 次**。
+        ///   同一轮里「换 `WM_CLOSE`」「不 `SW_HIDE`」都照样响 ⇒ 与关法的种类无关，**只与关得太早有关**。
+        ///   ⚠ 推迟期间**必须继续轮询 + 继续按住**（所以不是一句 `Sleep`）：shell 有把窗再显出来的路径，
+        ///     不接着按就会让它重新露脸（那正是当初要按它的原因）。
         /// </summary>
         private void WatchShellWindow(IntPtr h, int react)
         {
@@ -716,24 +735,37 @@ namespace TabbedExplorer
                 try
                 {
                     DateTime deadline = DateTime.Now.AddMilliseconds(ShellResolveMs);
-                    while (DateTime.Now < deadline)
+                    int closeAt = 0;         // 0 = 还没读到路径；否则 = 「落定」之后再关的时刻（TickCount）
+                    string path = null;
+                    while (true)
                     {
                         if (quitting) return;
                         if (!NativeMethods.IsWindow(h)) return;      // 它自己没了（用户关了）
                         // 它露脸了（或 shell 又把它显出来）：按住。见 HushShellWindow。
+                        // ⚠ 这一句在「等它落定」那段时间里也得一直跑 —— 不接着按，shell 会把它再显出来。
                         if (HushShellWindow(h) && !hushed)
                         {
                             hushed = true;
                             Diag.Step(string.Format("Hub: 盯梢中把 shell 那扇窗按住 cab=0x{0:X}", h.ToInt64()));
                         }
-                        string p = ShellBrowserReg.PathOfWindow(h);
-                        if (p != null)
+                        if (closeAt == 0)
                         {
-                            lock (shellReady) shellReady[h] = new ShellCandidate { Path = p, ReactMs = react };
+                            string p = ShellBrowserReg.PathOfWindow(h);
+                            if (p != null)
+                            {
+                                // ★ 路径先交出去（UI 线程这就去开标签）—— 推迟关窗**不会**拖慢标签。
+                                path = p;
+                                lock (shellReady) shellReady[h] = new ShellCandidate { Path = p, ReactMs = react };
+                                closeAt = Environment.TickCount + ShellSettleMs;
+                            }
+                            else if (DateTime.Now >= deadline) break;   // 等不到路径：放开它，当没这回事
+                        }
+                        else if (Environment.TickCount >= closeAt)
+                        {
                             EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);   // WM_SYSCOMMAND / SC_CLOSE
                             Diag.Step(string.Format(
                                 "Hub: 关掉 shell 那扇窗（当时{0}）cab=0x{1:X} -> {2}",
-                                hushed ? "被我们按着" : "还没显示", h.ToInt64(), p));
+                                hushed ? "被我们按着" : "还没显示", h.ToInt64(), path));
                             asked = true;
                             break;
                         }

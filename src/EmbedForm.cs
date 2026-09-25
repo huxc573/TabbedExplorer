@@ -172,6 +172,25 @@ namespace TabbedExplorer
         private bool reserveReady;
 
         /// <summary>
+        /// 备用窗口被「导航复用」之后，等它真的换到目标目录再露面的那一小段（见 <see cref="UseReserve"/>）。
+        /// 不等的话，点书签会先闪一下它原来那个目录（此电脑）、再换成目标 —— 那一下很难看。
+        /// </summary>
+        private ExplorerHost revealPending;
+        private string revealWant;
+        private DateTime revealAt;
+        /// <summary>等它换目录最多等多久；到点还没换过来就先露面（宁可有一下过渡，也别让用户干等）。</summary>
+        private const int RevealMaxMs = 1500;
+        /// <summary>查「换过来没有」的节拍。只读一次清单项的 LocationURL，很便宜。</summary>
+        private readonly Timer revealTimer = new Timer();
+
+        /// <summary>
+        /// 连着几次「抓不到备用窗口的 shell 清单项」。抓不到时要白等一个超时（见 `ExplorerHost` 里
+        /// 那一段），而等待期间 `LaunchInFlight` 一直是真 —— 那会顺带把「收编用户新开的窗口」也推迟。
+        /// 所以连栽两次就不再试了，退回「备用窗口只给此电脑用」那套（预热也快回来）。
+        /// </summary>
+        private int shellTargetMisses;
+
+        /// <summary>
         /// 预热失败之后的冷却期到什么时候（见 <see cref="CanWarm"/>）。
         /// 没有它的话「起失败 → 立刻再起」就是个死循环：起一次失败要干等 25 秒超时，
         /// 于是每 25 秒白烧一个 explorer 进程。
@@ -423,6 +442,12 @@ namespace TabbedExplorer
             // 停不停也在它那儿判 —— 别在这儿拿「队列空不空」提前停：
             // 队列空之后还有一件周期性的事（备用窗口还没备好），见 PumpLaunch 尾部。
             pumpTimer.Tick += delegate { PumpLaunch(); };
+
+            // 备用窗口导航之后，等它换到目标目录再露面（见 UseReserve 里那段）。
+            // 40ms 一问：这一问只是读一次清单项的 LocationURL（跨进程的一次属性读），很便宜；
+            // 用它而不是用标签那条 500ms 心跳，是因为心跳太粗 —— 那会让新标签白等半秒才露面。
+            revealTimer.Interval = 40;
+            revealTimer.Tick += delegate { OnRevealTick(); };
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
             trimTimer.Interval = 3000;
@@ -1652,7 +1677,7 @@ namespace TabbedExplorer
         private ExplorerHost NewTab(string path, string initialTitle, bool activate)
         {
             // 有预热好的备用窗口就直接用（几乎瞬时），没有才现起一个
-            if (UseReserve(path)) return null;
+            if (UseReserve(path, initialTitle)) return null;
 
             ExplorerHost h = AddHost();
             int i = hosts.IndexOf(h);
@@ -1893,6 +1918,10 @@ namespace TabbedExplorer
             ExplorerHost h = CreateHost();
             reserve = h;
             reserveReady = false;
+            // 让它在收编之前把 shell 清单里那一项抓住 —— 用户点了**别的**文件夹时，
+            // 这扇备用窗口直接导航过去就是（省掉再起一个 explorer 进程那 0.24~1.28 秒），见 UseReserve。
+            // 连着栽两次就别再试了（理由见 shellTargetMisses）。
+            h.WantShellTarget = shellTargetMisses < 2;
             h.PresetTarget(ExplorerView.ThisPcPath);
             Diag.Step("EmbedForm: 预热备用标签（此电脑）");
             launchQueue.Enqueue(new Launch { Host = h, Path = ExplorerView.ThisPcPath, Warm = true });
@@ -1917,12 +1946,17 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 新建标签页时优先用它。返回 true = 已经开好了，调用方不用再起 explorer。
+        /// 新建标签页 / 点书签 / 点历史 / 转生时优先用它。返回 true = 已经开好了，调用方不用再起 explorer。
+        ///
+        /// 从前这个窗口只能用在「此电脑」上（它就是预热在那个目录的），所以只有按 + 才快。
+        /// 现在**别的文件夹也能用**：直接让 shell 把它**导航过去**（`ShellBrowserReg.NavigateTo`，
+        /// 实测嵌入之后 82ms、还是顶层时 105ms），省掉「起 explorer 进程 + 它自己建窗/导航/SHOW」
+        /// 那一整段（实测 0.24~1.28 秒）—— 点书签觉得慢，慢的就是这一段。
+        /// 虚拟位置（回收站 / 网络 / 此电脑）不吃这条：那些是 shell 别名，导航过去未必认，照老路现起。
         /// </summary>
-        private bool UseReserve(string path)
+        private bool UseReserve(string path, string initialTitle)
         {
             if (!reserveReady || reserve == null) return false;
-            if (!PathRules.Same(PathRules.Store(path), ExplorerView.ThisPcPath)) return false;
 
             ExplorerHost h = reserve;
             if (h.CabWindow == IntPtr.Zero || !NativeMethods.IsWindow(h.CabWindow))
@@ -1932,19 +1966,83 @@ namespace TabbedExplorer
                 return false;
             }
 
+            string stored = PathRules.Store(path) ?? "";
+            bool isThisPc = PathRules.Same(stored, ExplorerView.ThisPcPath);
+            // 只有「真·文件夹」（`D:\…` 这种）才谈得上导航过去
+            bool realFolder = !isThisPc && PathRules.Restorable(stored)
+                && !stored.StartsWith("::", StringComparison.Ordinal)
+                && !stored.StartsWith("shell:", StringComparison.OrdinalIgnoreCase);
+            if (!isThisPc && !realFolder) return false;
+
+            bool navigated = false;
+            if (realFolder)
+            {
+                if (!ShellBrowserReg.NavigateTo(h.ShellTarget, stored))
+                {
+                    // 导航这条路走不通（没抓到清单项 / shell 不收这个请求）：**别将它就**，
+                    // 也别把这个备用窗口扔掉 —— 它对「此电脑」照样好用，留着。这一次照老路现起。
+                    Diag.Step("EmbedForm: 备用窗口导航不了，照老路现起 explorer（备用窗口留着）");
+                    return false;
+                }
+                navigated = true;
+            }
+
             reserve = null;
             reserveReady = false;
             hosts.Add(h);
             int i = hosts.Count - 1;
-            tabStrip.AddTab(h.CurrentDisplayName);
+            // 标题用调用方给的那个（书签上的名字 / 路径现算的名字）：此刻窗口还停在旧目录上，
+            // 问它要名字只会拿到「此电脑」。
+            tabStrip.AddTab(string.IsNullOrEmpty(initialTitle) ? h.CurrentDisplayName : initialTitle);
             tabStrip.SetIcon(i, h.TabIcon);
-            tabStrip.SetPath(i, TabStrip.PathLine(LivePath(h)));
-            History.Add(LivePath(h));
-            Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i + "（秒开）");
+            string line = stored.Length > 0 ? stored : LivePath(h);
+            tabStrip.SetPath(i, TabStrip.PathLine(line));
+            History.Add(line);
+            Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i + (navigated ? "（导航复用）" : "（秒开）"));
             Activate(i);
+            if (navigated)
+            {
+                // 导航是 explorer 那边的异步动作，立刻现身会先闪一下它原来那个目录（此电脑）。
+                // 标签条上它已经选中、名字也对了，只是先把内容藏起来，等它真换过去再放出来（见 OnRevealTick）。
+                RevealNow();       // 上一个还在等露面的先放出来（只记得住一个，不放开它就永远藏着）
+                h.Host.Visible = false;
+                revealPending = h;
+                revealWant = stored;
+                revealAt = DateTime.Now;
+                revealTimer.Start();
+            }
             MarkDirty();
             PumpLaunch();      // 立刻再备一个
             return true;
+        }
+
+        /// <summary>
+        /// 等「导航复用的备用窗口」真的换到目标目录，再把它露出来（见 <see cref="UseReserve"/>）。
+        /// 到点还没换过来就先露面 —— 那扇窗里的内容至少是能看的，比一直空着强。
+        /// </summary>
+        private void OnRevealTick()
+        {
+            ExplorerHost h = revealPending;
+            if (h == null) { revealTimer.Stop(); return; }
+
+            string got = ShellBrowserReg.PathOfEntry(h.ShellTarget);
+            bool ok = got != null && PathRules.Same(got, revealWant);
+            if (!ok && (DateTime.Now - revealAt).TotalMilliseconds < RevealMaxMs) return;
+
+            Diag.Step("EmbedForm: 备用窗口换目录" + (ok ? "到位" : "超时（先露面）") + " " + revealWant);
+            RevealNow();
+        }
+
+        /// <summary>把「在等导航到位才露面」的那个标签放出来（到点了 / 超时了 / 又来一个要等）。</summary>
+        private void RevealNow()
+        {
+            ExplorerHost h = revealPending;
+            revealPending = null;
+            revealTimer.Stop();
+            if (h == null || IsDisposed || Disposing) return;
+            if (!hosts.Contains(h)) return;
+            h.Host.Visible = true;
+            if (hosts.IndexOf(h) == activeIndex) h.Focus();
         }
 
         /// <summary>
@@ -2018,6 +2116,8 @@ namespace TabbedExplorer
             if (h == reserve)
             {
                 reserveReady = true;
+                // 抓到没抓到那一项，决定这个备用窗口往后能不能给「别的目录」用（见 UseReserve）
+                if (h.ShellTarget == null) shellTargetMisses++; else shellTargetMisses = 0;
                 Diag.Step("EmbedForm: 备用标签已就绪（下次新建标签页秒开）");
                 LaunchDone(h);
                 return;

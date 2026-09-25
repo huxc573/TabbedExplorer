@@ -89,9 +89,11 @@ namespace TabbedExplorer
         private const int DISPID_PROPERTYPUT = -3;
 
         private const short VT_I4 = 3;                  // 32 位整数
+        private const short VT_BSTR = 8;                // 宽字符串（BSTR）
         private const short VT_BOOL = 11;               // VARIANT_TRUE = -1
         private const short VT_VARIANT = 12;            // 「值是个 VARIANT」
         private const short VT_BYREF = 0x4000;          // 按引用传
+        private const short VT_VARIANT_BYREF = unchecked((short)(VT_VARIANT | VT_BYREF));
 
         /// <summary>
         /// 把清单里**属于本进程**的窗口统统写一遍 `RegisterAsBrowser = TRUE`。
@@ -197,6 +199,111 @@ namespace TabbedExplorer
             }
             catch (Exception ex) { Diag.Log("ShellReg: 读窗口当前目录失败 " + ex.Message); }
             return null;
+        }
+
+        /// <summary>
+        /// 在一扇窗**还是顶层窗**的时候，把它在 `ShellWindows` 里的那一项抓住，留着以后让它换目录
+        /// （见 <see cref="NavigateTo"/>）。抓不到就返回 null（调用方下一轮再来）。
+        ///
+        /// 为什么要趁早抓：窗口被我们 `SetParent` 收编之后，清单报回来的 `HWND` 就变成**我们的宿主窗体**了
+        /// —— 一张桌面上的标签全撞成同一个句柄，再也分不出谁是谁（类注释里那条）。只有「它还是顶层窗」
+        /// 这一刻能用 `HWND` 对上号。
+        ///
+        /// ⚠ 新窗刚起来那阵子在清单里是**幽灵项**（`Item(i)` 回空指针），实测窗口出现后约 **+1 秒**
+        ///   才读得到。所以调用方是「一轮试一次、过一会儿再来」，不是一次不成就算了。
+        /// ⚠ 抓到的这一项**只能在同一个线程上接着用**（清单项是个 STA 对象，跨线程得自己封送）。
+        ///   本工程里「抓」在收编那条链上（UI 线程）、「用」在 `EmbedForm.UseReserve`（也是 UI 线程），对得上。
+        /// </summary>
+        internal static object GrabWindowEntry(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return null;
+            try
+            {
+                Application.OleRequired();
+                Type t = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (t == null) return null;
+                IDispatch root = Activator.CreateInstance(t) as IDispatch;
+                if (root == null) return null;
+
+                int total = ReadInt(root, "Count");
+                // 从队尾往前找（新窗追加在队尾，理由见 Lookback）
+                for (int i = 0; i < Lookback && i < total; i++)
+                {
+                    IDispatch item = ReadItem(root, total - 1 - i);
+                    if (item == null) continue;
+                    if (ReadHwnd(item) != hwnd) continue;
+                    return item;            // 留着 —— 以后 NavigateTo 直接拿它用
+                }
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 抓窗口项失败 " + ex.Message); }
+            return null;
+        }
+
+        /// <summary>
+        /// 让 <see cref="GrabWindowEntry"/> 抓到的那扇窗换到 `path`（`IWebBrowser2::Navigate2`）。
+        ///
+        /// 用途：预热好的备用窗口本来停在「此电脑」上，用户点了别的文件夹（书签 / 历史 / 转生）时，
+        /// 与其再起一个 explorer 进程（实测 0.24~1.28 秒），不如直接让它导航过去（实测 82~105ms）。
+        ///
+        /// 返回 true 只代表 **shell 收下了这个请求**（`hr=0`）：导航是异步的，内容稍后自己换。
+        /// 调用方要判断「到位没有」，读 `LocationURL` 就是（见 <see cref="PathOfEntry"/>）。
+        /// </summary>
+        internal static bool NavigateTo(object target, string path)
+        {
+            IDispatch d = target as IDispatch;
+            if (d == null || string.IsNullOrEmpty(path)) return false;
+
+            int id;
+            // `Navigate2` 优先（`Navigate` 是它的前身，参数是裸 BSTR）；两个都没有就作罢
+            if (!DispIdOf(d, "Navigate2", out id) && !DispIdOf(d, "Navigate", out id)) return false;
+
+            IntPtr inner = Marshal.AllocCoTaskMem(VarSize);
+            IntPtr outer = Marshal.AllocCoTaskMem(VarSize);
+            IntPtr url = IntPtr.Zero;
+            try
+            {
+                // URL 形参在自动化里是个 `VARIANT`，按 OLE 的规矩要传 `VT_VARIANT|VT_BYREF`
+                //（外层标「按引用」、联合里放真正那个 VARIANT 的地址）—— 跟 `Item(i)` 同一个套路。
+                url = Marshal.StringToBSTR(path);
+                Zero(inner, VarSize);
+                Marshal.WriteInt16(inner, 0, VT_BSTR);
+                Marshal.WriteIntPtr(inner, 8, url);
+
+                Zero(outer, VarSize);
+                Marshal.WriteInt16(outer, 0, VT_VARIANT_BYREF);
+                Marshal.WriteIntPtr(outer, 8, inner);
+
+                DISPPARAMS dp = new DISPPARAMS();
+                dp.rgvarg = outer;
+                dp.cArgs = 1;
+                Guid none = Guid.Empty;
+                int hr = d.Invoke(id, ref none, 0, DISPATCH_METHOD, ref dp, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (hr != 0)
+                {
+                    Diag.Log(string.Format("ShellReg: 导航到 {0} 失败 hr=0x{1:X8}", path, hr));
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 导航失败 " + ex.Message); return false; }
+            finally
+            {
+                if (url != IntPtr.Zero) { try { Marshal.FreeBSTR(url); } catch { } }
+                Marshal.FreeCoTaskMem(inner);
+                Marshal.FreeCoTaskMem(outer);
+            }
+        }
+
+        /// <summary>
+        /// 那扇窗**现在**开着哪个文件夹（`LocationURL` → 真路径）。给「等它导航到位」那条用（见 `NavigateTo`）。
+        /// ⚠ 只认 `file:///` 那一种（虚拟位置返回 null）—— 调用方拿它跟一个真文件夹比，比不了就算还没到位。
+        /// </summary>
+        internal static string PathOfEntry(object target)
+        {
+            IDispatch d = target as IDispatch;
+            if (d == null) return null;
+            try { return FileUrlToPath(ReadString(d, "LocationURL")); }
+            catch { return null; }
         }
 
         /// <summary>

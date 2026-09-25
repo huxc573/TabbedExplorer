@@ -69,6 +69,7 @@ u.SetParent.restype = wt.HWND
 u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
                               c_int, c_int, c_int, c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, c_void_p]
 u.CreateWindowExW.restype = wt.HWND
+u.DestroyWindow.argtypes = [wt.HWND]
 u.PeekMessageW.argtypes = [POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
 u.TranslateMessage.argtypes = [POINTER(wt.MSG)]
 u.DispatchMessageW.argtypes = [POINTER(wt.MSG)]
@@ -85,12 +86,14 @@ k.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
 k.CloseHandle.argtypes = [wt.HANDLE]
 
 CAB = ("CabinetWClass", "ExploreWClass")
+OUR_PID = k.GetCurrentProcessId()
 WM_CLOSE, WM_GETTEXT = 0x0010, 0x000D
 SW_HIDE = 0
 PM_REMOVE = 1
 POLL_MS = 25
 BUDGET_S = 20.0
 NAV_BUDGET_S = 10.0
+SCAN_WAIT_S = 15.0            # 等这扇窗在 ShellWindows 里变得可读的最长时间（phase 0）
 GWL_STYLE, GWL_EXSTYLE = -16, -20
 WS_CHILD = 0x40000000
 WS_POPUP_MASK = 0x80000000
@@ -224,9 +227,48 @@ def new_shell_windows():
     return p if hr == 0 and p.value else None
 
 
-def scan_for(cab, leaf):
-    """扫一遍 ShellWindows，找那扇窗的 IDispatch。只扫这一次。
-    新窗追加在清单**末尾**（见 MEMORY 24）⇒ 从队尾倒扫。"""
+def dump_tail(n, tag, cab):
+    """把 ShellWindows **队尾** n 项里能读出对象的那些打出来（看清单报的 HWND 是谁）。"""
+    p = new_shell_windows()
+    if p is None:
+        print("   [%s] ShellWindows 拿不到" % tag)
+        return
+    total, cd = 0, get_dispid(p, "Count")[0]
+    if cd is not None:
+        _, cv, _ = invoke(p, cd, DISPATCH_PROPERTYGET)
+        if cv.vt == VT_I4:
+            total = cv.u.lVal
+    idm, _ = get_dispid(p, "Item")
+    print("   [%s] 清单 %d 项，队尾 %d 项里能读出的（cab=0x%X，本进程 pid=%d）：" % (tag, total, n, cab, OUR_PID))
+    shown = 0
+    for i in range(total - 1, max(-1, total - 1 - n), -1):
+        hr, item, _ = invoke(p, idm, DISPATCH_METHOD, args=[vref(vint(i))])
+        q = item.u.pdispVal or item.u.punkVal
+        if hr != 0 or not q:
+            continue
+        h, hv = prop(q, "HWND")
+        url, _ = prop(q, "LocationURL")
+        nm, _ = prop(q, "LocationName")
+        shown += 1
+        print("      [%3d] HWND=%-10s(vt=%d, pid=%d)%s url=%s name=%s" % (
+            i, (hex(h) if isinstance(h, int) else None), hv,
+            pid_of(h) if isinstance(h, int) and h else 0,
+            " <= 本进程" if isinstance(h, int) and h and pid_of(h) == OUR_PID else "",
+            (url or "?")[:50], (nm or "?")[:14]))
+    if shown == 0:
+        print("      （队尾这 %d 项全是幽灵项）" % n)
+
+
+def scan_for(cab, leaf=None):
+    """扫一遍 ShellWindows，找这扇窗对应的项。认的方式依次是：
+      ① 清单报的 `HWND` == cab（跟 `ShellReg.PathOfWindow` 同一条路）；
+      ② 清单报的 `HWND` 属于**本进程**（收编之后它变成我们那个宿主窗口）。
+
+    ⚠ 实测（2026-09-25，干净环境）：`explorer.exe /n,/separate` 起的窗，**刚起来那一会儿**
+      在清单里是个幽灵项（`Count` 数得到 258 项、`Item(i)` 回空指针）⇒ 两种方式都认不出。
+      所以调用方要**等**（见主流程里的 phase 0）——先量出来它多久才变得可读。
+    新窗追加在清单**末尾**（见 MEMORY 24）⇒ 从队尾倒扫。
+    """
     p = new_shell_windows()
     if p is None:
         return None, "no-instance", "CoCreateInstance(ShellWindows) 失败"
@@ -237,27 +279,32 @@ def scan_for(cab, leaf):
         if cv.vt == VT_I4:
             total = cv.u.lVal
     idm, _ = get_dispid(p, "Item")
-    fallback, n_disp, n_int, head = None, 0, 0, []
+    mine, n_disp = [], 0
     for i in range(total - 1, -1, -1):
         hr, item, _ = invoke(p, idm, DISPATCH_METHOD, args=[vref(vint(i))])
         q = item.u.pdispVal or item.u.punkVal
         if hr != 0 or not q:
             continue
         n_disp += 1
-        h, _vt = prop(q, "HWND")
-        if h is not None:
-            n_int += 1
+        h, hv = prop(q, "HWND")
+        if not isinstance(h, int) or not h:
+            continue
         url, _ = prop(q, "LocationURL")
-        if len(head) < 6:
-            head.append((i, hex(h) if h else None, (url or "?")[:46]))
+        nm, _ = prop(q, "LocationName")
         if h == cab:
-            return q, "hwnd(i=%d)" % i, "清单 %d 项 / 有效对象 %d / HWND 可读 %d" % (total, n_disp, n_int)
-        if fallback is None and url and leaf and leaf in url.lower():
-            fallback = q
-    if fallback is not None:
-        return fallback, "url", "清单 %d 项 / 有效对象 %d / HWND 可读 %d" % (total, n_disp, n_int)
-    return None, "miss", "清单 %d 项 / 有效对象 %d / HWND 可读 %d；队尾 6 项：%s" % (
-        total, n_disp, n_int, head)
+            return q, "HWND==cab（i=%d/vt=%d）" % (i, hv), \
+                "清单 %d 项 / 有效对象 %d / 属于本进程 %d" % (total, n_disp, len(mine))
+        if pid_of(h) == OUR_PID:
+            mine.append((q, i, h, url, nm))
+    note = "清单 %d 项 / 有效对象 %d / 属于本进程 %d" % (total, n_disp, len(mine))
+    if not mine:
+        return None, "miss", note
+    if len(mine) == 1:
+        return mine[0][0], "本进程唯一一项 i=%d" % mine[0][1], note
+    hit = [m for m in mine if leaf and leaf in (m[3] or "").lower()]
+    if len(hit) == 1:
+        return hit[0][0], "按 url 命中 i=%d" % hit[0][1], note
+    return None, "ambiguous", note + "，分不清（%s）" % [(m[1], m[3]) for m in mine]
 
 
 def navigate(disp, url):
@@ -392,6 +439,22 @@ def explorer_pids():
     return out
 
 
+def procs_named(name):
+    s = k.CreateToolhelp32Snapshot(0x2, 0)
+    out = []
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k.Process32FirstW(s, byref(e))
+        while ok:
+            if e.szExeFile.lower() == name.lower():
+                out.append(e.th32ProcessID)
+            ok = k.Process32NextW(s, byref(e))
+    finally:
+        k.CloseHandle(s)
+    return out
+
+
 class STARTUPINFOW(ctypes.Structure):
     _fields_ = [("cb", wt.DWORD), ("lpReserved", wt.LPWSTR), ("lpDesktop", wt.LPWSTR),
                 ("lpTitle", wt.LPWSTR), ("dwX", wt.DWORD), ("dwY", wt.DWORD),
@@ -428,6 +491,55 @@ def to_signed32(v):
 
 
 # ==================== 主流程 ====================
+def cleanup(say, ctx, log):
+    """收尾必须**无条件**跑到。
+    ⚠ 本轮踩过：早退路径（`return`）跳过了收尾 ⇒ 桌面上留了一扇**可见**的 explorer 窗。
+    顺序：摘钩子 → WM_CLOSE 那扇窗 → 实在关不掉就先藏（绝不留在桌面上）→ 杀本次新起的 explorer。
+    """
+    cab, host, hook, baseline = ctx["cab"], ctx["host"], ctx["hook"], ctx["baseline"]
+    if hook:
+        try:
+            u.UnhookWinEvent(hook)
+        except Exception:
+            pass
+    for _ in range(3):
+        if not (cab and u.IsWindow(cab)):
+            break
+        u.PostMessageW(cab, WM_CLOSE, 0, 0)
+        pump()
+        time.sleep(0.7)
+    if cab and u.IsWindow(cab):
+        say("!! WM_CLOSE 关不掉它，改成先藏住（绝不能留在桌面上）")
+        u.ShowWindow(cab, SW_HIDE)
+        if host and u.IsWindow(host):
+            u.DestroyWindow(host)          # 销殁父窗会连子窗一起带走
+            time.sleep(0.4)
+        if cab and u.IsWindow(cab):
+            u.ShowWindow(cab, SW_HIDE)
+    for rnd in (1, 2, 3):
+        diff = sorted(explorer_pids() - baseline)
+        if not diff:
+            break
+        killed = []
+        for p in diff:
+            hp = k.OpenProcess(PROCESS_TERMINATE, False, p)
+            if hp:
+                k.TerminateProcess(hp, 0)
+                k.CloseHandle(hp)
+                killed.append(p)
+        say("清理第 %d 轮：结束 %s" % (rnd, killed))
+        time.sleep(0.9)
+    left = sorted(explorer_pids() - baseline)
+    stray = [h for h in cabs() if pid_of(h) in set(left)]
+    say("清理结果：残留 explorer %s；残留 cabinet 窗口 %s；本窗还在？%s"
+        % (left, [hex(h) for h in stray], bool(cab and u.IsWindow(cab))))
+    if host and u.IsWindow(host):
+        u.PostMessageW(host, WM_CLOSE, 0, 0)
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "navigate_reuse.out.txt")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(log) + "\n")
+
+
 def main(src, dst1, dst2):
     log = []
 
@@ -436,7 +548,14 @@ def main(src, dst1, dst2):
         log.append(s)
 
     ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    running = procs_named("TabbedExplorer.exe")
+    if running:
+        say("!! 有 TabbedExplorer 在跑（pid %s）—— 它会把我们新起的测试窗收编成标签，" % running)
+        say("   那样量到的一切都是被它干扰过的（会污染它的历史/记忆，导航也会改到它身上）。")
+        say("   先 `TabbedExplorer.exe --quit` 再来。")
+        return 3
     baseline = explorer_pids()
+    ctx = {"cab": None, "host": None, "hook": None, "baseline": baseline}
     # ⚠ 桌面 shell（pid 5712）自己就挂着好几扇可见顶层 CabinetWClass（桌面×2/文档/SelfDeviceCheck），
     #   所以「新窗」必须按**起跑前的窗口快照**判，另外再加一道「pid 不在起跑基线里」，
     #   免得把 shell 自己的窗当成我们的测试窗（那会当场把桌面/文档窗口藏掉）。
@@ -463,10 +582,12 @@ def main(src, dst1, dst2):
     hook = u.SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, None, cb, 0, 0,
                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
     say("CREATE 钩子 = %s" % (("0x%X" % (hook or 0)) if hook else "装不上(!)"))
+    ctx["hook"] = hook
 
     pi = create_process('explorer.exe /n,/separate,"%s"' % src)
     if pi is None:
         say("!! CreateProcessW 失败 err=%d" % k.GetLastError())
+        cleanup(say, ctx, log)
         return 2
     say("起 explorer 的 launcher pid=%d" % pi.dwProcessId)
 
@@ -489,28 +610,38 @@ def main(src, dst1, dst2):
     pump()
     if cab is None:
         say("!! 没等到新窗口")
+        cleanup(say, ctx, log)
         return 2
+    ctx["cab"] = cab
     say("窗口 cab=0x%X pid=%d 出现+%dms 文件列表+%s（这段就是按 + 之前要先等的那 0.24~1.28 秒）"
         % (cab, pid_of(cab), t_appear, ("%dms" % t_view) if t_view is not None else "-"))
     say("CREATE 钩子一共藏了 %d 次：%s" % (
         len(hides), [(hex(h), p, "%dms" % ((ts - t0) * 1000)) for h, p, ts in hides]))
 
     leaf = os.path.basename(src).lower()
-    t_scan = time.time()
-    disp, how, note = scan_for(cab, leaf)
-    say("ShellWindows 扫描：%dms，命中方式=%s（%s）" % ((time.time() - t_scan) * 1000, how, note))
-    if disp is None:
-        say("!! 清单里没有这扇窗 ⇒ 后面无从谈起")
-        return 2
+    say("-- 0) 等这扇窗在 ShellWindows 里变得可读（认不出就没法导航）--")
+    t_r = time.time()
+    note = "?"
+    while time.time() - t_r < SCAN_WAIT_S:
+        pump()
+        d0, how0, note = scan_for(cab, leaf)
+        if d0 is not None:
+            say("   +%dms 可读了：%s（%s）" % ((time.time() - t_r) * 1000, how0, note))
+            break
+        time.sleep(0.2)
+    else:
+        say("   等了 %ds 仍认不出（最后一次：%s）" % (SCAN_WAIT_S, note))
 
     host = u.CreateWindowExW(0, "Static", "TBEProbeHost", WS_POPUP_MASK, 0, 0, 800, 600,
                              None, None, k.GetModuleHandleW(None), None)
     say("宿主窗 host=0x%X（从不 SHOW）" % (host or 0))
+    ctx["host"] = host
+    cur = [None]        # 当前用的那个清单项（step 里更新，stat 用它看清单报的 HWND）
 
     def stat(tag):
         st = u.GetWindowLongW(cab, GWL_STYLE) & 0xFFFFFFFF
         ex = u.GetWindowLongW(cab, GWL_EXSTYLE) & 0xFFFFFFFF
-        hw, _ = prop(disp, "HWND")
+        hw = prop(cur[0], "HWND")[0] if cur[0] is not None else None
         say("   [%s] hwnd=0x%X pid=%d parent=0x%X style=0x%08X ex=0x%08X "
             "WS_VISIBLE=%s IsWindowVisible=%s host可见=%s defview=%s 清单报HWND=%s"
             % (tag, cab, pid_of(cab), u.GetParent(cab) or 0, st, ex,
@@ -519,10 +650,17 @@ def main(src, dst1, dst2):
                has_defview(cab) if u.IsWindow(cab) else "-", hex(hw) if hw else None))
 
     def step(name, url):
+        # 每一步都重新扫（收编前后清单里的可读性不一样）
+        disp2, how, note = scan_for(cab, leaf)
+        say("  [%s] 找窗：%s（%s）" % (name, how, note))
+        if disp2 is None:
+            say("  [%s] 清单里找不到这扇窗 ⇒ 这一步没得试" % name)
+            return None
+        cur[0] = disp2
         pid_before, parent_before = pid_of(cab), u.GetParent(cab)
-        say("  [%s] 导航前 LocationURL=%s 地址栏=%s"
-            % (name, (prop(disp, "LocationURL")[0] or "?")[:68], read_path(cab)))
-        m, hr, scode, call_ms = navigate(disp, url)
+        say("  [%s] 导航前 LocationURL=%s name=%s"
+            % (name, (prop(disp2, "LocationURL")[0] or "?")[:60], (prop(disp2, "LocationName")[0] or "?")))
+        m, hr, scode, call_ms = navigate(disp2, url)
         say("  [%s] %s('%s') -> hr=0x%08X scode=0x%08X 调用本身 %dms"
             % (name, m, url, hr & 0xFFFFFFFF, scode & 0xFFFFFFFF, call_ms))
         t1 = time.time()
@@ -534,7 +672,7 @@ def main(src, dst1, dst2):
                 say("  [%s] !!! 窗没了" % name)
                 return False
             if t_url is None:
-                cu, _ = prop(disp, "LocationURL")
+                cu, _ = prop(disp2, "LocationURL")
                 p = url_to_path(cu)
                 if p and p.lower().startswith(want):
                     t_url = (time.time() - t1) * 1000
@@ -548,7 +686,7 @@ def main(src, dst1, dst2):
         say("  [%s] 耗时：清单 LocationURL 变过来 %s / 窗内地址栏变过来 %s"
             % (name, ("%dms" % t_url) if t_url is not None else "超时未变",
                ("%dms" % t_addr) if t_addr is not None else "超时未变"))
-        say("  [%s] 导航后 LocationURL=%s" % (name, (prop(disp, "LocationURL")[0] or "?")[:68]))
+        say("  [%s] 导航后 LocationURL=%s" % (name, (prop(disp2, "LocationURL")[0] or "?")[:60]))
         say("  [%s] 同一扇窗？ hwnd=0x%X pid=%d(%s) parent=0x%X(%s)"
             % (name, cab, pid_of(cab), "未变" if pid_of(cab) == pid_before else "变了(换进程!)",
                u.GetParent(cab) or 0, "未变" if u.GetParent(cab) == parent_before else "变了!"))
@@ -556,6 +694,7 @@ def main(src, dst1, dst2):
         return t_url is not None
 
     say("-- A 顶层（已被藏住）时导航 --")
+    dump_tail(6, "A-前", cab)
     stat("A-前")
     a_ok = step("A", dst1)
 
@@ -567,45 +706,22 @@ def main(src, dst1, dst2):
     ex = u.GetWindowLongW(cab, GWL_EXSTYLE) & 0xFFFFFFFF
     u.SetWindowLongW(cab, GWL_EXSTYLE, to_signed32((ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW))
     say("   嵌入耗时 %dms（对照：程序里样式+SetParent 20~149ms）" % ((time.time() - tb) * 1000))
+    dump_tail(6, "B-后", cab)
     stat("B-后")
 
     say("-- C 嵌入之后再导航 --")
     c_ok = step("C", dst2)
 
     say("-- 结论 --")
-    say("A（顶层能导航）=%s   C（嵌入后能导航）=%s" % (a_ok, c_ok))
+    say("A（未收编、顶层）=%s   C（已 SetParent 成子窗）=%s" % (a_ok, c_ok))
     if c_ok:
         say("=> 备用窗口导航复用**可行**：同一扇窗、同一进程，直接 Navigate2 换目录。")
-    elif a_ok:
-        say("=> 通道本身通，但**嵌入之后就废了** ⇒ 要么导航时临时放回顶层，要么放弃这条路。")
+    elif c_ok is None:
+        say("=> 收编之后清单里照样认不出这扇窗 ⇒ **ShellWindows 这条导航路走不通**，得换别的拿 IWebBrowser2 的办法。")
     else:
-        say("=> 连顶层都导航不了 ⇒ ShellWindows 那套 Navigate2 指望不上，换思路。")
+        say("=> 认出来了但导航没生效 ⇒ 看上面的 hr / scode。")
 
-    # ---- 收尾 ----
-    if u.UnhookWinEvent and hook:
-        u.UnhookWinEvent(hook)
-    if u.IsWindow(cab):
-        u.PostMessageW(cab, WM_CLOSE, 0, 0)
-    time.sleep(0.8)
-    pump()
-    if u.IsWindow(cab):
-        u.PostMessageW(cab, WM_CLOSE, 0, 0)
-    time.sleep(0.6)
-    if host and u.IsWindow(host):
-        u.PostMessageW(host, WM_CLOSE, 0, 0)
-    say("STILL_OPEN: %d" % (1 if u.IsWindow(cab) else 0))
-    killed = []
-    for p in sorted(explorer_pids() - baseline):
-        hp = k.OpenProcess(PROCESS_TERMINATE, False, p)
-        if hp:
-            k.TerminateProcess(hp, 0)
-            k.CloseHandle(hp)
-            killed.append(p)
-    time.sleep(0.8)
-    say("清理：结束 %d 个本次新起的 explorer，残留 %s" % (len(killed), sorted(explorer_pids() - baseline)))
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "navigate_reuse.out.txt")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write("\n".join(log) + "\n")
+    cleanup(say, ctx, log)
     return 0
 
 

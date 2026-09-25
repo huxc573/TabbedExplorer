@@ -81,6 +81,24 @@ namespace TabbedExplorer
         private int pendingPid;
         private DateTime cabSeenAt;
 
+        /// <summary>
+        /// 这扇窗以后可能被「导航复用」（预热好的备用窗口就是）：得趁它还**没被 SetParent** 的时候
+        /// 把 `ShellWindows` 里的那一项抓住 —— 收编之后清单报回来的 HWND 变成我们的宿主窗体，
+        /// 一张桌面上的标签全撞成同一个句柄（见 `ShellBrowserReg.GrabWindowEntry`）。
+        /// 上层 `EmbedForm.WarmUp` 起备用窗口时置 true。
+        /// </summary>
+        public bool WantShellTarget { get; set; }
+
+        /// <summary>抓到的 `ShellWindows` 那一项 —— 备用窗口「换个目录再当标签用」全靠它。</summary>
+        public object ShellTarget { get; private set; }
+
+        /// <summary>下一次「试抓」的时刻（清单里先出现的是幽灵项，得隔一会儿再来）。</summary>
+        private DateTime grabAt = DateTime.MinValue;
+        /// <summary>两次试抓之间隔多久 —— 抓一次要跨进程问一遍清单，别每 25ms 都来。</summary>
+        private const int GrabRetryMs = 150;
+        /// <summary>抓那一项最多等这么久（实测窗口出现之后约 +1 秒才可读，留足余量）。</summary>
+        private const int ShellTargetWaitMs = 2500;
+
         /// <summary>这个标签左边要显示的图标（= 当前文件夹的图标，导航后自己会变）。</summary>
         public Bitmap TabIcon { get { return tabIcon; } }
         /// <summary>图标变了（刚嵌好 / 用户在里导航了）。</summary>
@@ -395,6 +413,21 @@ namespace TabbedExplorer
             bool viewReady = WinFind.ByClass(pendingCab, "SHELLDLL_DefView") != IntPtr.Zero;
             double waited = (DateTime.Now - cabSeenAt).TotalMilliseconds;
             if (!viewReady && waited < 1200) return;
+
+            // 备用窗口：趁它还是顶层窗，把 shell 清单里的那一项抓住（收编之后就对不上号了）。
+            // 一轮试一次、不阻塞 —— 新窗在清单里先是幽灵项，约 +1 秒才读得到。
+            // 试抓期间窗口一直藏在外面的（上面那句每轮都确保它藏着），不会露脸。
+            if (WantShellTarget && ShellTarget == null)
+            {
+                if (DateTime.Now >= grabAt)
+                {
+                    grabAt = DateTime.Now.AddMilliseconds(GrabRetryMs);
+                    ShellTarget = ShellBrowserReg.GrabWindowEntry(pendingCab);
+                    if (ShellTarget != null)
+                        Diag.Step("Embed: 抓到了这扇窗的 shell 清单项（备用窗口以后能直接导航复用）");
+                }
+                if (ShellTarget == null && waited < ShellTargetWaitMs) return;   // 还没进清单，下一轮再来
+            }
 
             Diag.Step(string.Format("Embed: 开始嵌入（文件列表{0}，发现后等了 {1}ms）",
                 viewReady ? "已就绪" : "还没建好/超时", (int)waited));

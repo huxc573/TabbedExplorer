@@ -872,12 +872,44 @@ namespace TabbedExplorer
         /// 「它就是我要的那个」的硬证据了）。调用方靠它决定还要不要再复核一遍 — 见 `ExplorerHost.OnPoll`。
         /// </summary>
         public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
-            bool relax, string wantedPath, out int pidOfFound, out bool matchedByPath)
+            bool relax, string wantedPath, int expectPid, out int pidOfFound, out bool matchedByPath)
         {
             pidOfFound = 0;
             matchedByPath = false;
             string wanted = (wantedPath != null && !relax) ? PathRules.Store(wantedPath) : null;
             List<CabSighting> list = ScanCabs();
+
+            // ⓪ 「这扇窗是不是**我起的那个进程**的」—— 比地址栏内容更硬的一条判据，
+            //    也是**重复目标**下唯一分得清谁是谁的办法：好几个标签开着同一个目录时，
+            //    「地址栏内容 == 我要开的路径」对它们**全都**成立，于是先认到窗的标签会把别人的窗抢走，
+            //    其余的要么等到 12 秒 relax 后就近凑一个（标签开成别的目录），要么 25 秒超时。
+            //    （实测：记忆里 10 个同目标的标签 ⇒ 8 次「等 explorer 窗口超时（25s）」+ 4 次「标签打开失败」。）
+            //    ⚠ `expectPid` 为 0、或者它是个「我们起之前就已经在跑的」进程，整段跳过 —— 行为跟从前一模一样。
+            if (expectPid != 0 && !pidsBefore.Contains(expectPid))
+            {
+                for (int i = 0; i < list.Count; i++)
+                {
+                    CabSighting c = list[i];
+                    if (c.Pid != expectPid) continue;
+                    if (cabsBefore.Contains(c.H)) continue;
+                    if (IsClaimed(c.H)) continue;
+                    if (wanted != null)
+                    {
+                        if (string.IsNullOrEmpty(c.Path))
+                        {
+                            // 是我们那扇窗，只是地址栏（比窗口晚约半秒到几秒才建好）还没读出来。
+                            // **就地继续等** —— 别顺手去认别人进程的窗，那正是「标签开成别的目录」的成因。
+                            // 等过头还有下面 12 秒 relax / 25 秒兜底。
+                            return IntPtr.Zero;
+                        }
+                        if (!PathRules.Same(c.Path, wanted)) continue;
+                        matchedByPath = true;
+                    }
+                    pidOfFound = c.Pid;
+                    return c.H;
+                }
+            }
+
             for (int i = 0; i < list.Count; i++)
             {
                 CabSighting c = list[i];

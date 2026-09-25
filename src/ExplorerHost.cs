@@ -79,6 +79,11 @@ namespace TabbedExplorer
         private readonly WinShowWatcher watcher = new WinShowWatcher();
         private IntPtr pendingCab = IntPtr.Zero;   // 已发现、已藏起、在等它加载完的那个窗口
         private int pendingPid;
+        /// <summary>
+        /// 我们`Process.Start` 起出来的那个 explorer 的 pid —— 归属判定的**第一判据**（见 `EmbedApi.FindNewCab`）。
+        /// 光看「地址栏内容 == 目标路径」在有重复目标时分不出谁是谁；0 = 没留住（那就退回老路）。
+        /// </summary>
+        private int launchedPid;
         private DateTime cabSeenAt;
 
         /// <summary>
@@ -191,6 +196,7 @@ namespace TabbedExplorer
         {
             TargetPath = path;
             startedAt = DateTime.Now;
+            launchedPid = 0;
             pidsBefore.Clear();
             foreach (Process p in Process.GetProcessesByName("explorer"))
             {
@@ -206,7 +212,15 @@ namespace TabbedExplorer
             try
             {
                 Diag.Step("Embed: 起 explorer " + arg);
-                Process.Start("explorer.exe", arg);
+                Process sp = Process.Start("explorer.exe", arg);
+                // 留住 pid：并发起好几个、或者几个标签开着同一个目录时，只有它能分得清「哪扇窗是我的」
+                //（见 `EmbedApi.FindNewCab` 里的 ⓪）。留不到也不影响 —— 那边会退回老路。
+                if (sp != null)
+                {
+                    try { launchedPid = sp.Id; }
+                    catch { launchedPid = 0; }
+                    finally { sp.Dispose(); }
+                }
             }
             catch (Exception ex)
             {
@@ -291,6 +305,7 @@ namespace TabbedExplorer
 
             adopted = true;
             TargetPath = null;
+            launchedPid = 0;          // 这扇不是我们起的，没有「我起的那个进程」可认
             startedAt = DateTime.Now;
             pendingCab = cab;
             pendingPid = pid;
@@ -367,7 +382,7 @@ namespace TabbedExplorer
                 // 并发起 explorer 时把「我要开哪个路径」交给扫描器，让它**只认地址栏对得上的那个窗口**
                 //（一次冒出好几个，不这么判就会抢到别人的窗口）；串行时传 null，走老路不判。
                 IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax,
-                    Settings.ParallelLaunch ? TargetPath : null, out pid, out byPath);
+                    Settings.ParallelLaunch ? TargetPath : null, launchedPid, out pid, out byPath);
                 // `byPath` = 上面那一扇是**按地址栏内容**命中的：也就是说「它就是我要开的那扇窗」
                 // 已经有硬证据了（那份内容由后台线程读的，见 `EmbedApi.ProbePath`）。那就别再在这里
                 // 重读一遍地址栏 —— 这一下是跨进程 `SendMessage`，对方忙的时候要几百毫秒，
@@ -395,7 +410,10 @@ namespace TabbedExplorer
                 }
 
                 Diag.Step(string.Format("Embed: 发现 cab=0x{0:X} pid={1}{2}，先藏起来（别让它闪）",
-                    cab.ToInt64(), pid, relax ? "（已放宽 pid 条件）" : ""));
+                    cab.ToInt64(), pid,
+                    (launchedPid != 0 && pid == launchedPid)
+                        ? "（按进程命中）"
+                        : (relax ? "（已放宽 pid 条件）" : "")));
                 pendingCab = cab;
                 pendingPid = pid;
                 EmbedApi.Claim(cab);       // 登记：Hub 那个「谁来都抓」的监听看见已登记就放手

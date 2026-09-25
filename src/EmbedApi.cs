@@ -546,8 +546,12 @@ namespace TabbedExplorer
         /// 所以改成「读出它要去哪儿 → 关掉它 → 用我们自己的 explorer 把同一个文件夹开成标签」。
         /// 地址栏是**唯一一条**「按手上这个 HWND 读、又拿得到当前文件夹」的路，理由见 FindAddressBand。
         ///
-        /// 读不到 / 读出来不是真目录（「此电脑」「主文件夹」这类虚拟位置）一律返回 null，
-        /// 调用方据此走「放手」那条路 —— 绝不能因为读不出来就把窗口晾成隐形的。
+        /// ⚠ 地址栏给出来的**不一定是路径**：已知文件夹（「图片」「视频」）与虚拟位置（「此电脑」）
+        /// 给的是**显示名**。所以读完先过 `PathRules.Store` 翻一遍，只有「翻完能交给 explorer 开」
+        /// 才返回；否则一律 null。「开始菜单点『资源管理器 / 图片 / 视频』毫无反应」就是这里只认
+        /// `Directory.Exists` 造成的：显示名连不成路径 ⇒ 全程判定「读不到」⇒ 窗口被放过。
+        /// 之所以宁可 null 也不能把原文交出去：调用方是**先关窗再开标签**（`TakeOverShellWindow`），
+        /// 交一个开不了的路径进去 = 原生窗没了、标签也没出来，比不动它糟得多。
         /// </summary>
         public static string AddressPathOf(IntPtr cab)
         {
@@ -561,7 +565,8 @@ namespace TabbedExplorer
                 if (i < 0) return null;
                 string p = raw.Substring(i + 2).Trim();
                 if (p.Length == 0) return null;
-                return System.IO.Directory.Exists(p) ? p : null;
+                string stored = PathRules.Store(p);          // 显示名 → `::` / `shell:` / 真路径
+                return PathRules.Restorable(stored) ? stored : null;
             }
             catch { return null; }
         }

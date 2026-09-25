@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace TabbedExplorer
@@ -11,9 +12,12 @@ namespace TabbedExplorer
     /// 地址栏给的**不是**永远都是路径：
     ///   - 真目录 → 完整路径（实测 `地址: D:\My Tools\TabbedExplorer`）；
     ///   - `此电脑` / `回收站` / `网络` 这种虚拟文件夹 → 就是那个**显示名**，拿去喂 explorer 是错的；
-    ///   - 库（比如 `视频`）→ 也是显示名，而且它压根不对应某个目录。
+    ///   - 库（`文档` / `图片` / `音乐` / `视频` 这四条默认库）→ 显示名，而且库本身是虚拟位置、没有目录；
+    ///   - **同名的那四个已知文件夹** → 也是显示名，但它**有**真身，只是被重定向到了别处
+    ///     （重定向位置因机而异、还可能在 OneDrive）。两者的地址栏文字一模一样，分不出来 ——
+    ///     一律按已知文件夹解出真路径（开始菜单那几个入口打开的就是它）。
     ///
-    /// 所以存之前先归一到 shell 认的写法（`::` / `shell:`），还原之前再验一遍
+    /// 所以存之前先归一到 shell 认的写法（`::` / `shell:` / 真路径），还原之前再验一遍
     /// 「这玩意儿开得开吗」—— 宁可不还原那一个标签，也别丢一个开不了的路径给 explorer
     /// （`explorer.exe "视频"` 会当成当前目录下的一个相对路径，指不定开到哪里去）。
     /// </summary>
@@ -34,6 +38,26 @@ namespace TabbedExplorer
                 { "Desktop",          "shell:Desktop" },
             };
 
+        /// <summary>
+        /// 已知文件夹：显示名 → FOLDERID。这几个**不能**像上面那样写 `shell:xxx` 常量，
+        /// 因为重定向位置因机而异（`shell:MyPictures` 这类老令牌在 Win10 上干脆解析不了，实测 0x80070003），
+        /// 而 `shell:::{GUID}` 解析出来是个**虚拟项**（取不到文件系统路径，跟窗口实际在看的那个文件夹不是一回事）。
+        /// 所以这里只存 GUID，真路径运行时问系统要（见 `KnownFolderPath`）。
+        /// 键只能写死 —— 它是本地化的显示名，没有「反查」的 API，中英文各留一份。
+        /// </summary>
+        private static readonly Dictionary<string, string> knownFolders =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "图片",      "{33E28130-4E1E-4676-835A-98395C3BC3BB}" },
+                { "Pictures",  "{33E28130-4E1E-4676-835A-98395C3BC3BB}" },
+                { "视频",      "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" },
+                { "Videos",    "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" },
+                { "音乐",      "{4BD8D571-6D19-48D3-BE97-422220080E43}" },
+                { "Music",     "{4BD8D571-6D19-48D3-BE97-422220080E43}" },
+                { "文档",      "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}" },
+                { "Documents", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}" },
+            };
+
         /// <summary>地址栏文字 → 存进记忆的值。认不出来的原样存（还原时再判）。</summary>
         public static string Store(string addr)
         {
@@ -42,7 +66,50 @@ namespace TabbedExplorer
             if (addr.Length == 0) return null;
             string v;
             if (virtuals.TryGetValue(addr, out v)) return v;
+            if (knownFolders.TryGetValue(addr, out v))
+            {
+                string real = KnownFolderPath(v);
+                if (real != null) return real;
+            }
             return addr;
+        }
+
+        private static readonly Dictionary<string, string> knownPaths =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object knownLock = new object();
+
+        // FOLDERID 就是 16 字节的 GUID，`System.Guid` 的内存布局跟它一致，可以直接按 ref 传。
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHGetKnownFolderPath(ref Guid rfid, uint flags, IntPtr token, out IntPtr ppszPath);
+
+        [DllImport("ole32.dll")]
+        private static extern void CoTaskMemFree(IntPtr p);
+
+        /// <summary>
+        /// 按 FOLDERID 问系统要真路径。问不出来返回 null（调用方退回「原样存」，还原时 `Restorable` 会挡掉）。
+        /// 结果缓存：这个函数在 `LivePath` / `IndexOfPath` 这些热路径上被调，不能每次现问。
+        /// </summary>
+        private static string KnownFolderPath(string guidText)
+        {
+            lock (knownLock)
+            {
+                string hit;
+                if (knownPaths.TryGetValue(guidText, out hit)) return hit.Length == 0 ? null : hit;
+                string real = null;
+                try
+                {
+                    Guid g = new Guid(guidText);
+                    IntPtr p;
+                    if (SHGetKnownFolderPath(ref g, 0, IntPtr.Zero, out p) == 0 && p != IntPtr.Zero)
+                    {
+                        try { real = Marshal.PtrToStringUni(p); }
+                        finally { CoTaskMemFree(p); }
+                    }
+                }
+                catch { real = null; }
+                knownPaths[guidText] = real ?? "";     // 空串 = 问过了、问不出来
+                return real;
+            }
         }
 
         /// <summary>这个值能不能直接交给 explorer.exe 去开。</summary>

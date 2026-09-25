@@ -64,6 +64,15 @@ namespace TabbedExplorer
         /// 体验不好，所以留成选择项、默认关。
         /// </summary>
         public static bool LazyTabs = false;
+        /// <summary>
+        /// 并发起 explorer（默认**开**）。
+        ///
+        /// 关着的时候是一个一个来（`EmbedForm.PumpLaunch` 从前只放一个）：开标签慢，但「新出现的窗口就是我的」
+        /// 这条不证自明，不用判归属。开着就一次放好几个 —— 快得多（实测 7 个标签从 8.4s 降到 ~2s），
+        /// 代价是每个标签得**自己证明那个窗口是它的**：等到地址栏能读了、内容正好是它要开的那个才认领
+        /// （见 `EmbedApi.FindNewCab` 的 wantedPath）。所以并发下每次起窗口会多等约 0.5s（等地址栏）。
+        /// </summary>
+        public static bool ParallelLaunch = true;
         public static ColorMode Color = ColorMode.System;
         public static int TabWidth = 112;
         /// <summary>
@@ -214,6 +223,7 @@ namespace TabbedExplorer
                     Capture      = ParseCapture(Json.Get(json, "capture"));
                     KeepTabs     = Json.GetBool(json, "keeptabs", true);
                     LazyTabs     = Json.GetBool(json, "lazytabs", false);
+                    ParallelLaunch = Json.GetBool(json, "parallel", true);
                     Color        = ParseColor(Json.Get(json, "theme"));
                     TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
@@ -280,6 +290,7 @@ namespace TabbedExplorer
                     case "capture":    Capture = ParseCapture(v); break;
                     case "keeptabs":   KeepTabs = ParseBool(v, true); break;
                     case "lazytabs":   LazyTabs = ParseBool(v, false); break;
+                    case "parallel":   ParallelLaunch = ParseBool(v, true); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
@@ -313,6 +324,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
                 sb.Append("  \"_captureshell\": \"true = 连桌面 shell 进程开的文件夹窗口也接管（先读出它的路径、像点 × 一样关掉它，再用我们自己的 explorer 开成标签）；false = 一个都不碰（从开始菜单/桌面双击打开的文件夹就不会进标签了）\",\r\n");
+                sb.Append("  \"_parallel\": \"true = 一次同时起多个 explorer（开标签快得多；每个标签靠地址栏内容证明那个窗口是它的）；false = 一个一个来（慢但最简单）\",\r\n");
                 sb.Append("  \"_lazytabs\": \"true = 还原标签时只把当时选中那个真起出来、其它点开才加载（省开程序那一下的等待）；false = 一次全起出来（默认）\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
@@ -323,6 +335,7 @@ namespace TabbedExplorer
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"lazytabs\": ").Append(LazyTabs ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"parallel\": ").Append(ParallelLaunch ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
@@ -368,8 +381,8 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} theme={3} tabwidth={4} autowiden={5} autofit={6} favbar={7} captureall={8} captureshell={9} winsize={10} vtabs={11} vtabsfold={12} vpanealpha={13} debug={14} hotkeys={15}",
-                Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, Text(Color), TabWidth,
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16}",
+                Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, Debug ? 1 : 0, hotkeys.Count);
@@ -457,6 +470,7 @@ namespace TabbedExplorer
         public static void SetColor(ColorMode m) { Color = m; Save(); }
         public static void SetKeepTabs(bool on) { KeepTabs = on; Save(); }
         public static void SetLazyTabs(bool on) { LazyTabs = on; Save(); }
+        public static void SetParallelLaunch(bool on) { ParallelLaunch = on; Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }

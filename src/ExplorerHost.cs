@@ -28,8 +28,18 @@ namespace TabbedExplorer
         /// <summary>嵌入窗口顶部那条空白的像素高度（explorer 留给标题栏/QAT 的，子窗口画不出来）。</summary>
         public int TopBlank { get; private set; }
 
+        /// <summary>正在收编（SetParent 那一套）—— 这一步只能在 UI 线程上串行做，上层拿它当「忙」看。</summary>
+        public bool Attaching { get; private set; }
+
         /// <summary>嵌好了（此时才看得到内容）。</summary>
         public event EventHandler Ready;
+        /// <summary>
+        /// 窗口已经认下来了（还在嵌的路上）。**并发起标签时靠它放行下一个 explorer** ——
+        /// 从「窗口到手」到「嵌好」中间还有 1 秒多的收编工作（见 `AttachWindow` 的耗时步进），
+        /// 那段只能在一个 UI 线程上串行做；要是等它做完才放行，起进程的并发就白搭了
+        ///（实测：等收编完再放行，总耗时和串行一模一样）。
+        /// </summary>
+        public event EventHandler Claimed;
         /// <summary>起不来（超时等）。</summary>
         public event EventHandler Failed;
         /// <summary>这个标签里 explorer 的标题变了（用户在里面导航、或进了别的目录）。</summary>
@@ -302,10 +312,18 @@ namespace TabbedExplorer
 
             if (pendingCab == IntPtr.Zero)
             {
-                // 4 秒还没找到就放宽「进程必须新」这条（万一 shell 复用了老进程建窗口）
-                bool relax = (DateTime.Now - startedAt).TotalSeconds > 4;
+                // 等太久就放宽「地址栏必须对得上」这条（万一地址栏一直读不出来）。
+                // ⚠ 这个门槛别调小：放宽之后是「**随便哪个**还没被认领的新窗口都要」，一次还原起好几个
+                //   explorer 时那几个窗口互相抢资源，本机实测地址栏最晚能到 5.7 秒才可读 ——
+                //   4 秒就放宽的话，先到点的标签会把别人还没认领的窗口抢走，**标签就开成别的文件夹了**
+                //   （实测看到过「起的是 pt-seeder、标题却是 SelfDeviceCheck」）。宁可多等，也别配错。
+                //   12 秒仍远早于下面 25 秒的失败兜底。
+                bool relax = (DateTime.Now - startedAt).TotalSeconds > 12;
                 int pid;
-                IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax, out pid);
+                // 并发起 explorer 时把「我要开哪个路径」交给扫描器，让它**只认地址栏对得上的那个窗口**
+                //（一次冒出好几个，不这么判就会抢到别人的窗口）；串行时传 null，走老路不判。
+                IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax,
+                    Settings.ParallelLaunch ? TargetPath : null, out pid);
                 if (cab != IntPtr.Zero && !relax && !CabMatches(cab, TargetPath))
                 {
                     // 找到了一个窗口，但地址栏显示的不是我们要开的那个 —— 十有八九是
@@ -335,6 +353,7 @@ namespace TabbedExplorer
                 EmbedApi.Claim(cab);       // 登记：Hub 那个「谁来都抓」的监听看见已登记就放手
                 ExplorerPid = pid;         // 还没嵌进来就被关掉时，Close() 靠它收进程
                 cabSeenAt = DateTime.Now;
+                RaiseClaimed();            // 「起进程」这条道空出来了，后面的标签可以接着起
             }
 
             // shell 自己可能又 ShowWindow 一次，所以每一轮都确保它是藏着的
@@ -353,6 +372,7 @@ namespace TabbedExplorer
             IntPtr cab2 = pendingCab;
             int pid2 = pendingPid;
             pendingCab = IntPtr.Zero;
+            Attaching = true;
             AttachWindow(cab2, pid2);
         }
 
@@ -384,6 +404,14 @@ namespace TabbedExplorer
             EmbedApi.ShowWindow(h, SW_HIDE);
             Diag.Step(string.Format("Embed: 新窗口刚显示就藏掉 cab=0x{0:X} pid={1}（事件后 {2}ms）",
                 h.ToInt64(), pid, Environment.TickCount - tick));
+
+            // 认领（+ 盯上）这件事**只在串行时**能当场做：一个一个起的时候「新出现的就是我的」不证自明。
+            // 并发起的时候一次冒出好几个窗口，而这一刻它们的地址栏还没建出来 —— 根本分不出谁是谁；
+            // 当场认领就是从前那个「互相认错、标签页点开是空的」的老毛病。所以并发时这里只负责**藏**，
+            // 归属交给 25ms 轮询那边按地址栏内容判（见 OnPoll / EmbedApi.FindNewCab）。
+            // 藏错也无害：真正的属主自己也会藏它，而且它认领之前本来也不该露面。
+            if (Settings.ParallelLaunch) return;
+
             EmbedApi.Claim(h);          // 先登记再往下走：Hub 的监听（如果插在我们前面）一看已登记就不抢了
             pendingCab = h;
             pendingPid = pid;
@@ -393,6 +421,10 @@ namespace TabbedExplorer
 
         private void AttachWindow(IntPtr cab, int pid)
         {
+            // 收编是**整条还原流水线里最贵的一步**，而且只能在我们那一个 UI 线程上串行做，
+            // 所以它的耗时直接决定「一次还原 N 个标签」的下限。这里逐段记一下，
+            // 别再去猜是 SetParent 慢还是 shell 登记慢（debug 打开才写）。
+            DateTime tA = DateTime.Now;
             poll.Stop();
             watcher.Dispose();          // 盯上了、要嵌进来了，不用再听系统广播
             try
@@ -407,6 +439,7 @@ namespace TabbedExplorer
                 //   不摘的话嵌进来的标签**永远是隐形的** —— 比闪一下严重得多，所以就在这里兜住。
                 EmbedApi.ClearTransparent(cab);
 
+                DateTime tB = DateTime.Now;
                 // 顺序不能反：先改样式，再 SetParent
                 uint child = EmbedApi.ToChildStyle(origStyle);
                 EmbedApi.SetStyle(cab, child);
@@ -415,11 +448,13 @@ namespace TabbedExplorer
                 Diag.Step(string.Format("Embed: 接管 cab=0x{0:X} pid={1} style 0x{2:X8}->0x{3:X8}",
                     cab.ToInt64(), pid, origStyle, child));
 
+                DateTime tC = DateTime.Now;
                 // 让 shell 以后别再把这扇窗当成「这个文件夹已经开着的那扇窗」（见 ShellBrowserReg 的类注释）：
                 // 不然三方程序再点「打开文件夹」时 shell 只会去激活这扇已被我们收编的窗，
                 // 不建新窗、也不给我们任何事件 —— 用户看到的就是「点了没反应、标签没切」。
                 ShellBrowserReg.ExcludeOurs(true);
 
+                DateTime tD = DateTime.Now;
                 // 防闪流程里 cab 一直是藏着的，这时量出来的空白可能是 0，先按它摆一下位置即可；
                 // 真正的值以「现身之后」那次为准（下面 + settle 定时器）。
                 TopBlank = EmbedApi.TopBlankOf(cab);
@@ -433,16 +468,27 @@ namespace TabbedExplorer
                 if (tb != TopBlank) { TopBlank = tb; LayoutCab(true); }
                 Diag.Step("Embed: 顶部空白 = " + TopBlank + "px");
                 settle.Start();
+
+                DateTime tE = DateTime.Now;
                 RefreshIcon(true);          // 接手时先要一颗图标（当前文件夹的）
                 RefreshPath();              // 也先要一次当前路径
+
+                DateTime tF = DateTime.Now;
+                Diag.Step(string.Format(
+                    "Embed: 收编耗时 准备{0}ms 样式+SetParent{1}ms shell登记{2}ms 布局{3}ms 图标+路径{4}ms（合计 {5}ms）",
+                    (int)(tB - tA).TotalMilliseconds, (int)(tC - tB).TotalMilliseconds,
+                    (int)(tD - tC).TotalMilliseconds, (int)(tE - tD).TotalMilliseconds,
+                    (int)(tF - tE).TotalMilliseconds, (int)(tF - tA).TotalMilliseconds));
 
                 Focus();
                 lastTitle = CurrentDisplayName;
                 titlePoll.Start();
+                Attaching = false;
                 RaiseReady();
             }
             catch (Exception ex)
             {
+                Attaching = false;
                 LastError = "嵌入失败: " + ex.Message;
                 Diag.Log("Embed: " + LastError);
                 RaiseFailed();
@@ -857,6 +903,12 @@ namespace TabbedExplorer
         private void RaiseReady()
         {
             EventHandler h = Ready;
+            if (h != null) h(this, EventArgs.Empty);
+        }
+
+        private void RaiseClaimed()
+        {
+            EventHandler h = Claimed;
             if (h != null) h(this, EventArgs.Empty);
         }
 

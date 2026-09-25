@@ -157,6 +157,11 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("懒加载标签页（还原时先只开当前那个，其它点开才加载）",
                        () => Settings.LazyTabs,
                        () => hub.SetLazyTabs(!Settings.LazyTabs))));
+            // ③″ 并发起 explorer（默认开）：一次同时起多个，开标签 / 还原标签快得多。
+            //     关了就是「一个一个来」（慢，但归属判定最简单）—— 留着它当退路。
+            n.Add(WinOnly(Leaf("并发起标签页（一次同时起多个，开标签更快）",
+                       () => Settings.ParallelLaunch,
+                       () => hub.SetParallelLaunch(!Settings.ParallelLaunch))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。
@@ -249,6 +254,11 @@ namespace TabbedExplorer
             // 这个是**动作**（现在立刻把当前各桌面的标签存一次）。自动保存本来就有
             // （改动攒 800ms 落盘 + 退出前再存），所以手动这一下只在「怕它没来得及存」时用。
             n.Add(WinOnly(Leaf("立即记住当前标签（平时自动记，这个是手动存一次）", null, () => hub.RememberNow())));
+            // 重启本程序：改完设置想让它从头走一遍（比如验「懒加载」到底有没有生效）时点它。
+            // 它是**动作**不是开关；记忆由退出那条路落盘，重启后原样还原。
+            // ⚠ notice 给 null：重启就是当场退出，那句提示根本来不及显示（RebuildAfter 会推后一轮重建，
+            //    而退出消息已经在队里了）。
+            n.Add(WinOnly(Act("重启本程序", delegate { hub.RestartApp(); }, null)));
             n.Add(Info("数据目录：程序目录\\data（settings / desktops / history / favorites 四个 json）"));
             // 用户问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
             // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：

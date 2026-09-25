@@ -693,11 +693,19 @@ namespace TabbedExplorer
             if (pendingCapture.Count == 0 && pendingShell.Count == 0) { captureTimer.Stop(); return; }
             DateTime now = DateTime.Now;
             List<IntPtr> ready = null;
-            foreach (KeyValuePair<IntPtr, CaptureCandidate> kv in new List<KeyValuePair<IntPtr, CaptureCandidate>>(pendingCapture))
+            // 并发起 explorer 期间**先别收**：那批窗口有大约半秒是「还没认领」的 ——
+            // 并发的归属判定要等地址栏读出来（见 EmbedApi.FindNewCab），所以「700ms 之后它肯定已被
+            // 自己那个标签认领」这条前提在那半秒里不成立，照收就会把我们自己起的窗口当成
+            // 「用户新开的」再收一个重复标签进来。等这一批起完再收，代价只是我们把
+            // 用户自己开的那个窗口多晾一两秒（它本来就在屏幕上，用户看得到）。
+            if (!AnyLaunchInFlight())
             {
-                if ((now - kv.Value.SeenAt).TotalMilliseconds < CaptureDelayMs) continue;
-                if (ready == null) ready = new List<IntPtr>();
-                ready.Add(kv.Key);
+                foreach (KeyValuePair<IntPtr, CaptureCandidate> kv in new List<KeyValuePair<IntPtr, CaptureCandidate>>(pendingCapture))
+                {
+                    if ((now - kv.Value.SeenAt).TotalMilliseconds < CaptureDelayMs) continue;
+                    if (ready == null) ready = new List<IntPtr>();
+                    ready.Add(kv.Key);
+                }
             }
             if (ready == null) return;
             foreach (IntPtr h in ready)
@@ -991,6 +999,63 @@ namespace TabbedExplorer
             if (Settings.LazyTabs == on) return;
             Settings.SetLazyTabs(on);
             RefreshTrayMenu();
+        }
+
+        /// <summary>
+        /// 并发起 explorer。**立刻生效**（看下一次起标签），所以只刷一下菜单勾选。
+        /// </summary>
+        public void SetParallelLaunch(bool on)
+        {
+            if (Settings.ParallelLaunch == on) return;
+            Settings.SetParallelLaunch(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 并发起 explorer -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
+        /// 重启本程序（设置里那一项）。
+        ///
+        /// 顺序不能反：**先起新进程、再退自己** —— 单实例锁是我们退出那一刻才放开的，
+        /// 所以新进程带 `--restart-wait &lt;我们的 pid&gt;`，它会先等我们退干净再抢锁
+        /// （不然它把自己当成「第二个实例」，转头去 Set 唤醒事件然后自杀，看着就是「点了重启、程序没了」）。
+        /// 标签记忆由 `Quit()` 落盘，这里不用另存。
+        ///
+        /// 新进程的可见性跟着现在走：窗口正开着就 `--open`（重启完还在眼前，正好看效果 / 验懒加载），
+        /// 收在托盘里就 `--tray`（不无缘无故弹窗、不抢前台）。
+        /// </summary>
+        public void RestartApp()
+        {
+            try
+            {
+                bool visible = false;
+                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                {
+                    if (f != null && !f.IsDisposed && f.Visible) { visible = true; break; }
+                }
+                int pid = Process.GetCurrentProcess().Id;
+                string exe = Application.ExecutablePath;
+                string args = (visible ? "--open" : "--tray") + " --embed --restart-wait " + pid;
+                Diag.Step("Hub: 重启本程序 -> " + args);
+                Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false });
+            }
+            catch (Exception ex)
+            {
+                // 新进程没起来就**先别退**，否则用户两头空（旧程序没了、新的也没来）
+                Diag.Log("Hub: 重启失败 " + ex.Message);
+                Toast.Show("重启失败", ex.Message);
+                return;
+            }
+            Quit("重启本程序");
+        }
+
+        /// <summary>现在有标签正等着 explorer 起来吗（任何一张桌面）。见 DrainCapture 的那道闸。</summary>
+        private bool AnyLaunchInFlight()
+        {
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f != null && !f.IsDisposed && f.LaunchInFlight) return true;
+            }
+            return false;
         }
 
         /// <summary>标签页宽度（逻辑像素）。立刻重排所有标签条。</summary>

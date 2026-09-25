@@ -417,28 +417,55 @@ namespace TabbedExplorer
             lock (claims) { if (h != IntPtr.Zero) claims.Remove(h); }
         }
 
+        /// <summary>扫到的一扇「可能是我们要的」浏览窗口：句柄、属主 pid、地址栏读出来的路径。</summary>
+        public sealed class CabSighting
+        {
+            public IntPtr H;
+            public int Pid;
+            /// <summary>地址栏读出来的路径；地址栏还没建好时是 null。</summary>
+            public string Path;
+        }
+
+        // 这份缓存是「并发起标签页能不能真的变快」的关键，别删。
+        //
+        // 为什么必须有：等待窗口的那套轮询（`ExplorerHost.OnPoll`，25ms 一跳）**每个标签各一份，
+        // 而且全都跑在同一个 UI 线程上**。而一轮扫描要 `EnumWindows` 走一遍全屏顶层窗、
+        // 每个窗问一次跨进程 `GetClassNameW` —— 本机实测 723 个顶层窗时一轮 4.5ms。
+        // 4 个标签并发等窗口 ⇒ 每 25ms 里 18ms 都花在扫屏上（UI 线程占 72%），
+        // 嵌入、布局、重绘全排在它后面 ⇒ 并发起的那几个 explorer 反被自己的轮询拖住，
+        // 单窗就绪从 1.0s 涨到 2.9~5.8s，四路并发白干（实测总耗时跟串行一样）。
+        // 共用这一份之后同一遍扫描 40ms 内只做一次，占用降到十几%。
+        private static List<CabSighting> scanCache;
+        private static DateTime scanAt = DateTime.MinValue;
+        private static readonly object scanLock = new object();
+        private const int ScanFreshMs = 40;
+
         /// <summary>
-        /// 扫顶层窗口，找出「刚冒出来的」文件夹窗口 —— 也就是**我们刚叫起来的那个**。
+        /// 扫一遍顶层窗口，把「新出现、不是 shell 自己的、还没被谁认领」的文件夹窗口连同
+        /// 各自地址栏里的路径一起交出来。结果缓存 `ScanFreshMs`，让同时等窗口的几个标签
+        /// 共用同一遍扫描（理由见上面 `scanCache` 那段）。
+        ///
         /// 三条刻意的设计：
         ///   · **不看可见性**：我们可能已经把它藏起来了（怕它闪），藏了也得认得出来；
         ///   · **不枚举进程列表**：这个函数 25ms 就要跑一次，`GetProcessesByName` 太贵，
         ///     而窗口只能由进程建出来，直接扫窗口就够了（有窗口 ⇒ 进程必然存在）；
         ///   · 排掉两种「本来就在那儿的东西」：**启动基线**上的窗口（他早就开着的）
         ///     和**已被认领**的窗口（我们自己另一个标签已经收走的）。
-        ///     `pidsBefore` 参数留着不用了 —— 见上面基线那段，按进程判会串台；
-        ///     `relax` 的含义现在只是「不做地址校验」（见 ExplorerHost.OnPoll）。
         /// </summary>
-        public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
-            bool relax, out int pidOfFound)
+        public static List<CabSighting> ScanCabs()
         {
-            IntPtr found = IntPtr.Zero;
-            int foundPid = 0;
+            lock (scanLock)
+            {
+                if (scanCache != null && (DateTime.Now - scanAt).TotalMilliseconds < ScanFreshMs)
+                    return scanCache;
+            }
+
+            List<CabSighting> list = new List<CabSighting>();
             EnumWindowsProc cb = null;
             cb = delegate(IntPtr h, IntPtr l)
             {
                 string c = ClassOf(h);
                 if (c != "CabinetWClass" && c != "ExploreWClass") return true;
-                if (cabsBefore.Contains(h)) return true;
                 if (IsBaseline(h)) return true;
                 if (IsClaimed(h)) return true;
                 // shell 进程自己的窗口绝不能被当成「我们要嵌的那个」——理由见 IsShellOwned。
@@ -447,13 +474,47 @@ namespace TabbedExplorer
                 if (IsShellOwned(h)) return true;
                 int p = ProcessIdOf(h).ToInt32();
                 if (p == 0) return true;
-                found = h; foundPid = p;
-                return false;
+                list.Add(new CabSighting { H = h, Pid = p, Path = AddressPathOf(h) });
+                return true;
             };
             EnumWindows(cb, IntPtr.Zero);
             GC.KeepAlive(cb);
-            pidOfFound = foundPid;
-            return found;
+
+            lock (scanLock) { scanCache = list; scanAt = DateTime.Now; }
+            return list;
+        }
+
+        /// <summary>
+        /// 从上面那份扫描结果里挑出「这个标签要的那一扇」。
+        ///
+        /// `pidsBefore` 参数留着不用了 —— 按进程判会串台（见 `IsBaseline` 那段）。
+        /// `relax` 的含义是「不做地址校验」；`wantedPath` 为 null 时也不校验（串行时只有一个候选）。
+        /// </summary>
+        public static IntPtr FindNewCab(HashSet<IntPtr> cabsBefore, HashSet<int> pidsBefore,
+            bool relax, string wantedPath, out int pidOfFound)
+        {
+            pidOfFound = 0;
+            string wanted = (wantedPath != null && !relax) ? PathRules.Store(wantedPath) : null;
+            List<CabSighting> list = ScanCabs();
+            for (int i = 0; i < list.Count; i++)
+            {
+                CabSighting c = list[i];
+                if (cabsBefore.Contains(c.H)) continue;
+                if (IsClaimed(c.H)) continue;
+                // 「这扇窗是不是我要开的那个」—— 并发起 explorer 时**必须**判这一条：
+                // 一次冒出好几个窗口，「新出现的就是我的」不再成立，谁抢到谁的窗是随机的
+                //（那正是从前不能并发的原因）。判据 = 它地址栏读出来的路径正好是我们要开的那个；
+                // **读不出来时一律不算**（地址栏比窗口晚约半秒才建好），这样它自己的属主才有机会认领。
+                // 串行时（wanted 为 null）不判 —— 只有一个候选，省掉那半秒。
+                if (wanted != null)
+                {
+                    if (string.IsNullOrEmpty(c.Path)) continue;
+                    if (!PathRules.Same(c.Path, wanted)) continue;
+                }
+                pidOfFound = c.Pid;
+                return c.H;
+            }
+            return IntPtr.Zero;
         }
 
         [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]

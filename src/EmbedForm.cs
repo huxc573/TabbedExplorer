@@ -107,8 +107,25 @@ namespace TabbedExplorer
             public bool Warm;
         }
         private readonly Queue<Launch> launchQueue = new Queue<Launch>();
-        /// <summary>现在正在起（还没 Ready / Failed）的那个 —— 一次只允许有一个。</summary>
-        private ExplorerHost launching;
+        /// <summary>
+        /// 现在正在起（还没 Ready / Failed）的那批 —— 同时最多 <see cref="MaxConcurrentLaunch"/> 个。
+        ///
+        /// 从前这里是「一个 `ExplorerHost launching`、一次只放一个」。改成一批的理由：串行时
+        /// 一个标签要 1.2 秒（起进程 0.5s + 等地址栏/文件列表 0.5s+），7 个标签就是 8.4 秒，实测过。
+        /// 并发之后那一秒几乎全被叠掉了。
+        ///
+        /// ⚠ 并发的**代价**在归属判定上：一个一个来的时候「新出现的窗口就是我的」不证自明；
+        /// 一次冒出好几个就必须让每个标签**自己证明**哪个窗口是它的 —— 见
+        /// `EmbedApi.FindNewCab` 的 wantedPath 与 `ExplorerHost.OnPoll`。
+        /// 所以关了 `Settings.ParallelLaunch` 就是退回那套最简（也最慢）的老路。
+        /// </summary>
+        private readonly HashSet<ExplorerHost> launchingSet = new HashSet<ExplorerHost>();
+
+        /// <summary>
+        /// 一批最多同时起几个 explorer。不设上限的话「还原 20 个标签」会一口气冒出 20 个
+        /// explorer.exe（每个几十 MB），而且它们全在同一秒里抢着建窗口，判定压力也白涨。
+        /// </summary>
+        private const int MaxConcurrentLaunch = 4;
 
         /// <summary>
         /// 预热好的备用窗口（已经嵌好、藏在容器里不显示）。
@@ -1512,31 +1529,39 @@ namespace TabbedExplorer
         /// （显示「打开中…」+ 目标路径），内容各填各的 —— 浏览器也是这个样子。
         ///
         /// 队列空了就去**预热一个备用窗口**（见 WarmUp）：下次「新建标签页」不用再等进程起来。
+        ///
+        /// `Settings.ParallelLaunch` 开着时一次放 `MaxConcurrentLaunch` 个（互相认错的问题由
+        /// 「地址栏内容必须对上」那条判据兜住，见 `EmbedApi.FindNewCab`）。
         /// </summary>
         private void PumpLaunch()
         {
             if (IsDisposed || Disposing) return;
-            if (launching != null) return;
-            while (launchQueue.Count > 0)
+            int cap = Settings.ParallelLaunch ? MaxConcurrentLaunch : 1;
+            while (launchQueue.Count > 0 && launchingSet.Count < cap)
             {
                 Launch j = launchQueue.Dequeue();
                 if (j.Host == null) continue;
                 // 备用窗口不在 hosts 里，别把它当「排队期间被关掉了」扔掉
                 if (!j.Warm && !hosts.Contains(j.Host)) continue;
-                launching = j.Host;
-                Diag.Step("EmbedForm: 起 explorer（串行）" + j.Path);
+                if (!launchingSet.Add(j.Host)) continue;
+                Diag.Step("EmbedForm: 起 explorer" + (Settings.ParallelLaunch ? "（并发 " + launchingSet.Count + "/" + cap + "）" : "（串行）") + j.Path);
                 j.Host.Start(j.Path);
-                return;
             }
-            WarmUp();      // 队列空了：提前把下一个「新建标签页」的窗口准备出来
+            // 队列空、手里也没有在起的 → 预热下一个「新建标签页」的窗口
+            if (launchQueue.Count == 0 && launchingSet.Count == 0) WarmUp();
         }
 
-        /// <summary>一个标签起完了（成了 / 失败了）—— 轮到队列里的下一个。</summary>
+        /// <summary>一个标签起完了（成了 / 失败了）—— 给队列里的下一个腾位置。</summary>
         private void LaunchDone(ExplorerHost h)
         {
-            if (launching != h) return;
-            launching = null;
+            if (!launchingSet.Remove(h)) return;
             PumpLaunch();
+        }
+
+        /// <summary>现在手里还有正在起的 explorer（Hub 收编窗口前要看这个，见 DrainCapture）。</summary>
+        internal bool LaunchInFlight
+        {
+            get { return launchingSet.Count > 0 || launchQueue.Count > 0; }
         }
 
         // ------------------------------------------------------------------
@@ -1553,9 +1578,17 @@ namespace TabbedExplorer
 
         private bool CanWarm()
         {
-            return !IsDisposed && !Disposing && !Quitting
-                   && reserve == null && !reserveReady
-                   && launching == null && launchQueue.Count == 0;
+            if (IsDisposed || Disposing || Quitting) return false;
+            if (reserve != null || reserveReady) return false;
+            if (launchingSet.Count != 0 || launchQueue.Count != 0) return false;
+            // 已经认下来、还在收编路上的那些也算「忙」：收编是整条流水线最贵的一步，
+            // 这时候再塞一个备用窗口进去，就是在一堆刚起来的 explorer 上又加一个，
+            // 只会把最后几个标签拖慢。
+            for (int i = 0; i < hosts.Count; i++)
+            {
+                if (hosts[i].Attaching) return false;
+            }
+            return true;
         }
 
         private void WarmUp()
@@ -1577,7 +1610,7 @@ namespace TabbedExplorer
             reserve = null;
             reserveReady = false;
             if (h == null) return;
-            if (launching == h) launching = null;
+            launchingSet.Remove(h);
             try
             {
                 content.Controls.Remove(h.Host);
@@ -1653,6 +1686,7 @@ namespace TabbedExplorer
             h.SetIconTarget(TabStrip.TabIconSize);      // 告诉它图标画多大（设备像素）
 
             h.Ready += delegate(object s, EventArgs e) { OnHostReady(h); };
+            h.Claimed += delegate(object s, EventArgs e) { LaunchDone(h); };
             h.Failed += delegate(object s, EventArgs e) { OnHostFailed(h); };
             h.TitleChanged += delegate(object s, EventArgs e) { OnHostTitleChanged(h); };
             h.IconChanged += delegate(object s, EventArgs e) { OnHostIconChanged(h); };
@@ -1699,7 +1733,7 @@ namespace TabbedExplorer
                 h.Focus();
             }
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
-            LaunchDone(h);   // 这一个起完了，队列里的下一个可以动了
+            LaunchDone(h);   // 兜底：正常早就在 `Claimed` 那一步放行过了（见那个事件的注释）
         }
 
         /// <summary>
@@ -1872,10 +1906,9 @@ namespace TabbedExplorer
             }
             catch (Exception ex) { Diag.Log("EmbedForm: 关标签失败 " + ex.Message); }
 
-            // 关掉的正好是「正在起」的那个：队列得往前走，不然后面排着的全卡住
-            if (launching == h)
+            // 关掉的正好是「正在起」的那几个之一：给队列里的下一个腾位置，不然后面排着的全卡住
+            if (launchingSet.Remove(h))
             {
-                launching = null;
                 Diag.Step("EmbedForm: 正在起的那个被关了，队列继续");
                 PumpLaunch();
             }

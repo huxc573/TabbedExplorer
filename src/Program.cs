@@ -38,6 +38,15 @@ namespace TabbedExplorer
         /// </summary>
         public static bool QuitRequested;
 
+        /// <summary>
+        /// 命令行 `--restart-wait &lt;pid&gt;`：**先把那个 pid 等退出**，再往下走（抢单实例锁）。
+        ///
+        /// 给设置里的「重启本程序」用：重启是**先起新进程、再让老进程退**（老进程要先落盘标签记忆），
+        /// 而单实例锁是老进程退出时才放开的 —— 新进程不等一下就会把自己当成「第二个实例」，
+        /// 转头去 Set 唤醒事件然后自杀，看起来就是「点了重启，程序没了」。
+        /// </summary>
+        public static int RestartWaitPid;
+
         public static string QuitSignalName
         {
             get { return EmbedMode ? "TabbedExplorer.Quit.v1" : "TabbedExplorer.Quit.classic.v1"; }
@@ -128,8 +137,31 @@ namespace TabbedExplorer
                 if (string.Equals(args[i], "--classic", StringComparison.OrdinalIgnoreCase)) EmbedMode = false;
                 if (string.Equals(args[i], "--tray", StringComparison.OrdinalIgnoreCase)) StartHidden = true;
                 if (string.Equals(args[i], "--quit", StringComparison.OrdinalIgnoreCase)) QuitRequested = true;
+                if (string.Equals(args[i], "--restart-wait", StringComparison.OrdinalIgnoreCase) &&
+                    i + 1 < args.Length)
+                {
+                    int.TryParse(args[i + 1], out RestartWaitPid);
+                    i++;
+                }
             }
             if (AutoOpen) StartHidden = false;   // --open 想看效果，就别藏着
+
+            // --restart-wait <旧 pid>：等那个实例真退出再往下走。
+            // 必须在抢互斥体**之前** —— 它退出的那一刻锁才放开（见 RestartWaitPid 的注释）。
+            if (RestartWaitPid != 0)
+            {
+                try
+                {
+                    using (System.Diagnostics.Process old =
+                           System.Diagnostics.Process.GetProcessById(RestartWaitPid))
+                    {
+                        Diag.Step("--restart-wait: 等旧实例 pid=" + RestartWaitPid + " 退出");
+                        bool gone = old.WaitForExit(20000);
+                        Diag.Step("--restart-wait: " + (gone ? "旧实例已退出" : "等超时了（照常往下走）"));
+                    }
+                }
+                catch (Exception ex) { Diag.Step("--restart-wait: 等旧实例失败（多半已经退了）" + ex.Message); }
+            }
 
             // --quit：不启界面，只把“真退出”的信号发给已经在跑的那个，然后自己就退。
             // 放在判重之前 —— 它本来就不需要拿单实例锁。

@@ -511,9 +511,12 @@ namespace TabbedExplorer
                 else
                 {
                     // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE。
-                    // ⚠ 传 isShow：「不进任务栏」那两位只能在 SHOW 那一次打 —— CREATE 就打上的话
-                    //   explorer 会不建 Ribbon、退回老式菜单栏（内嵌窗口顶上那条白条，见 MakeTransparent）。
+                    // ⚠ CREATE 那一次**不能**打「不进任务栏」那两位 —— explorer 见着它就**不建 Ribbon**、
+                    //   退回老式菜单栏（内嵌窗口顶上那条白条，见 MakeTransparent）；
+                    //   可等 SHOW 事件到了才补又太晚（任务栏已经按「可见那一帧」加了按钮、图标闪一下）。
+                    //   中间那段时机交给 ScheduleTaskbarBits：Ribbon 一建出来就补（见那边的实测时间线）。
                     EmbedApi.MakeTransparent(h, isShow);
+                    if (!isShow) EmbedApi.ScheduleTaskbarBits(h);
                     bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
                     if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
 

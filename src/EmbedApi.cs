@@ -168,14 +168,15 @@ namespace TabbedExplorer
         ///   「加载时状态栏显示系统资源管理器图标、完成后消失」）。带 `WS_EX_TOOLWINDOW` 的窗口
         ///   任务栏与 Alt+Tab 都不收，所以顺手打上它、摘掉 `WS_EX_APPWINDOW`。
         ///
-        /// ★ `taskbarBits` = 要不要动任务栏那两位。**调用方只在 SHOW 那一次传 true**：
+        /// ★ `taskbarBits` = 要不要动任务栏那两位。**CREATE 那一次必须传 false**，补法见
+        ///   `ScheduleTaskbarBits`：
         ///   ⚠ explorer 建窗时看到 `WS_EX_TOOLWINDOW` 就**不建 Ribbon**，于是退回显示老式菜单栏
         ///   —— 内嵌窗口顶上那条 `文件(F) 编辑(E) 查看(V) 工具(T)` 白条就是这么来的。
         ///   物证：`probe/embed_menubar_state.py` 逐版回代，v1.14.0（还没打这一位）内嵌窗口顶上
         ///   和原生窗口一样是 Ribbon 25px、没有老式菜单栏；从打了这一位的那版起变成
         ///   「没有 Ribbon + 老式菜单栏 20px」，一直到现在。
-        ///   放到 SHOW 那一次再打就没事 —— Ribbon 那会儿早建好了，而窗口是被 CREATE 那次就置了
-        ///   透明的、紧接着还会被 `SW_HIDE`，所以任务栏那一刀照样来得及。
+        ///   SHOW 那一次仍会传 true 兜一下 —— 但那时窗口已经可见，任务栏多半已经按那一帧加了
+        ///   按钮，真正的时机是 `ScheduleTaskbarBits` 守的那段空档。
         ///
         /// ⚠ 收编进标签之前 / 放它走之前**必须** `ClearTransparent`，
         ///   否则嵌进来的窗口会永远是隐形的（这个坑比闪一下严重得多）。
@@ -189,6 +190,64 @@ namespace TabbedExplorer
                 if (taskbarBits) want = (want | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
                 if (want != ex) SetExStyle(h, want);
                 if ((ex & WS_EX_LAYERED) == 0) SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 「不进任务栏」那两位的**延后一刻**：等 explorer 把 Ribbon 建出来、而窗口还没露脸时补上。
+        ///
+        /// 为什么必须延后（`probe/ribbon_timing_probe.py` 量的新窗时间线）：
+        ///   +0ms    窗口出现，ex 里没有 `WS_EX_TOOLWINDOW`   ← 此刻 explorer 还没决定建 Ribbon
+        ///   +242ms  Ribbon 出现
+        ///   +625ms  窗口变可见                                ← 任务栏按这一帧的样式加了按钮
+        ///   +698ms  SHOW 事件才到我们手里 ⇒ 那时补已经晚了一帧
+        /// 两头都是硬约束：建窗那一次就带 TOOLWINDOW ⇒ explorer 不建 Ribbon（顶上那条白条）；
+        /// 等 SHOW 事件才补 ⇒ 任务栏已经按「可见那一帧」加了按钮（图标闪一下）。
+        /// 中间那 383ms 是唯一的空档 —— 本函数就守在那儿：轮询到 Ribbon 出现（说明 explorer
+        /// 已经决定建它了）且窗口还没显示，立刻补上两位。
+        ///
+        /// ⚠ 判据用 `WS_EX_LAYERED` 当「我们动过这扇窗」的记号（跟 <see cref="ClearTransparent"/> 一致）：
+        ///   窗口已经没了 / 已经被收编成子窗口 / 没被我们置过透明，一律不动 —— 这函数也可能
+        ///   被别的路径的候选窗口捎带上，碰错窗口（尤其是 shell 自己那扇）是明令禁止的。
+        /// </summary>
+        public static void ScheduleTaskbarBits(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            System.Threading.Thread th = new System.Threading.Thread(delegate()
+            {
+                try
+                {
+                    for (int i = 0; i < 60; i++)            // 一轮 20ms，最多等 1.2 秒
+                    {
+                        if (!NativeMethods.IsWindow(h)) return;
+                        if (GetParent(h) != IntPtr.Zero) return;          // 已被收编 ⇒ 任务栏早不管它
+                        if (IsWindowVisible(h)) { ApplyTaskbarBits(h); return; }   // 已经露脸，补总比不补强
+                        if (WinFind.ByClass(h, "UIRibbonCommandBarDock") != IntPtr.Zero)
+                        {
+                            ApplyTaskbarBits(h);
+                            return;
+                        }
+                        System.Threading.Thread.Sleep(20);
+                    }
+                    ApplyTaskbarBits(h);                    // 兜底：这窗口压根不建 Ribbon 的类型
+                }
+                catch { }
+            });
+            th.IsBackground = true;
+            th.Name = "TBE-任务栏标记";
+            th.Start();
+        }
+
+        /// <summary>真去改那两位。见 <see cref="ScheduleTaskbarBits"/> 的时机说明。</summary>
+        private static void ApplyTaskbarBits(IntPtr h)
+        {
+            try
+            {
+                uint ex = GetExStyle(h);
+                if ((ex & WS_EX_LAYERED) == 0) return;      // 不是我们置过透明的窗口，别碰
+                uint want = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+                if (want != ex) SetExStyle(h, want);
             }
             catch { }
         }

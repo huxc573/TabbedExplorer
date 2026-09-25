@@ -123,8 +123,66 @@ namespace TabbedExplorer
             catch (Exception ex) { Diag.Log("ShellReg: 失败 " + ex.Message); }
         }
 
+        /// <summary>
+        /// 问 shell「你这扇窗口现在开着哪个文件夹」（`LocationURL`），按 HWND 对上号。
+        ///
+        /// 为什么要多这一条路：接管 shell 自己开的窗口时，地址栏那条（`EmbedApi.AddressPathOf`）
+        /// 得**等窗口把地址栏建出来**——实测 shell 先把窗显示出来、地址栏才慢慢填好，那扇窗
+        /// 因此在屏幕上实打实露半秒到一秒（用户报的「从开始菜单点文件夹还是会闪」）。
+        /// 这条不问窗口本体、直接问 shell 的浏览器清单，建窗那一刻就有答案，于是能在它露脸
+        /// **之前**就把 `SC_CLOSE` 发出去。**纯读，一个字节都不改它。**
+        ///
+        /// ⚠ 只能用于**我们没碰过的窗口**（shell 自己开的那些）：清单里 `HWND` 报的是浏览器窗的
+        ///   顶层窗，被我们 `SetParent` 收编之后它会变成我们的宿主窗体——一张桌面上的标签全撞成
+        ///   同一个 key（见 `ExplorerHost` 里那段）。shell 那条路我们从不 SetParent，句柄才对得上。
+        /// ⚠ 回来还要过同一套筛子（`PathRules.Store` → `Restorable`）：`LocationURL` 对「此电脑」
+        ///   这类虚拟位置给的不是 `file:///` 路径，直接交出去会让调用方「先关窗再开标签」两头空。
+        /// </summary>
+        internal static string PathOfWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return null;
+            try
+            {
+                Application.OleRequired();
+                Type t = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (t == null) return null;
+                IDispatch root = Activator.CreateInstance(t) as IDispatch;
+                if (root == null) return null;
+
+                int total = ReadInt(root, "Count");
+                for (int i = 0; i < total; i++)
+                {
+                    IDispatch item = ReadItem(root, i);
+                    if (item == null) continue;
+                    if (ReadHwnd(item) != hwnd) continue;      // 不是这一扇
+                    string p = FileUrlToPath(ReadString(item, "LocationURL"));
+                    if (p == null) return null;
+                    string stored = PathRules.Store(p);
+                    return PathRules.Restorable(stored) ? stored : null;
+                }
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 读窗口当前目录失败 " + ex.Message); }
+            return null;
+        }
+
+        /// <summary>
+        /// `file:///D:/Dev/!tmp/` → `D:\Dev\!tmp`。认不出来的（UNC / 虚拟位置 / 别的协议）返回 null ——
+        /// 宁可退回地址栏那条路，也不要交一个可能开不出来的字符串出去。
+        /// </summary>
+        private static string FileUrlToPath(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return null;
+            if (!url.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return null;
+            string s = url.Substring(5);
+            if (s.StartsWith("///")) s = s.Substring(3);      // file:///D:/… → D:/…
+            else return null;                                  // file://server/… 之类：不猜，交给地址栏
+            s = Uri.UnescapeDataString(s);
+            s = s.Replace('/', '\\').TrimEnd('\\');
+            return (s.Length >= 3 && s[1] == ':') ? s : null;  // 必须是 D:\ 这种盘符开头
+        }
+
         // ==================================================================
-        // IDispatch 那点活儿：只有属性读一个整数 / 读 lstItem / 写一个布尔，够用就行
+        // IDispatch 那点活儿：只有属性读一个整数 / 读 lstItem / 读一个字符串 / 写一个布尔，够用就行
         // ==================================================================
 
         private static int ReadInt(IDispatch d, string name)
@@ -184,6 +242,19 @@ namespace TabbedExplorer
                 if (o == null) return IntPtr.Zero;
                 long h = Convert.ToInt64(o);
                 return h == 0 ? IntPtr.Zero : new IntPtr(h);
+            }
+            finally { Marshal.FreeCoTaskMem(v); }
+        }
+
+        /// <summary>读一个 `BSTR` 属性（`LocationURL`）。拿不到就当空。</summary>
+        private static string ReadString(IDispatch d, string name)
+        {
+            IntPtr v = Marshal.AllocCoTaskMem(VarSize);
+            try
+            {
+                Zero(v, VarSize);
+                object o = Invoke(d, name, DISPATCH_PROPERTYGET, v, IntPtr.Zero, 0);
+                return o as string;
             }
             finally { Marshal.FreeCoTaskMem(v); }
         }

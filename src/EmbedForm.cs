@@ -1305,6 +1305,36 @@ namespace TabbedExplorer
             for (int i = 0; i < hosts.Count; i++)
                 if (hosts[i] != restFirstHost) StartDeferred(i);
             Diag.Step("记忆: 优先那个已落定，其余标签开始排队（共 " + hosts.Count + " 个）");
+            // ★ 顺手把备用窗口也排到队尾（见 WarmUpQueued）：等这一批全落定再预热要十几秒，
+            //   那段时间里按 `+` 都得现起 explorer。
+            WarmUpQueued();
+        }
+
+        /// <summary>
+        /// 把「备用窗口」直接排进**队尾**，不等这一批标签全起完（见 <see cref="StartRestNow"/>）。
+        ///
+        /// 为什么值当：`+` 号全靠备用窗口才「秒开」（见 <see cref="UseReserve"/>），而备用窗口
+        /// 原来只有等**所有**标签都落定后 `PumpLaunch` 才去预热 —— 实测从「从开始菜单打开目录」
+        /// 那一刻算起，备用窗口要 15 秒才就绪（预热在 +11.3s、就绪在 +14.9s），这十几秒里按 `+`
+        /// 都得现起一个 explorer（用户报的「按+号也好慢」）。排进队尾之后它跟着这一批一起轮转，
+        /// 标签结束前后就有货了。
+        ///
+        /// ⚠ 只在「队列里已经有活」时叫它。`CanWarm` 那条 `!LaunchInFlight` 防的是「本批标签还在
+        ///   收编时又塞一个 explorer 进去抢 CPU」；排进**队尾**不存在抢在谁前面——起进程本来就是
+        ///   900ms 一格按时间放行的（见 SpawnSlotMs）。
+        /// </summary>
+        private void WarmUpQueued()
+        {
+            if (reserve != null || reserveReady) return;
+            if (IsDisposed || Disposing || Quitting) return;
+            if (DateTime.Now < warmRetryAt) return;      // 刚失败过：别在冷却期里再来一个
+            ExplorerHost h = CreateHost();
+            reserve = h;
+            reserveReady = false;
+            h.PresetTarget(ExplorerView.ThisPcPath);
+            Diag.Step("EmbedForm: 备用标签排进队尾（让 + 号早点能秒开）");
+            launchQueue.Enqueue(new Launch { Host = h, Path = ExplorerView.ThisPcPath, Warm = true });
+            PumpLaunch();
         }
 
         /// <summary>

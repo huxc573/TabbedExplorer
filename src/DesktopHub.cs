@@ -650,8 +650,12 @@ namespace TabbedExplorer
             }
             // 先当场试一次：shell 是先导航后显示，SHOW 那一刻地址栏多半已经填好了 ——
             // 能读出来就直接收，那扇窗在屏幕上只短暂露一下。
-            // （CREATE 那一刻也走这条路：那时地址栏通常还没填，于是进 pendingShell、每 250ms 再看。）
-            string now = EmbedApi.AddressPathOf(h, true);
+            // ★ 先问 shell 自己的浏览器清单（`ShellWindows.LocationURL`）：这条在**建窗那一刻**
+            //   就有答案，而地址栏得等窗口把那一排工具条建出来。多这一问，就是为了在那扇窗
+            //   露脸**之前**把它 SC_CLOSE 掉 —— 用户报的「从开始菜单点文件夹还是会闪」就是
+            //   只读地址栏造成的（实测地址栏就绪时它早就可见了）。
+            string now = ShellBrowserReg.PathOfWindow(h);
+            if (now == null) now = EmbedApi.AddressPathOf(h, true);
             if (now != null) { TakeOverShellWindow(h, now, react); return; }
             pendingShell[h] = new ShellCandidate { SeenAt = DateTime.Now, ReactMs = react };
             if (captureTimer != null && !captureTimer.Enabled) captureTimer.Start();
@@ -675,7 +679,9 @@ namespace TabbedExplorer
                 }
                 // force：别吃「这个窗口还没有地址栏」那条 1.2 秒的负缓存 —— 我们正 250ms 一轮
                 // 盯着它看，而超时也是 1.2 秒，缓存一命中就注定读不出来（见 AddressPathOf）。
-                string path = EmbedApi.AddressPathOf(h, true);
+                // 先问清单（快、建窗即有），再退回地址栏。
+                string path = ShellBrowserReg.PathOfWindow(h);
+                if (path == null) path = EmbedApi.AddressPathOf(h, true);
                 if (path == null)
                 {
                     // 还没填好地址栏（少见：正常是 SHOW 之前就填好了）—— 再看看，到点就不管它了
@@ -689,7 +695,7 @@ namespace TabbedExplorer
                 pendingShell.Remove(h);
                 // 这行专为回答「到底有没有赶在它露脸之前动手」：报「还没显示」就是抢在了 SHOW 前面
                 Diag.Step(string.Format(
-                    "Hub: shell 窗口地址栏就绪（登记后 {0}ms，当时{1}）cab=0x{2:X} -> {3}",
+                    "Hub: shell 窗口路径就绪（登记后 {0}ms，当时{1}）cab=0x{2:X} -> {3}",
                     (int)(now - kv.Value.SeenAt).TotalMilliseconds,
                     EmbedApi.IsWindowVisible(h) ? "已可见" : "还没显示", h.ToInt64(), path));
                 TakeOverShellWindow(h, path, kv.Value.ReactMs);

@@ -56,6 +56,10 @@ namespace TabbedExplorer
         private static DateTime lastRun = DateTime.MinValue;
         private static readonly TimeSpan minInterval = TimeSpan.FromSeconds(2);
 
+        /// <summary>上一遍登记的数字 + 上一次写日志的时刻（见下面那行日志的节流）。</summary>
+        private static int lastTotal = -1, lastMine = -1;
+        private static DateTime lastLog = DateTime.MinValue;
+
         /// <summary>
         /// 「这段时间内谁也别登记」的截止时刻（见 <see cref="KeepQuiet"/>）。
         ///
@@ -128,8 +132,21 @@ namespace TabbedExplorer
                     if (PutBool(item, "RegisterAsBrowser", true)) done++;
                 }
 
-                if (done != mine) Diag.Log(string.Format("ShellReg: 清单 {0} 项，本进程 {1} 项，登记成功 {2} 项", total, mine, done));
-                else Diag.Step(string.Format("ShellReg: 清单 {0} 项，本进程 {1} 项已登记", total, mine));
+                if (done != mine)
+                {
+                    Diag.Log(string.Format("ShellReg: 清单 {0} 项，本进程 {1} 项，登记成功 {2} 项", total, mine, done));
+                    lastLog = DateTime.Now;
+                }
+                // ⚠ 这行原来**每 2 秒写一遍**（本函数挂在 500ms 心跳上、内部 2 秒节流），而清单那两百多项
+                //   里绝大多数跟我们无关 —— 平时它只是把同样的数字刷进 log.txt，每行一次 open/write/close。
+                //   改成「数字变了、或隔了半分钟」才写：真出事时照样看得到它在跑，平时不吵（也少一笔落盘）。
+                else if (total != lastTotal || mine != lastMine || (DateTime.Now - lastLog).TotalSeconds >= 30)
+                {
+                    Diag.Step(string.Format("ShellReg: 清单 {0} 项，本进程 {1} 项已登记", total, mine));
+                    lastLog = DateTime.Now;
+                }
+                lastTotal = total;
+                lastMine = mine;
             }
             catch (Exception ex) { Diag.Log("ShellReg: 失败 " + ex.Message); }
         }

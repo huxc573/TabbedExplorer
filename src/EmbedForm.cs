@@ -278,10 +278,12 @@ namespace TabbedExplorer
             };
 
             favBar = new FavBar();
-            favBar.ItemClicked += delegate(string path)
+            favBar.ItemClicked += delegate(FavNode nd)
             {
-                Diag.Step("EmbedForm: 书签 -> " + path);
-                NewTab(path);
+                Diag.Step("EmbedForm: 书签 -> " + nd.Path);
+                // ★ 首帧就把**书签上那个名字**摆上去（起 explorer 实测 0.7~1.8 秒，标签条上显示
+                //   「打开中…」还是显示书签名，直接决定用户觉得快不快）—— 跟还原记忆标签同一招。
+                NewTab(nd.Path, nd.Display, true);
             };
             // 顶上 / 最左边那枚书签图标：
             //   横排 = 开**书签管理器**（用户：原来点是开数据目录，改成「管理书签」）；
@@ -1627,8 +1629,15 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        /// <summary>用户按 + / Ctrl+T、或从书签/历史开一个 —— 起个新标签并立刻切过去。</summary>
-        private void NewTab(string path) { NewTab(path, null, true); }
+        /// <summary>
+        /// 用户按 + / Ctrl+T、或从书签 / 历史 / 「转生」开一个 —— 起个新标签并立刻切过去。
+        ///
+        /// 首帧标题给「这个文件夹的名字」，而不是留在 `AddHost` 的「打开中…」：起 explorer 到内容
+        /// 出来实测 **0.7~1.8 秒**，这段时间标签条上显示什么，直接决定用户觉得快不快（跟还原
+        /// 记忆标签同一个道理，见 `RestoreRememberedTabs`）。书签那条路还会用**书签自己的名字**盖过去
+        /// （见上面 `favBar.ItemClicked`）。
+        /// </summary>
+        private void NewTab(string path) { NewTab(path, PathRules.Friendly(PathRules.Store(path)), true); }
 
         /// <summary>
         /// 开一个新标签（内容由 `launchQueue` 在后台填）。

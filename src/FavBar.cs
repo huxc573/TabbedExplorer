@@ -136,9 +136,14 @@ namespace TabbedExplorer
         private bool inactive;
         private Color TheBack { get { return inactive ? Theme.ChromeOff : Theme.Chrome; } }
 
-        public delegate void PathEventHandler(string path);
-        /// <summary>点了某一项 —— 参数是那个**文件夹**路径（新标签页开它）。</summary>
-        public event PathEventHandler ItemClicked;
+        /// <summary>
+        /// 项上松手（文件夹书签）= 让宿主把它开成新标签。
+        /// 传**节点**而不是光一个路径：标签条首帧要显示的就是 `Node.Display` —— 用户在手改过书签名之后，
+        /// 他认的是书签上那个名字，不是目录名（文件夹名往往还带个 `-dist` 之类的后缀）。
+        /// </summary>
+        public delegate void NodeEventHandler(FavNode node);
+        /// <summary>点了某一**项书签**（文件夹）—— 宿主把它开成新标签页。</summary>
+        public event NodeEventHandler ItemClicked;
         /// <summary>点了最左边那枚书签图标（EmbedForm 拿它开书签管理器）。</summary>
         public event EventHandler LeadClicked;
         /// <summary>右键选了「管理书签…」。</summary>
@@ -712,7 +717,7 @@ namespace TabbedExplorer
             string p = items[i].Node.Path;
             if (FavStore.IsFolder(p))
             {
-                if (ItemClicked != null) ItemClicked(p);      // 文件夹 → 新标签
+                if (ItemClicked != null) ItemClicked(items[i].Node);      // 文件夹 → 新标签
                 return;
             }
             try
@@ -842,7 +847,7 @@ namespace TabbedExplorer
                     string p = k.Path;
                     r.Add(PopMenu.It(k.Display, delegate
                     {
-                        if (FavStore.IsFolder(p)) { if (ItemClicked != null) ItemClicked(p); }
+                        if (FavStore.IsFolder(p)) { if (ItemClicked != null) ItemClicked(k); }
                         else
                         {
                             try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
@@ -882,7 +887,7 @@ namespace TabbedExplorer
                 else
                 {
                     if (FavStore.IsFolder(p))
-                        m.Add(PopMenu.It("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(p); }));
+                        m.Add(PopMenu.It("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(it.Node); }));
                     else
                         m.Add(PopMenu.It("用默认程序打开", delegate
                         {

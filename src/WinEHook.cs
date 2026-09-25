@@ -38,6 +38,9 @@ namespace TabbedExplorer
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
+        private const int VK_LMENU = 0xA4;     // 低级钩子报的是左右分开的那个
+        private const int VK_RMENU = 0xA5;
+        private const int VK_F10 = 0x79;
         private const int VK_E = 0x45;
         private const int VK_1 = 0x31;      // 主键盘的 1..9（Ctrl+1..9 = 第 N 个标签）
         private const int VK_9 = 0x39;
@@ -147,6 +150,17 @@ namespace TabbedExplorer
             {
                 Raise(WinE);
                 return true;
+            }
+
+            // Alt / F10 = Windows 里「把菜单栏叫出来」的标准手势。我们默认把内嵌窗口那条
+            // 菜单栏压成 0 高度（不收就会留一条白条，见 `EmbedApi.CollapseMenuBar`），所以这里
+            // 递个话：接下来几秒内把它**还原**给 explorer 自己的菜单逻辑（菜单开着期间一直不收）。
+            // 只在我们窗口在前台时递（在别的程序里按 Alt 不该把我们的菜单栏放出来 —— Alt+Tab
+            // 每天都在按）；而且**绝不吞这个键**：Alt 上还有 Alt+Tab / Alt+F4 一堆系统组合。
+            if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU || vk == VK_F10)
+            {
+                if (OursIsForeground()) EmbedApi.LetGoMenuBar(EmbedApi.MenuLetGoMs);
+                return false;
             }
 
             bool ctrl = Down(VK_CONTROL);

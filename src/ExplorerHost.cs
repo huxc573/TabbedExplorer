@@ -511,7 +511,7 @@ namespace TabbedExplorer
                 // 用户报的「多出这个白条、我关不掉」就是它。详见 EmbedApi.CollapseMenuBar 的类注释。
                 // 必须在「现身之后」做：藏着的窗口 explorer 还没排版，那时量到的位置不可信。
                 if (EmbedApi.CollapseMenuBar(cab))
-                    Diag.Step("Embed: 收起菜单栏（原生窗口里这条是收着的，内嵌之后 explorer 把它立起来了）");
+                    Diag.Step("Embed: 收起了菜单栏（原生窗口里这条是收着的，内嵌之后 explorer 把它立起来了）");
                 settle.Start();
 
                 DateTime tE = DateTime.Now;
@@ -557,7 +557,7 @@ namespace TabbedExplorer
                 LayoutCab(true);
             }
             if (EmbedApi.CollapseMenuBar(CabWindow))
-                Diag.Step("Embed: 又收起了一次菜单栏（explorer 惰性排版把它立起来过）");
+                Diag.Step("Embed: 菜单栏又动了一下（explorer 惰性排版把它立起来过 / 他按 Alt 要它出来）");
         }
 
         /// <summary>
@@ -800,10 +800,11 @@ namespace TabbedExplorer
 
             // 兜住「explorer 自己重排之后又把菜单栏立起来」：改窗口尺寸就会发生一次，
             // 而它的重排是异步的（`LayoutCab` 当场补那一下常常赶在它前面）。
-            // 这行平时只是几条便宜的查询 —— `GetWindowRect` / `IsWindowVisible` 都不发消息，
-            // 真要动手时才写窗口（藏 + 把文件视图撑回去）。
+            // 反过来，用户按 Alt / F10 时这一句会把菜单栏**还回去**（见 EmbedApi.CollapseMenuBar）。
+            // 平时只是几条便宜的查询 —— `GetWindowRect` / `IsWindowVisible` 都不发消息，
+            // 真要动手时才写窗口（压高度 / 把文件视图撑回全高）。
             if (EmbedApi.CollapseMenuBar(CabWindow))
-                Diag.Step("Embed: 又收起了一次菜单栏（explorer 重排把它立起来过）");
+                Diag.Step("Embed: 菜单栏动了一下（收起来 / 他按 Alt 要它出来）");
 
             string t = CurrentDisplayName;
 

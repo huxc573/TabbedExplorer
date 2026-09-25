@@ -429,9 +429,57 @@ namespace TabbedExplorer
 
         private static readonly HashSet<IntPtr> claims = new HashSet<IntPtr>();
 
+        // 「用户点名要原生」的那几扇窗 —— 在关掉之前永不收编。
+        //
+        // 场景 = 标签右键「用原生资源管理器打开」（`DesktopHub.OpenNative`）。那边原来只记一个
+        // **到点作废的让行期**，而一扇新窗会先后报两条事件（CREATE / SHOW）—— 第一条把凭据吃掉，
+        // 第二条就没人拦了：用户看到的就是「刚开出来的原生窗，一会儿又被收成标签」（川报的就是这个）。
+        // 所以凭据之外再认下**窗口本身**。
+        //
+        // 为什么挂在 `IsClaimed` 上而不是另加一处判定：所有「该不该碰这扇窗」的口
+        // （`IsHideCandidate` / `IsShellTakeoverCandidate` / `IsCapturable` / `ScanCabs` / `FindNewCab`）
+        // 第一句问的都是它 —— 挂在这儿一处就够，几条路自动全绕开。
+        private static readonly Dictionary<IntPtr, DateTime> keeps = new Dictionary<IntPtr, DateTime>();
+
+        /// <summary>认下这一扇「用户要的原生窗口」：直到它关掉为止都不收编（见 keeps 那段）。</summary>
+        public static void MarkNativeKeep(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            lock (keeps)
+            {
+                // 句柄会被系统复用，所以隔一阵把已经不在的条目清掉 —— 留着就可能认错人
+                // （把一扇新窗当成「那扇原生窗」放过去）。
+                if (keeps.Count > 16)
+                {
+                    List<IntPtr> gone = null;
+                    foreach (IntPtr k in keeps.Keys)
+                    {
+                        if (NativeMethods.IsWindow(k)) continue;
+                        if (gone == null) gone = new List<IntPtr>();
+                        gone.Add(k);
+                    }
+                    if (gone != null) for (int i = 0; i < gone.Count; i++) keeps.Remove(gone[i]);
+                }
+                keeps[h] = DateTime.Now;
+            }
+        }
+
+        private static bool IsNativeKeep(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            lock (keeps)
+            {
+                if (!keeps.ContainsKey(h)) return false;
+                if (NativeMethods.IsWindow(h)) return true;
+                keeps.Remove(h);        // 窗口已经没了：这一条作废（句柄可能被复用，不能一直认着）
+                return false;
+            }
+        }
+
         public static bool IsClaimed(IntPtr h)
         {
-            lock (claims) { return claims.Contains(h); }
+            lock (claims) { if (claims.Contains(h)) return true; }
+            return IsNativeKeep(h);      // 用户点名要原生的也算「已认领」（见 keeps 那段）
         }
 
         public static void Claim(IntPtr h)
@@ -1073,9 +1121,19 @@ namespace TabbedExplorer
         // 我们内嵌的窗口里它被撑成 20px —— 因为原生窗口顶上有 Ribbon（`UIRibbonCommandBarDock`
         // 25px），而降级成 `WS_CHILD` 之后 Ribbon 根本没建出来，explorer 就退回「显示菜单栏」。
         //
-        // 为什么不能只 `ShowWindow(SW_HIDE)`：位置是 explorer 自己摆的，藏掉它文件视图仍留在
-        // y=+20，那条位置由 `ShellTabWindowClass` 自己刷成一片底色 —— **白条还在**。
-        // 所以必须同时把 DUIView 撑回容器整个高度（就是 explorer 原生那种「菜单栏高度 0」的样子）。
+        // 两条硬事实（都是实测踩出来的）：
+        //
+        //   ① 光 `ShowWindow(SW_HIDE)` 不行：位置是 explorer 自己摆的，藏掉它文件视图仍留在 y=+20，
+        //      那条位置由 `ShellTabWindowClass` 自己刷成一片底色 —— **白条还在**。
+        //      所以必须同时把 DUIView 撑回容器整个高度。
+        //   ② 得是「**压高度**」而不是 SW_HIDE：菜单栏在 Windows 里是「收了但能叫出来」的东西（按
+        //      Alt / F10）。`SW_HIDE` 是把窗口从系统眼里摘掉（清了 `WS_VISIBLE`），explorer 自己那套
+        //      菜单逻辑再想把它立起来也白搭 —— 川报的「我再自己打开菜单栏，它也不显示了」
+        //      （而且这就是正常行为：原生窗口里它本来就是收着的，只是能叫出来）。
+        //      压成 0 高度时 `WS_VISIBLE` 还在，explorer 想显示它时改高度就行。
+        //      光靠这一点还不够稳（explorer 未必自己改高度），所以配上 `WinEHook` 里的 Alt/F10 让行：
+        //      他按一下，我们主动 `RestoreMenuBar` 还回去；菜单开着期间不收（`InMenuMode`）；
+        //      菜单一关（Esc / 选完菜单项）下一次心跳就又收回去。
         //
         // ⚠ 只对我们自己那扇 cab 调（`ExplorerHost`）；shell 的窗口一个字节都不能碰。
         // ==================================================================
@@ -1083,7 +1141,15 @@ namespace TabbedExplorer
         {
             public IntPtr Container;     // ShellTabWindowClass
             public IntPtr Menu;          // 菜单栏的宿主 WorkerW
+            public IntPtr Bar;           // 里面那条 ReBarWindow32
             public IntPtr View;          // DUIViewWndClassName（文件列表）
+            /// <summary>
+            /// 菜单栏「自然」高度。按 Alt 还给他时得知道还多少。
+            /// ⚠ 不能只看「第一次看见它时它多高」：收编那一刻 explorer 常常还没把菜单栏立起来
+            ///   （实测：第一次调进来时它已经是 0），那就永远量不到。所以优先向里面那条 ReBar
+            ///   要高度 —— 它不受我们压高度的影响，记的就是 explorer 想要的那个尺寸。
+            /// </summary>
+            public int NaturalH;
         }
 
         /// <summary>cab → 它那三个窗口。收过一次就记着：窗口缩放的每一帧都要复核，不能每帧重找一遍。
@@ -1091,9 +1157,10 @@ namespace TabbedExplorer
         private static readonly Dictionary<IntPtr, MenuBarRef> menuBarCache = new Dictionary<IntPtr, MenuBarRef>();
 
         /// <summary>
-        /// 收起 <paramref name="cab"/> 里那条菜单栏，并把文件视图补满。
+        /// 收起 <paramref name="cab"/> 里那条菜单栏，并把文件视图补满；**除非用户正要用它** ——
+        /// 他按了 Alt / F10，或者菜单已经开着（见下面 wantMenu 那段）。
         /// 幂等：已经收着（原生那种 h=0 的状态）时只做两次进程内查询，不写任何东西。
-        /// 返回 true = 这一趟真的动了手（第一次收 / explorer 又把它立起来了）。
+        /// 返回 true = 这一趟真的动了手（收了 / 还回去了）。
         /// </summary>
         public static bool CollapseMenuBar(IntPtr cab)
         {
@@ -1111,23 +1178,153 @@ namespace TabbedExplorer
                     menuBarCache[cab] = r;
                 }
 
-                bool acted = false;
-                if (IsWindowVisible(r.Menu))
-                {
-                    ShowWindow(r.Menu, SW_HIDE);
-                    acted = true;
-                }
-                WRECT cr, vr;
-                if (GetWindowRect(r.Container, out cr) && GetWindowRect(r.View, out vr))
-                {
-                    if (vr.Top != cr.Top || vr.Height != cr.Height || vr.Width != cr.Width)
-                    {
-                        SetWindowPos(r.View, IntPtr.Zero, 0, 0, cr.Width, cr.Height,
-                            SWP_NOZORDER | SWP_NOACTIVATE);
-                        acted = true;
-                    }
-                }
-                return acted;
+                // ★ 他要用菜单栏时**必须把菜单栏还回去**，不能只「停手」：
+                //   explorer 那边以为这条菜单栏一直是显示着的（我们只压了高度），光停手它自己不会
+                //   把高度改回来 —— 表现就是「按了 Alt 什么都没有」。
+                //   两个判据都要「我们的窗口在前台」，免得在别的程序里按 Alt 也把它放出来（Alt+Tab
+                //   每天都在按，不能让菜单栏跟着乱冒）。
+                bool fg = IsForegroundOurs(cab);
+                if (fg && (MenuLetGo() || InMenuMode(cab))) return RestoreMenuBar(r);
+                return CollapseMenuBarNow(r);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>收：菜单栏高度压 0（**不隐藏**，见那段注释②），文件视图撑满容器。幂等。</summary>
+        private static bool CollapseMenuBarNow(MenuBarRef r)
+        {
+            WRECT cr, mr;
+            if (!GetWindowRect(r.Container, out cr)) return false;
+            if (!GetWindowRect(r.Menu, out mr)) return false;
+
+            bool acted = false;
+            if (mr.Height > 0 && r.NaturalH <= 0) r.NaturalH = mr.Height;
+            if (r.NaturalH <= 0) r.NaturalH = MenuBarH(r);      // 见 NaturalH 的注释：优先问里面那条 ReBar
+            if (mr.Height > 0)
+            {
+                SetWindowPos(r.Menu, IntPtr.Zero, 0, 0, cr.Width, 0,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                acted = true;
+            }
+            WRECT vr;
+            if (GetWindowRect(r.View, out vr)
+                && (vr.Top != cr.Top || vr.Height != cr.Height || vr.Width != cr.Width))
+            {
+                SetWindowPos(r.View, IntPtr.Zero, 0, 0, cr.Width, cr.Height,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                acted = true;
+            }
+            return acted;
+        }
+
+        /// <summary>放：菜单栏回它自然的高度，文件视图让出那一条（用户按 Alt / 菜单开着时用）。幂等。</summary>
+        private static bool RestoreMenuBar(MenuBarRef r)
+        {
+            WRECT cr, mr;
+            if (!GetWindowRect(r.Container, out cr)) return false;
+            if (!GetWindowRect(r.Menu, out mr)) return false;
+
+            int h = r.NaturalH > 0 ? r.NaturalH : MenuBarFallbackH(r.Container);
+            bool acted = false;
+            if (mr.Height != h || mr.Width != cr.Width)
+            {
+                SetWindowPos(r.Menu, IntPtr.Zero, 0, 0, cr.Width, h,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                acted = true;
+            }
+            WRECT vr;
+            if (GetWindowRect(r.View, out vr)
+                && (vr.Top != cr.Top + h || vr.Height != cr.Height - h || vr.Width != cr.Width))
+            {
+                SetWindowPos(r.View, IntPtr.Zero, 0, h, cr.Width, cr.Height - h,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                acted = true;
+            }
+            return acted;
+        }
+
+        /// <summary>菜单栏的自然高度：优先问里面那条 ReBar（它不受我们压高度影响），问不到再量宿主。</summary>
+        private static int MenuBarH(MenuBarRef r)
+        {
+            WRECT br;
+            if (r.Bar != IntPtr.Zero && GetWindowRect(r.Bar, out br) && br.Height > 0) return br.Height;
+            return 0;
+        }
+
+        // ==================================================================
+        // 「把菜单栏还给他」：用户按 Alt / F10 时用（`WinEHook` 里递话）
+        // ==================================================================
+
+        /// <summary>
+        /// 让行期长度。够他按完 Alt 之后菜单栏出现、并从从容容点开一个菜单；
+        /// 菜单真开着时由 `InMenuMode` 接着管（菜单开着就一直不收）。
+        /// 给得长一点不危险：一旦他把前台切走（Alt+Tab、点别的程序），
+        /// `IsForegroundOurs` 立刻为假，下一次心跳就把菜单栏收回去。
+        /// </summary>
+        public const int MenuLetGoMs = 6000;
+
+        /// <summary>让行截止时刻。钩子线程写、UI 线程读 —— 用 `int` 就是为了这个（读写天然原子）。</summary>
+        private static int menuLetGoUntil;
+
+        /// <summary>「他刚按了 Alt/F10」—— 只写一个字段，钩子回调里能安全调（那里不许做 IO）。</summary>
+        public static void LetGoMenuBar(int ms) { menuLetGoUntil = Environment.TickCount + ms; }
+
+        /// <summary>减法比较：`TickCount` 24.9 天翻一次，减法写法在翻越时仍然成立。</summary>
+        private static bool MenuLetGo()
+        {
+            int t = menuLetGoUntil;
+            return t != 0 && Environment.TickCount - t < 0;
+        }
+
+        // `GUI_INMENUMODE` / `GUI_POPUPMENUMODE` 是 `GUITHREADINFO.flags` 的位；
+        // 那个结构体和 `GetGUIThreadInfo` 本文件上面已经有了（那块是给按键/焦点用的），直接接着用。
+        private const int GUI_INMENUMODE = 0x00000004;
+        private const int GUI_POPUPMENUMODE = 0x00000010;
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr h);
+
+        /// <summary>从来没量到过自然高度时的兜底：菜单栏在 96 DPI 下是 20px。</summary>
+        private static int MenuBarFallbackH(IntPtr anyWindow)
+        {
+            try
+            {
+                uint dpi = GetDpiForWindow(anyWindow);
+                if (dpi > 0) return (int)Math.Round(20.0 * dpi / 96.0);
+            }
+            catch { }
+            return 20;
+        }
+
+        /// <summary>
+        /// explorer 那个线程是不是正开着菜单（`GUI_INMENUMODE`）。
+        /// 他正在点菜单的时候我们绝不能把菜单栏抽走 —— 这一条比时间窗准：菜单开多久就管多久。
+        /// </summary>
+        private static bool InMenuMode(IntPtr cab)
+        {
+            try
+            {
+                uint tid = GetWindowThreadProcessId(cab, IntPtr.Zero);
+                if (tid == 0) return false;
+                GUITHREADINFO g = new GUITHREADINFO();
+                g.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+                if (!GetGUIThreadInfo(tid, ref g)) return false;
+                return (g.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>`h` 所在的那扇**顶层**窗口是不是现在的前台窗口。</summary>
+        private static bool IsForegroundOurs(IntPtr h)
+        {
+            try
+            {
+                IntPtr fg = NativeMethods.GetForegroundWindow();
+                if (fg == IntPtr.Zero) return false;
+                IntPtr t = h, p = GetParent(t);
+                int guard = 0;
+                while (p != IntPtr.Zero && guard++ < 32) { t = p; p = GetParent(t); }
+                return t == fg;
             }
             catch { return false; }
         }
@@ -1152,7 +1349,7 @@ namespace TabbedExplorer
             }
             if (st == IntPtr.Zero) return null;
 
-            IntPtr menu = IntPtr.Zero, view = IntPtr.Zero;
+            IntPtr menu = IntPtr.Zero, view = IntPtr.Zero, bar = IntPtr.Zero;
             c = GetWindow(st, GW_CHILD);
             guard = 0;
             while (c != IntPtr.Zero && guard++ < 32)
@@ -1160,13 +1357,15 @@ namespace TabbedExplorer
                 string cn = ClassOf(c);
                 if (string.Compare(cn, "DUIViewWndClassName", StringComparison.OrdinalIgnoreCase) == 0)
                     view = c;
-                else if (string.Compare(cn, "WorkerW", StringComparison.OrdinalIgnoreCase) == 0
-                         && WinFind.ByClass(c, "ReBarWindow32") != IntPtr.Zero)
-                    menu = c;
+                else if (string.Compare(cn, "WorkerW", StringComparison.OrdinalIgnoreCase) == 0)
+                {
+                    IntPtr b = WinFind.ByClass(c, "ReBarWindow32");
+                    if (b != IntPtr.Zero) { menu = c; bar = b; }
+                }
                 c = GetWindow(c, GW_HWNDNEXT);
             }
             if (menu == IntPtr.Zero || view == IntPtr.Zero) return null;
-            return new MenuBarRef { Container = st, Menu = menu, View = view };
+            return new MenuBarRef { Container = st, Menu = menu, Bar = bar, View = view };
         }
 
         // ==================================================================

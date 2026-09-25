@@ -445,13 +445,19 @@ namespace TabbedExplorer
                 // （见 TakeOverShellWindow）。
                 bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
                 bool candidate = shellTake || IsHideCandidate(h);
-                // ★ 用户刚点了「用原生资源管理器打开」：这一扇正是他要的 —— 原样放过。
+                // ★ 用户刚点了「用原生资源管理器打开」：这几秒里冒出来的候选窗口就是他要的 ——
+                //   原样放过，**而且认下这一扇**（`MarkNativeKeep`，挂在 `IsClaimed` 上）。
                 //   放在 candidate 之后判：只有「本来会被我们动手」的窗口才吃这笔凭据，
                 //   否则让行期会被一个不相干的事件（比如一个对话框）白白耗掉。
-                if (candidate && ConsumeNativeOpen())
+                //   ⚠ 不能只「吃一次凭据就作废」：一扇新窗会先后报 CREATE / SHOW 两条事件，
+                //     第一条把凭据吃掉，第二条就没人拦了 —— 用户看到的就是「原生窗开出来一会儿
+                //     又被收成标签」（川报的就是这个）。认下窗口本身，它关掉之前谁都别碰。
+                if (candidate && NativeOpenPeriod())
                 {
+                    EmbedApi.MarkNativeKeep(h);
                     Diag.Step(string.Format(
-                        "Hub: 让行（用原生资源管理器打开）cab=0x{0:X}（不藏、不登记、不转生）", h.ToInt64()));
+                        "Hub: 让行（用原生资源管理器打开）cab=0x{0:X} —— 这扇窗在关掉之前都不收编",
+                        h.ToInt64()));
                     return;
                 }
                 if (!candidate)
@@ -729,8 +735,10 @@ namespace TabbedExplorer
         /// 所以先开一个短暂的「让行期」（见 `nativeOpenUntilTick`），这段时间里新出现的候选窗口
         /// 一律不藏、不登记、不转生，原样留在桌面上。
         ///
-        /// 让行期是**一次性**的：真等到那一扇就立刻作废；等不到（shell 复用了已有的原生窗、
-        /// 压根没建新窗）就由 `NativeOpenMs` 兜底到期。
+        /// 让行期是**按时间**算的（`NativeOpenMs`）：这几秒里冒出来的候选窗口一律当他的原生窗认下
+        /// （见 `EmbedApi.MarkNativeKeep`）—— 认下之后那扇窗在关掉之前都不会再被收编。
+        /// 早先写的是「等到一扇就作废」，结果一扇新窗会先后报 CREATE / SHOW 两条事件，
+        /// 第一条把凭据吃掉、第二条就没人拦了：原生窗还是被收成了标签。
         /// </summary>
         public void OpenNative(string path)
         {
@@ -752,15 +760,16 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 吃掉（一次性的）让行凭据 —— 只有真来了一个够格的候选窗口才吃（调用点在 `OnWindowShown`）。
+        /// 让行凭据还有效吗（`OpenNative` 起算的那几秒）。**不再「吃掉就作废」** ——
+        /// 见 `OnWindowShown` 里那段：一扇新窗会先后报 CREATE / SHOW 两条事件，凭据只够拦第一条。
+        /// 窗口本身由 `EmbedApi.MarkNativeKeep` 认着，这里只负责「哪几秒里冒出来的窗算他的」。
         /// 用减法和 `Environment.TickCount` 比较：它 24.9 天会翻一次，减法写法在翻越时仍然成立。
         /// </summary>
-        private bool ConsumeNativeOpen()
+        private bool NativeOpenPeriod()
         {
             int until = nativeOpenUntilTick;
             if (until == 0) return false;
             if (Environment.TickCount - until >= 0) { nativeOpenUntilTick = 0; return false; }
-            nativeOpenUntilTick = 0;
             return true;
         }
 

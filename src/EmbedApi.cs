@@ -120,6 +120,12 @@ namespace TabbedExplorer
         public const uint WS_EX_LAYERED = 0x00080000;
         public const uint LWA_ALPHA = 0x00000002;
 
+        /// <summary>不进任务栏 / 不进 Alt+Tab（见 MakeTransparent 里为什么顺手要加它）。</summary>
+        public const uint WS_EX_TOOLWINDOW = 0x00000080;
+
+        /// <summary>「请把我列进任务栏」。explorer 的浏览窗口本来带它 —— 摘掉时要还回去。</summary>
+        public const uint WS_EX_APPWINDOW = 0x00040000;
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
 
@@ -151,6 +157,12 @@ namespace TabbedExplorer
         /// 「事件后 0ms，**当时已可见**」：WinEvent 是投递到消息队列的，等我们收到 SHOW，
         /// explorer 那一帧**已经画在屏幕上了**。加了这层之后，无论它怎么 Show，画面都是透明的。
         ///
+        /// ★ 顺带还管住了**任务栏**：光置透明只解决「画面闪」，那扇窗在收编之前仍是个正常顶层窗口，
+        ///   任务栏上会多出一个「文件资源管理器」按钮，直到 `SetParent` 成子窗口才消失（川报的
+        ///   「加载时状态栏显示系统资源管理器图标、完成后消失」）。所以这里同时打上 `WS_EX_TOOLWINDOW`
+        ///   并摘掉 `WS_EX_APPWINDOW` —— 带 TOOLWINDOW 的窗口任务栏和 Alt+Tab 都不收。
+        ///   两件事必须在**同一个时刻**做：都是「趁这扇窗还没露脸把它按住」，拆成两步就有一帧的空档。
+        ///
         /// ⚠ 收编进标签之前 / 放它走之前**必须** `ClearTransparent`，
         ///   否则嵌进来的窗口会永远是隐形的（这个坑比闪一下严重得多）。
         /// </summary>
@@ -160,20 +172,29 @@ namespace TabbedExplorer
             {
                 uint ex = GetExStyle(h);
                 if ((ex & WS_EX_LAYERED) != 0) return;      // 已经是分层的，别重复设
-                SetExStyle(h, ex | WS_EX_LAYERED);
+                SetExStyle(h, (ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
                 SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
             }
             catch { }
         }
 
-        /// <summary>把 <see cref="MakeTransparent"/> 加的那层去掉（本来就带 WS_EX_LAYERED 的窗口不动）。</summary>
+        /// <summary>
+        /// 把 <see cref="MakeTransparent"/> 加的那两层去掉：透明与「不进任务栏」。
+        /// 顺手把 `WS_EX_APPWINDOW` 还回去 —— explorer 的浏览窗口本来就是任务栏窗口，
+        /// 放手让它回桌面时得能重新出现在任务栏里（收编成子窗口后这一位本来也不起作用）。
+        /// </summary>
         public static void ClearTransparent(IntPtr h)
         {
             try
             {
                 uint ex = GetExStyle(h);
+                // ⚠ 只有「被我们置过透明」的窗口才能还它本来面目 —— `WS_EX_LAYERED` 就是那个记号
+                //   （`MakeTransparent` 一定同时加上它）。**不能**写成「跟期望值不一样就写」：
+                //   这函数在 `AdoptWindow` / `ReleaseIfAbandoned` 里是对**任何候选窗口**调的，
+                //   其中就有 shell 自己开的那扇 —— 对它动样式位是明令禁止的（见 TakeOverShellWindow：
+                //   改坏了会留在 shell 里、退程序也不恢复，只有重启电脑才解）。
                 if ((ex & WS_EX_LAYERED) == 0) return;
-                SetExStyle(h, ex & ~(uint)WS_EX_LAYERED);
+                SetExStyle(h, (ex & ~WS_EX_LAYERED & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW);
             }
             catch { }
         }

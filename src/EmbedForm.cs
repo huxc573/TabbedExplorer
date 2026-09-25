@@ -153,6 +153,13 @@ namespace TabbedExplorer
         private bool reserveReady;
 
         /// <summary>
+        /// 预热失败之后的冷却期到什么时候（见 <see cref="CanWarm"/>）。
+        /// 没有它的话「起失败 → 立刻再起」就是个死循环：起一次失败要干等 25 秒超时，
+        /// 于是每 25 秒白烧一个 explorer 进程。
+        /// </summary>
+        private DateTime warmRetryAt = DateTime.MinValue;
+
+        /// <summary>
         /// 切完标签等一会儿再收非激活标签的内存（见 TrimInactiveTabs）。
         /// 用延时是为了别在 Ctrl+Tab 快速来回切时反复「收了又读回来」——
         /// 那比不省内存还糟（每次切回来都要重新缺页）。
@@ -391,11 +398,10 @@ namespace TabbedExplorer
             // 起进程的并发窗口按**时间**放行，所以得有个人定期推一把队列
             //（放行本身不产生事件，光靠 LaunchDone 推不动它，见 SpawnSlotMs）。
             pumpTimer.Interval = 200;
-            pumpTimer.Tick += delegate
-            {
-                if (launchQueue.Count == 0) pumpTimer.Stop();
-                else PumpLaunch();
-            };
+            // 每 200ms 推一次，**推什么由 PumpLaunch 自己决定**（放行到点的格 / 把预热补上），
+            // 停不停也在它那儿判 —— 别在这儿拿「队列空不空」提前停：
+            // 队列空之后还有一件周期性的事（备用窗口还没备好），见 PumpLaunch 尾部。
+            pumpTimer.Tick += delegate { PumpLaunch(); };
 
             // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
             trimTimer.Interval = 3000;
@@ -1632,8 +1638,11 @@ namespace TabbedExplorer
             if (launchQueue.Count > 0 || launching.Count > 0) ShellBrowserReg.KeepQuiet(1500);
             // 队列空、手里也没有在起的 → 预热下一个「新建标签页」的窗口
             if (launchQueue.Count == 0 && launching.Count == 0) WarmUp();
-            // 队列还没走完 ⇒ 让 pumpTimer 每 200ms 回来放行到点的那些格
-            if (launchQueue.Count > 0) pumpTimer.Start();
+            // 什么时候还要 200ms 回来一趟：
+            //   · 队列里还有活 —— 回来放行「到点的格」（见 SpawnSlotMs）
+            //   · 队列空了但手里没备用窗口 —— 回来把预热补上（预热失败进了冷却期时全靠它自愈）
+            // 手里已经备着一个（或在备）就停：那时没有任何周期性的事要做。
+            if (launchQueue.Count > 0 || reserve == null) pumpTimer.Start();
             else pumpTimer.Stop();
         }
 
@@ -1663,10 +1672,18 @@ namespace TabbedExplorer
             }
         }
 
-        /// <summary>一个标签起完了（成了 / 失败了 / 认到窗口了）—— 现在就给它腾位置。</summary>
+        /// <summary>
+        /// 一个标签起完了（成了 / 失败了 / 认到窗口了）—— 给它腾位置，并且**无条件推一把队列**。
+        ///
+        /// ⚠ 别写成「不在表里就直接 return」：并行起标签时格是**按时间**放的（见 SpawnSlotMs），
+        ///   一个标签的格早在它收编完之前就到期放掉了 —— 等它最后 `Ready` 回来，表里已经没有它。
+        ///   这时候早退就等于把「这一批彻底结束了」这个收尾信号吃掉，`PumpLaunch` 尾部那句
+        ///   `WarmUp` 永远轮不到 ⇒ **备用窗口再也预热不出来** ⇒ 用户报的
+        ///   「Win+E 没有预加载、单个标签打开也变慢」（每个新标签都得现起 explorer）。
+        /// </summary>
         private void LaunchDone(ExplorerHost h)
         {
-            if (!launching.Remove(h)) return;
+            launching.Remove(h);
             PumpLaunch();
         }
 
@@ -1709,6 +1726,8 @@ namespace TabbedExplorer
         {
             if (IsDisposed || Disposing || Quitting) return false;
             if (reserve != null || reserveReady) return false;
+            // 刚失败过一次就先别急着重来（起失败要干等 25 秒超时，立刻重试就是死循环），见 warmRetryAt
+            if (DateTime.Now < warmRetryAt) return false;
             // 还有标签没落定（在起 / 在等窗口 / 在收编）就一律不预热。
             // 判据跟 Hub 那道闸同源（见 `LaunchInFlight`）—— 收编是整条流水线最贵的一步，
             // 这时候再塞一个备用窗口进去，就是在一堆刚起来的 explorer 上又加一个，
@@ -1913,6 +1932,7 @@ namespace TabbedExplorer
             if (h == reserve)
             {
                 Diag.Log("EmbedForm: 备用窗口没起起来，丢掉（下次新建标签页走老路）");
+                warmRetryAt = DateTime.Now.AddSeconds(30);   // 冷却：别每 25 秒烧一个 explorer（见 CanWarm）
                 KillReserve();
                 LaunchDone(h);
                 return;

@@ -45,6 +45,29 @@ namespace TabbedExplorer
         private static DateTime lastRun = DateTime.MinValue;
         private static readonly TimeSpan minInterval = TimeSpan.FromSeconds(2);
 
+        /// <summary>
+        /// 「这段时间内谁也别登记」的截止时刻（见 <see cref="KeepQuiet"/>）。
+        ///
+        /// 用**截止时刻**而不是一个布尔开关，是故意的：布尔一旦因为某条早退路径忘了复位，
+        /// 登记就永远不再发生 —— 而「登记没做」的后果是记忆 25 那条（三方点打开文件夹
+        /// 只激活不新建、看着像没反应）。时间戳自己会过期，坏不掉。
+        /// </summary>
+        private static DateTime quietUntil = DateTime.MinValue;
+
+        /// <summary>
+        /// 批量起标签 / 还原期间把登记挂起来（`ms` 毫秒之内不来）。
+        ///
+        /// 为什么要挂：这一步实测 **198~1365ms（均值约 660ms）**，而且只能在我们那一个 UI 线程上跑。
+        /// 一次还原 8 个标签光它就 5 秒多，摊在每个标签收编那一刻 ⇒ 用户报的「重启程序之后，
+        /// 激活那个标签已经好了，非激活还在加载时**整个程序几乎不可用**」就是它。
+        /// 挂起来不做的代价只是「晚几秒登记上」，而收编之后本来就跟着 500ms 心跳兜底
+        ///（见 `ExplorerHost.OnTitlePoll`）—— 心跳会在这一批结束后 2 秒内补上。
+        /// </summary>
+        public static void KeepQuiet(int ms)
+        {
+            quietUntil = DateTime.Now.AddMilliseconds(ms);
+        }
+
         private const int DISPATCH_METHOD = 1;
         private const int DISPATCH_PROPERTYGET = 2;
         private const int DISPATCH_PROPERTYPUT = 4;
@@ -65,6 +88,8 @@ namespace TabbedExplorer
         /// </summary>
         public static void ExcludeOurs(bool force = false)
         {
+            // 正在批量起标签：这一批全程不做（理由见 KeepQuiet）。到期后心跳会补上。
+            if (DateTime.Now < quietUntil) return;
             if (!force && DateTime.Now - lastRun < minInterval) return;
             lastRun = DateTime.Now;
             try

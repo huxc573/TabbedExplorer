@@ -1547,6 +1547,10 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 起 explorer" + (Settings.ParallelLaunch ? "（并发 " + launchingSet.Count + "/" + cap + "）" : "（串行）") + j.Path);
                 j.Host.Start(j.Path);
             }
+            // 只要有标签还在「起」这条道上，就把那笔昂贵的 shell 登记挂起来（见 ShellBrowserReg.KeepQuiet）。
+            // 还原 8 个标签时它累计要 5 秒多、还全压在一个 UI 线程上 —— 那就是「非激活标签还在加载时
+            // 整个程序几乎不可用」。挂起来之后由 500ms 心跳在这一批结束的 2 秒内补上。
+            if (launchQueue.Count > 0 || launchingSet.Count > 0) ShellBrowserReg.KeepQuiet(1500);
             // 队列空、手里也没有在起的 → 预热下一个「新建标签页」的窗口
             if (launchQueue.Count == 0 && launchingSet.Count == 0) WarmUp();
         }
@@ -1686,7 +1690,14 @@ namespace TabbedExplorer
             h.SetIconTarget(TabStrip.TabIconSize);      // 告诉它图标画多大（设备像素）
 
             h.Ready += delegate(object s, EventArgs e) { OnHostReady(h); };
-            h.Claimed += delegate(object s, EventArgs e) { LaunchDone(h); };
+            h.Claimed += delegate(object s, EventArgs e)
+            {
+                // 认到窗口 = 这一批还在走：把那笔昂贵的 shell 登记挂起来，等这一批完了由心跳补上
+                //（理由和数字见 ShellBrowserReg.KeepQuiet）。外部自己开的窗（转生/收编）不走这里，
+                // 那条路照旧收编那一刻就登记 —— 那条路是「用户当场在等」，不能拖。
+                ShellBrowserReg.KeepQuiet(1500);
+                LaunchDone(h);
+            };
             h.Failed += delegate(object s, EventArgs e) { OnHostFailed(h); };
             h.TitleChanged += delegate(object s, EventArgs e) { OnHostTitleChanged(h); };
             h.IconChanged += delegate(object s, EventArgs e) { OnHostIconChanged(h); };

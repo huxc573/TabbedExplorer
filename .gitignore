@@ -9,12 +9,13 @@ build.log.prev
 bin/
 obj/
 
-# 探针留下的截图 / 记录（源码 probe/*.py 要进库，图不进）
+# 探针留下的截图 / 记录 / 编译产物（源码 probe/*.py、probe/*.cs 要进库，其余不进）
 *.png
 !docs/*.png
 !assets/*.png
 probe/*.log
 probe/*.txt
+probe/*.exe
 __pycache__/
 
 # 本机数据（绿色便携那个 data\ 目录：settings.txt / desktops.txt / log.txt 全在这儿）

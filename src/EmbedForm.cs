@@ -1119,46 +1119,20 @@ namespace TabbedExplorer
             {
                 int skipped = 0;
 
-                // ---- 先把「记忆里当时选中那个」挑出来，让它**第一个入队** ----
-                // 用户：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
-                // 串行队列（PumpLaunch）是**按入队顺序**起 explorer 的 —— 先建谁谁先出来。
-                // 所以这里先建「该激活的那个」，等其余都建完再把它挪回原来的位置（见 MoveTabSynced）。
-                int activeAt = -1;
-                string activePath = null;
+                // ---- 先把记忆里的值过一遍筛子，得到「真能开出来、且不重复」的那一串 ----
+                // ⚠ 记忆里的值**不能直接拿去判能不能开**：地址栏给的常常是**显示名**（「视频」「此电脑」
+                //   「下载」），而 `Restorable` 只认「`::` / `shell:` 前缀」或「绝对且真实存在的目录」——
+                //   显示名两条都不占，会被整条跳过（用户报的「还原时有个标签报错」就是这个）。
+                //   所以一律先 `Store`（显示名 → 真路径 / shell 标识）再判。
+                string activeStored = PathRules.Store(b.Active);
+                List<string> want = new List<string>();
                 for (int i = 0; i < b.Paths.Count; i++)
                 {
-                    if (!PathRules.Restorable(b.Paths[i])) continue;
-                    if (!string.IsNullOrEmpty(b.Active) && PathRules.Same(b.Paths[i], b.Active))
-                    {
-                        activeAt = i;
-                        activePath = b.Paths[i];
-                        break;
-                    }
-                }
-
-                // 它「应该在」第几号位 = 排在它前面、且真能开出来的项有几个（重复项不算）
-                int wantIdx = 0;
-                for (int i = 0; i < activeAt; i++)
-                {
-                    string q = b.Paths[i];
-                    if (!PathRules.Restorable(q)) continue;
-                    if (IndexOfPath(q) >= 0) continue;
-                    wantIdx++;
-                }
-
-                // 建标签的顺序：active 打头，其余照记忆里的顺序
-                List<string> order = new List<string>();
-                if (activePath != null) order.Add(activePath);
-                for (int i = 0; i < b.Paths.Count; i++)
-                    if (i != activeAt) order.Add(b.Paths[i]);
-
-                for (int i = 0; i < order.Count; i++)
-                {
-                    string p = order[i];
+                    string p = PathRules.Store(b.Paths[i]);
                     if (!PathRules.Restorable(p))
                     {
                         skipped++;
-                        Diag.Step("记忆: 跳过开不了的项「" + p + "」（可能是个库/虚拟文件夹，没有真实路径）");
+                        Diag.Step("记忆: 跳过开不了的项「" + b.Paths[i] + "」（可能是个库/虚拟文件夹，没有真实路径）");
                         continue;
                     }
                     // 同一个路径已经有标签了就别再开一个。
@@ -1170,14 +1144,46 @@ namespace TabbedExplorer
                         Diag.Step("记忆: 「" + p + "」已经有标签了，跳过重复项");
                         continue;
                     }
-                    NewTab(p);
+                    want.Add(p);
                 }
 
-                // active 现在是第 0 个（它最先建），挪回它该在的位置
-                if (activePath != null && wantIdx > 0 && hosts.Count > 0)
-                    MoveTabSynced(0, Math.Min(wantIdx, hosts.Count - 1));
+                // 记忆里当时选中的那个在 `want` 里的位置（找不到就是 -1）
+                int activeAt = -1;
+                for (int i = 0; i < want.Count; i++)
+                    if (!string.IsNullOrEmpty(activeStored) && PathRules.Same(want[i], activeStored)) { activeAt = i; break; }
 
-                int act = (activePath == null) ? -1 : IndexOfPath(activePath);
+                if (Settings.LazyTabs)
+                {
+                    // 懒加载：先把全部标签**摆出来**（都只是占位，不起 explorer），再把当时选中那个真起起来。
+                    // 起 explorer 要排队一个一个来（约 1.2 秒一个），这样开程序只等一个标签的时间。
+                    for (int i = 0; i < want.Count; i++) AddDeferredTab(want[i]);
+                    int la = (activeAt >= 0) ? activeAt : -1;
+                    Diag.Step(string.Format("记忆: 桌面 {0} 懒加载摆上 {1} 个标签（跳过 {2} 个），只起第 {3} 个",
+                        DesktopKey, hosts.Count, skipped, la));
+                    if (hosts.Count > 0)
+                    {
+                        Activate(la >= 0 ? la : 0);   // 碰到占位标签时 `Activate` 会把它真起起来
+                        return true;
+                    }
+                    return false;
+                }
+
+                // ---- 不懒加载：建标签的顺序 = 该激活的打头，其余照记忆里的顺序 ----
+                // 用户：「完全退出程序后首次打开加载过慢，可以优先打开需要激活的窗口」。
+                // 串行队列（PumpLaunch）是**按入队顺序**起 explorer 的 —— 先建谁谁先出来。
+                // 所以这里先建「该激活的那个」，等其余都建完再把它挪回原来的位置（见 MoveTabSynced）。
+                List<string> order = new List<string>();
+                if (activeAt >= 0) order.Add(want[activeAt]);
+                for (int i = 0; i < want.Count; i++)
+                    if (i != activeAt) order.Add(want[i]);
+
+                for (int i = 0; i < order.Count; i++) NewTab(order[i]);
+
+                // active 现在是第 0 个（它最先建），挪回它该在的位置
+                if (activeAt > 0 && hosts.Count > 0)
+                    MoveTabSynced(0, Math.Min(activeAt, hosts.Count - 1));
+
+                int act = (activeAt < 0) ? -1 : IndexOfPath(want[activeAt]);
                 Diag.Step(string.Format("记忆: 桌面 {0} 还原 {1} 个标签（跳过 {2} 个），优先起的是第 {3} 个",
                     DesktopKey, hosts.Count, skipped, act));
                 if (hosts.Count > 0)
@@ -1460,6 +1466,37 @@ namespace TabbedExplorer
             PumpLaunch();
             Activate(i);
             MarkDirty();
+        }
+
+        /// <summary>
+        /// 摆一个**懒加载占位标签**：标题和路径先摆上，explorer 先不起（`Settings.LazyTabs` 开着时才走这儿）。
+        /// 用户点到它才真起 —— 见 `StartDeferred`。
+        /// </summary>
+        private void AddDeferredTab(string path)
+        {
+            ExplorerHost h = AddHost();
+            h.Deferred = true;
+            h.PresetTarget(path);      // 排队/占位期间也得知道要去哪儿（否则中途保存记忆会把它丢掉）
+            int i = hosts.IndexOf(h);
+            string stored = PathRules.Store(path);
+            tabStrip.SetTitle(i, PathRules.Friendly(stored));
+            tabStrip.SetPath(i, TabStrip.PathLine(stored));
+        }
+
+        /// <summary>
+        /// 把懒加载的占位标签真起起来（用户切到它了）。
+        /// 照样进**同一条串行队列** —— 已经在起别的标签时就排在后面，不会两个 explorer 互相认错。
+        /// </summary>
+        private void StartDeferred(int idx)
+        {
+            if (idx < 0 || idx >= hosts.Count) return;
+            ExplorerHost h = hosts[idx];
+            if (h == null || !h.Deferred) return;
+            h.Deferred = false;
+            Diag.Step("EmbedForm: 懒加载标签开始加载「" + h.TargetPath + "」");
+            tabStrip.SetTitle(idx, "打开中…");
+            launchQueue.Enqueue(new Launch { Host = h, Path = h.TargetPath });
+            PumpLaunch();
         }
 
         /// <summary>
@@ -1760,6 +1797,10 @@ namespace TabbedExplorer
         {
             if (idx < 0 || idx >= hosts.Count) return;
             activeIndex = idx;
+            // 懒加载的占位标签：切到它才算「要用它」，这时候才真起 explorer。
+            // 得排在下面那句 `Host.Visible` 之前 —— 先把队列上的活派出去，界面这一帧先显示空面板，
+            // 内容出来时 `OnHostReady` 会把标题 / 图标 / 路径再刷一遍。
+            if (hosts[idx].Deferred) StartDeferred(idx);
             for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);
             tabStrip.SetActive(idx);
             if (vPane != null && verticalOn) vPane.ScrollActiveIntoView();   // 竖排那份也要把选中的那行拉进视线

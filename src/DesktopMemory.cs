@@ -112,6 +112,37 @@ namespace TabbedExplorer
             }
         }
 
+        /// <summary>
+        /// 「存起来的那个值」→ 给人看的短名字：`::{20D04FE0…}` → 「此电脑」、`shell:Downloads` → 「下载」、
+        /// `D:\Dev\AI` → 「AI」。
+        ///
+        /// 给懒加载的占位标签起标题用：那种标签还没起 explorer，读不到窗口标题，只能拿路径现算一个。
+        /// 虚拟位置反过来查 `virtuals` 那张表（表的键才是显示名，值是要存的东西）。
+        /// </summary>
+        public static string Friendly(string stored)
+        {
+            if (string.IsNullOrEmpty(stored)) return "";
+            stored = stored.Trim();
+            if (stored.Length == 0) return "";
+
+            foreach (KeyValuePair<string, string> kv in virtuals)
+                if (Same(kv.Value, stored)) return kv.Key;
+
+            // 认成路径的那些 `::` 项（回收站之类），跟标签第二行一样给个笼统名，别把 GUID 当名字显示
+            if (stored.StartsWith("::", StringComparison.Ordinal)) return "系统文件夹";
+
+            try
+            {
+                string p = stored.TrimEnd('\\', '/');
+                int i = p.LastIndexOfAny(new char[] { '\\', '/' });
+                string name = (i >= 0 && i < p.Length - 1) ? p.Substring(i + 1) : p;
+                if (name.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+                    name = name.Substring(0, name.Length - 4);
+                return name.Length == 0 ? stored : name;
+            }
+            catch { return stored; }
+        }
+
         /// <summary>这个值能不能直接交给 explorer.exe 去开。</summary>
         public static bool Restorable(string p)
         {

@@ -52,6 +52,18 @@ namespace TabbedExplorer
         // ---- 默认值 ----
         public static CaptureMode Capture = CaptureMode.PerDesktop;
         public static bool KeepTabs = true;
+        /// <summary>
+        /// 懒加载标签页（默认**关**）。
+        ///
+        /// 开：还原记忆里的标签时只把「当时选中的那个」真起出来，其余先摆成占位（只有标题和路径），
+        /// 点到它才去起 explorer。省的是**开程序那一下的等待** —— 起 explorer 是串行的（见
+        /// `EmbedForm.PumpLaunch`），一个约 1.2 秒，7 个标签就是八秒多。
+        /// 关：按顺序把每个标签都起起来（跟以前一样）。
+        ///
+        /// 为什么做成开关而不是一直开着：用户先试过「一律懒加载」，觉得点到还没加载的标签要等一下、
+        /// 体验不好，所以留成选择项、默认关。
+        /// </summary>
+        public static bool LazyTabs = false;
         public static ColorMode Color = ColorMode.System;
         public static int TabWidth = 112;
         /// <summary>
@@ -201,6 +213,7 @@ namespace TabbedExplorer
                     string json = File.ReadAllText(FileName, Encoding.UTF8);
                     Capture      = ParseCapture(Json.Get(json, "capture"));
                     KeepTabs     = Json.GetBool(json, "keeptabs", true);
+                    LazyTabs     = Json.GetBool(json, "lazytabs", false);
                     Color        = ParseColor(Json.Get(json, "theme"));
                     TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
@@ -266,6 +279,7 @@ namespace TabbedExplorer
                 {
                     case "capture":    Capture = ParseCapture(v); break;
                     case "keeptabs":   KeepTabs = ParseBool(v, true); break;
+                    case "lazytabs":   LazyTabs = ParseBool(v, false); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
@@ -299,6 +313,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_tabautofit\": \"true = 一排标签挤不下时自动缩窄；false = 不缩，总宽停在右边那排按钮前，多出来的靠滚轮横向滑\",\r\n");
                 sb.Append("  \"_captureall\": \"true = 从开始菜单/桌面双击打开的文件夹也收成标签（像浏览器）；false = 只接管 Win+E\",\r\n");
                 sb.Append("  \"_captureshell\": \"true = 连桌面 shell 进程开的文件夹窗口也接管（先读出它的路径、像点 × 一样关掉它，再用我们自己的 explorer 开成标签）；false = 一个都不碰（从开始菜单/桌面双击打开的文件夹就不会进标签了）\",\r\n");
+                sb.Append("  \"_lazytabs\": \"true = 还原标签时只把当时选中那个真起出来、其它点开才加载（省开程序那一下的等待）；false = 一次全起出来（默认）\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
                 sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");
@@ -307,6 +322,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_vpanealpha\": \"侧边栏摊开盖在内容上那一下的不透明度，%，0 ~ 100；100 = 完全不透明，0 = 完全透明（只在折叠窗格开着、鼠标移进去盖住内容时生效）\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"lazytabs\": ").Append(LazyTabs ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
@@ -352,8 +368,8 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} theme={2} tabwidth={3} autowiden={4} autofit={5} favbar={6} captureall={7} captureshell={8} winsize={9} vtabs={10} vtabsfold={11} vpanealpha={12} debug={13} hotkeys={14}",
-                Text(Capture), KeepTabs ? 1 : 0, Text(Color), TabWidth,
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} theme={3} tabwidth={4} autowiden={5} autofit={6} favbar={7} captureall={8} captureshell={9} winsize={10} vtabs={11} vtabsfold={12} vpanealpha={13} debug={14} hotkeys={15}",
+                Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, Debug ? 1 : 0, hotkeys.Count);
@@ -440,6 +456,7 @@ namespace TabbedExplorer
         public static void SetCapture(CaptureMode m) { Capture = m; Save(); }
         public static void SetColor(ColorMode m) { Color = m; Save(); }
         public static void SetKeepTabs(bool on) { KeepTabs = on; Save(); }
+        public static void SetLazyTabs(bool on) { LazyTabs = on; Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }

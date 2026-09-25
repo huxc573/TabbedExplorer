@@ -982,6 +982,17 @@ namespace TabbedExplorer
             RefreshTrayMenu();
         }
 
+        /// <summary>
+        /// 懒加载标签页。**只影响下次还原**（这一次已经摆好的标签不动）——
+        /// 所以改完只刷一下菜单勾选，不重建任何窗口。
+        /// </summary>
+        public void SetLazyTabs(bool on)
+        {
+            if (Settings.LazyTabs == on) return;
+            Settings.SetLazyTabs(on);
+            RefreshTrayMenu();
+        }
+
         /// <summary>标签页宽度（逻辑像素）。立刻重排所有标签条。</summary>
         public void SetTabWidth(int w)
         {

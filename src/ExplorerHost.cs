@@ -118,6 +118,12 @@ namespace TabbedExplorer
         /// </summary>
         public bool Pinned { get; set; }
 
+        /// <summary>
+        /// 这个标签是**懒加载的占位**：还没起 explorer，只记了 `TargetPath`。
+        /// 上层 `Activate` 点到它时才真起（见 `EmbedForm.StartDeferred`）。
+        /// </summary>
+        public bool Deferred { get; set; }
+
         public ExplorerHost()
         {
             Host = new Panel();
@@ -712,6 +718,9 @@ namespace TabbedExplorer
         {
             get
             {
+                // 懒加载的占位标签还没有窗口可问标题 —— 拿记下的目标路径现算一个（「视频」/「AI」这种）
+                if (CabWindow == IntPtr.Zero && !string.IsNullOrEmpty(TargetPath))
+                    return PathRules.Friendly(TargetPath);
                 string t = EmbedApi.TitleOf(CabWindow);
                 return string.IsNullOrEmpty(t) ? "此电脑" : t;
             }

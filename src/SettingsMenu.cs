@@ -151,6 +151,12 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("保留标签页（退出后记住、下次还原）",
                        () => Settings.KeepTabs,
                        () => hub.SetKeepTabs(!Settings.KeepTabs))));
+            // ③′ 懒加载（默认关）：还原时只真起「当时选中那个」，其余先摆占位、点到才起。
+            //     跟「保留标签页」是同一件事的两半（关掉保留就无所谓懒不懒），所以紧挨着排。
+            //     它只影响**下次还原**，改完不用重建窗口。
+            n.Add(WinOnly(Leaf("懒加载标签页（还原时先只开当前那个，其它点开才加载）",
+                       () => Settings.LazyTabs,
+                       () => hub.SetLazyTabs(!Settings.LazyTabs))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。

@@ -118,6 +118,21 @@ namespace TabbedExplorer
         private readonly List<KeyValuePair<string, KeyBox>> keyBoxes =
             new List<KeyValuePair<string, KeyBox>>();
 
+        /// <summary>「更新日志」页里那个只读框（页大小变了要把它铺满，见 FitLogBox）。</summary>
+        private RichTextBox logBox;
+        /// <summary>日志页用到的几套字体 —— 建一次复用，别每行 new 一个。</summary>
+        private Font logFont, logFontBold, logH1, logH2;
+        /// <summary>「更新日志」那一页（切到它才去读文件、渲染，见 LoadLogIfNeeded）。</summary>
+        private TabPage logPage;
+        /// <summary>CHANGELOG.md 的原文 —— 每个窗口实例只读一次（读文件不贵，贵的是往框里逐段上样式）。</summary>
+        private string logText;
+        private bool logRead;
+        /// <summary>当前这个只读框里已经填过内容了。换颜色模式会整窗重建、框也换一个，得再填一遍。</summary>
+        private bool logFilled;
+        /// <summary>页里只渲染**最新这几个版本**，剩下的给个链接（整份 700 多行，全渲染要上百毫秒）。</summary>
+        private const int LogVersions = 3;
+        private const string LogFullUrl = AppInfo.RepoUrl + "/blob/main/CHANGELOG.md";
+
         public SettingsForm(DesktopHub hub)
         {
             this.hub = hub;
@@ -313,6 +328,8 @@ namespace TabbedExplorer
             int hGeneral = BuildGeneral(general, pageW);
             TabPage keys = NewPage("快捷键");
             int hKeys = BuildHotkeys(keys, pageW);
+            TabPage log = NewPage("更新日志");
+            int hLog = BuildLog(log, pageW);
 
             tabs = new TabHost();
             tabs.Font = Font;
@@ -326,6 +343,11 @@ namespace TabbedExplorer
             tabs.DrawItem += OnDrawTab;
             tabs.Controls.Add(general);
             tabs.Controls.Add(keys);
+            tabs.Controls.Add(log);
+            // 「更新日志」页**切到它才读文件、才渲染**。
+            // 用户报「打开设置窗口也挺慢的，是因为更新日志吗」—— 就是这儿：整份 700 多行逐段上样式
+            // 要上百毫秒，而窗口一开用户看的是「常规」页，这一页白花的。
+            tabs.SelectedIndexChanged += delegate { LoadLogIfNeeded(); };
 
             // 高度：内容要多高给多高，但**不许顶出屏幕**（屏幕高度够就全显示，不够就页内滚动）。
             // 「常规」页比「快捷键」页长得多的那种情况下也能看全（用户的屏幕不一定放得下 ~800 逻辑像素）。
@@ -336,13 +358,19 @@ namespace TabbedExplorer
             // 原来这里是 `Math.Max(Px(240), 剩余高度)`，屏幕一矮就把窗口顶到屏幕外，
             // 底下那截（提示行 / 关闭按钮）永远看不见。现在反过来：**窗口高度封顶**，放不下的交给页内滚动。
             int maxClient = Math.Max(Px(360), work - Px(72));
-            int maxTabsH = Math.Max(Px(150), maxClient - y - footerH);
-            int wantTabsH = Math.Max(hGeneral, hKeys) + Px(14);
+            // 窗口高度**封顶**（用户：「设置窗口越来越高了，给个合适的高度就行，里面本来就有滚动条」）：
+            // 内容再长也不许把窗口撑高，多出来的交给页内滚动（每页都开着 AutoScroll）。
+            // 屏幕比这个上限还矮的时候，才轮到屏幕说话。
+            int capClient = Math.Min(Px(700), maxClient);
+            int maxTabsH = Math.Max(Px(150), capClient - y - footerH);
+            int wantTabsH = Math.Max(Math.Max(hGeneral, hKeys), hLog) + Px(14);
             int tabsH = Math.Min(wantTabsH, maxTabsH);
             // 两页**一律**允许滚动 —— 装得下时 WinForms 自己不会画出滚动条，不必再拿一个开关去赌
             // （用户那次就是「没加可滚动」）。
             general.AutoScroll = true;
             keys.AutoScroll = true;
+            // 日志页自己那个只读框负责滚动（见 BuildLog）—— 别再叠一层页内滚动，两层会打架。
+            log.AutoScroll = false;
             tabs.SetBounds(pad, y, w - pad * 2, tabsH);
             Controls.Add(tabs);
 
@@ -351,8 +379,11 @@ namespace TabbedExplorer
             // 唯一能让它跟着我们颜色模式走的地方是 uxtheme 的子应用名，见 `Theme.StyleScrollBar`。
             StylePageNative(general);
             StylePageNative(keys);
+            StylePageNative(log);      // 递归进只读框，把它那条滚动条也刷成深色
+            FitLogBox(log);            // 页面积定下来了，把只读框铺满
 
             if (keepPage >= 0 && keepPage < tabs.TabCount) tabs.SelectedIndex = keepPage;
+            LoadLogIfNeeded();         // 重建时如果正停在这一页，得把它填回来
             y += tabsH + Px(8);
 
             // ---- 底部：提示行 + 关闭 ----
@@ -439,6 +470,190 @@ namespace TabbedExplorer
                 }
             }
             catch { }
+        }
+
+        // ==================================================================
+        // 「更新日志」页：把程序目录里的 CHANGELOG.md 渲染进来
+        // ==================================================================
+        private const string ChangeLogName = "CHANGELOG.md";
+
+        /// <summary>
+        /// 把 `CHANGELOG.md` 读进一个只读框。**不做通用 markdown 解析** —— 只认这个文件真用到的那几种：
+        /// `#`/`##` 标题、`- ` 列表、`**粗体**`、反引号。目标是「能顺眼地读」，不是当 markdown 阅读器。
+        ///
+        /// 版本号本来就是运行时读 `VERSION` 的，这里同样读文件：找不到（比如只把 exe 拷走了）
+        /// 就显示一行提示，不去猜也别硬编码一份旧的进去。
+        /// </summary>
+        private int BuildLog(TabPage page, int w)
+        {
+            logFont = Font;
+            logFontBold = new Font(Font, FontStyle.Bold);
+            logH1 = new Font(Font.FontFamily, Px(18), FontStyle.Bold);
+            logH2 = new Font(Font.FontFamily, Px(14), FontStyle.Bold);
+
+            RichTextBox box = new RichTextBox();
+            box.ReadOnly = true;
+            box.BorderStyle = BorderStyle.None;
+            box.BackColor = Theme.Chrome;
+            box.ForeColor = Theme.Text;
+            box.Font = logFont;
+            box.WordWrap = true;
+            box.ScrollBars = RichTextBoxScrollBars.Vertical;
+            // 尾巴上那条「完整更新日志」的地址要能点 —— 点开交给系统默认浏览器（同「开源地址」那条路）
+            box.DetectUrls = true;
+            box.LinkClicked += delegate(object s, LinkClickedEventArgs e)
+            {
+                try
+                {
+                    Diag.Step("设置窗口: 打开更新日志链接 " + e.LinkText);
+                    System.Diagnostics.Process.Start(
+                        new System.Diagnostics.ProcessStartInfo(e.LinkText) { UseShellExecute = true });
+                }
+                catch (Exception ex) { SetNotice("打不开浏览器：" + ex.Message); }
+            };
+            box.TabStop = false;
+            box.SetBounds(Px(12), Px(10), w - Px(24), Px(360));
+            page.Controls.Add(box);
+            logBox = box;
+            logPage = page;
+            logFilled = false;         // 新框是空的：等切到这一页（或重建时本来就在这页）再填
+            page.Resize += delegate { FitLogBox(page); };
+            return Px(400);
+        }
+
+        /// <summary>
+        /// 切到「更新日志」页时才真去读、去渲染（设置窗口在「常规」页被打开时这一页不做任何事）。
+        /// ⚠ 只能在这儿拦 —— 别改回「建窗口时顺手填一遍」，那正是「打开设置窗口慢」的来源。
+        /// </summary>
+        private void LoadLogIfNeeded()
+        {
+            if (logFilled || logBox == null) return;
+            if (tabs == null || logPage == null || tabs.SelectedTab != logPage) return;
+            logFilled = true;
+            try { FillLog(logBox); }
+            catch (Exception ex) { Diag.Log("设置窗口: 渲染更新日志失败 " + ex.Message); }
+        }
+
+        /// <summary>读 CHANGELOG.md（每个窗口实例只读一次）；读不到返回 null（调用方给提示 + 线上地址）。</summary>
+        private string ChangeLogText()
+        {
+            if (logRead) return logText;
+            logRead = true;
+            try
+            {
+                string p = System.IO.Path.Combine(
+                    AppDomain.CurrentDomain.BaseDirectory ?? ".", ChangeLogName);
+                if (System.IO.File.Exists(p))
+                    logText = System.IO.File.ReadAllText(p, System.Text.Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("设置窗口: 读 " + ChangeLogName + " 失败 " + ex.Message);
+                logText = null;
+            }
+            return logText;
+        }
+
+        /// <summary>把只读框铺满这一页（页内不滚动，滚动交给框自己那条）。</summary>
+        private void FitLogBox(TabPage page)
+        {
+            if (logBox == null || page == null) return;
+            try
+            {
+                int w = page.ClientSize.Width - Px(24);
+                int h = page.ClientSize.Height - Px(20);
+                if (w > Px(80) && h > Px(60)) logBox.SetBounds(Px(12), Px(10), w, h);
+            }
+            catch { }
+        }
+
+        private void FillLog(RichTextBox box)
+        {
+            string text = ChangeLogText();
+            if (string.IsNullOrEmpty(text))
+            {
+                AppendSeg(box, "没找到 " + ChangeLogName + "。\n\n它应该和 TabbedExplorer.exe 放在同一个文件夹里。\n\n",
+                    logFont, Theme.TextDim);
+                AppendSeg(box, "完整更新日志：" + LogFullUrl + "\n", logFontBold, Theme.Accent);
+                return;
+            }
+
+            string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            int shown = 0;          // 已经渲染了几个版本
+            bool more = false;      // 后面还有被截掉的
+            foreach (string raw in lines)
+            {
+                string line = raw.TrimEnd();
+
+                // 版本标题（`## [v1.14.0] - 日期`）：只认最新那几个，再多就停
+                if (line.StartsWith("## ", StringComparison.Ordinal))
+                {
+                    if (shown >= LogVersions) { more = true; break; }
+                    shown++;
+                    AppendSeg(box, line.Substring(3).Trim() + "\n", logH2, Theme.Accent);
+                    continue;
+                }
+                if (line.Length == 0) { AppendSeg(box, "\n", logFont, Theme.Text); continue; }
+
+                if (line.StartsWith("# ", StringComparison.Ordinal))
+                {
+                    AppendSeg(box, line.Substring(2).Trim() + "\n", logH1, Theme.Text);
+                    continue;
+                }
+
+                // 列表项统一换成「•」；缩进的那层也留着 —— 不然看不出哪几行归在上一条下面。
+                string s = line.TrimStart();
+                string lead = "";
+                if (s.StartsWith("- ", StringComparison.Ordinal))
+                {
+                    lead = (line.Length > s.Length ? "    " : "") + "• ";
+                    s = s.Substring(2);
+                }
+                AppendInline(box, lead + s + "\n");
+            }
+
+            // 尾巴：说清上面只是一截，并给出完整的地址（`DetectUrls` 会把它变成可点的链接）
+            AppendSeg(box, "\n", logFont, Theme.Text);
+            if (more)
+                AppendSeg(box, "…上面只是最新 " + LogVersions + " 个版本，历史版本没往这儿搬。\n", logFont, Theme.TextDim);
+            AppendSeg(box, "完整更新日志：" + LogFullUrl + "\n", logFontBold, Theme.Accent);
+            try { box.SelectionStart = 0; box.SelectionLength = 0; } catch { }
+        }
+
+        /// <summary>按 `**粗体**` 和反引号切成几段，逐段上样式；标记不成对就整段当普通文字。</summary>
+        private void AppendInline(RichTextBox box, string s)
+        {
+            int i = 0;
+            while (i < s.Length)
+            {
+                int b = s.IndexOf("**", i, StringComparison.Ordinal);
+                int c = s.IndexOf('`', i);
+                int next = -1;
+                bool bold = false;
+                if (b >= 0 && (c < 0 || b <= c)) { next = b; bold = true; }
+                else if (c >= 0) { next = c; }
+
+                if (next < 0) { AppendSeg(box, s.Substring(i), logFont, Theme.Text); return; }
+
+                string mark = bold ? "**" : "`";
+                int close = s.IndexOf(mark, next + mark.Length, StringComparison.Ordinal);
+                if (close < 0) { AppendSeg(box, s.Substring(i), logFont, Theme.Text); return; }
+
+                if (next > i) AppendSeg(box, s.Substring(i, next - i), logFont, Theme.Text);
+                string inner = s.Substring(next + mark.Length, close - next - mark.Length);
+                AppendSeg(box, inner, bold ? logFontBold : logFont, bold ? Theme.Text : Theme.AccentDim);
+                i = close + mark.Length;
+            }
+        }
+
+        /// <summary>往只读框尾部追加一段带样式的文字。</summary>
+        private static void AppendSeg(RichTextBox box, string s, Font f, Color c)
+        {
+            box.SelectionStart = box.TextLength;
+            box.SelectionLength = 0;
+            box.SelectionFont = f;
+            box.SelectionColor = c;
+            box.AppendText(s);
         }
 
         // ==================================================================

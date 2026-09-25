@@ -6,6 +6,8 @@
 
 触发器：`Shell.Application`（CLSID 13709620-...）是 explorer.exe 托管的**进程外**组件，
 `FolderItem.InvokeVerb("open")` 是让 **shell 自己**去开这个文件夹，跟开始菜单同路。
+⚠ 建这个组件必须带 `CLSCTX_INPROC_SERVER`：只给 `CLSCTX_LOCAL_SERVER` 会回
+   `REGDB_E_CLASSNOTREG (0x80040154)`（实测），别以为是 CLSID 写错了。
 
 采样：每 10ms 全屏数一遍 CabinetWClass，记 (可见, 扩展样式) 的变化 ——
 「从第一次可见到窗口消失」就是肉眼看到的闪。
@@ -22,8 +24,17 @@ ole32 = ctypes.windll.ole32
 oleaut32 = ctypes.windll.oleaut32
 user32 = ctypes.windll.user32
 
+# ⚠ 不声明 restype，ctypes 一律按 32 位整数收返回值 —— 在 x64 上指针会被**截断**，
+#   表现是随后莫名其妙的一次 access violation（实测 SysAllocString 就踩了这个）。
+oleaut32.SysAllocString.restype = c_void_p
+oleaut32.SysAllocString.argtypes = [ctypes.c_wchar_p]
+user32.FindWindowW.restype = wt.HWND
+user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
+
 COINIT_APARTMENTTHREADED = 0x2
+CLSCTX_INPROC_SERVER = 0x1
 CLSCTX_LOCAL_SERVER = 0x4
+CLSCTX_ALL = 0x17
 DISPATCH_METHOD = 0x1
 DISPATCH_PROPERTYGET = 0x2
 LOCALE_USER_DEFAULT = 0x400
@@ -54,7 +65,8 @@ def guid(s):
 class VARIANT(ctypes.Structure):
     class _U(ctypes.Union):
         _fields_ = [("llVal", ctypes.c_longlong), ("lVal", c_long), ("wReserved", c_ushort),
-                    ("bstrVal", c_void_p), ("punkVal", c_void_p), ("pdispVal", c_void_p)]
+                    ("bstrVal", c_void_p), ("punkVal", c_void_p), ("pdispVal", c_void_p),
+                    ("pad", c_byte * 16)]
     _fields_ = [("vt", c_ushort), ("r1", c_ushort), ("r2", c_ushort), ("r3", c_ushort), ("u", _U)]
 
 
@@ -123,20 +135,20 @@ def open_in_shell(path):
     clsid = guid("{13709620-C279-11CE-A49E-444553540000}")     # Shell.Application
     iid = guid("{00020400-0000-0000-C000-000000000046}")
     p = c_void_p()
-    hr = ole32.CoCreateInstance(byref(clsid), None, CLSCTX_LOCAL_SERVER, byref(iid), byref(p))
+    hr = ole32.CoCreateInstance(byref(clsid), None,
+                                CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+                                byref(iid), byref(p))
     if hr != 0:
         print("CoCreateInstance(Shell.Application) hr=0x%08X" % (hr & 0xFFFFFFFF))
         return False
-    err, ns = invoke(p, "NameSpace", [vstr(path)])
-    if err or ns.vt != VT_DISPATCH:
-        print("NameSpace ->", err, None if ns is None else ns.vt)
+    win = path.replace('/', '\\')
+    if not win.startswith("\\\\") and not (len(win) > 1 and win[1] == ':'):
+        print("路径 %r 不是盘符开头的，跳过" % win)
         return False
-    err, selfitem = invoke(ns.u.pdispVal, "Self")
-    if err or selfitem.vt != VT_DISPATCH:
-        print("Self ->", err, None if selfitem is None else selfitem.vt)
-        return False
-    err, _ = invoke(selfitem.u.pdispVal, "InvokeVerb", [vstr("open")], prop=False)
-    print("InvokeVerb(open) ->", err)
+    # `Shell.Application.Explore(path)` = IShellDispatch::Explore，直接在 shell 进程里
+    # 开一扇文件夹窗 —— 跟开始菜单点文件夹同一条路。
+    err, _ = invoke(p, "Explore", [vstr(win)], prop=False)
+    print("  Explore(%s) -> %r" % (win, err))
     return err is None
 
 
@@ -146,12 +158,32 @@ print("shell 进程 pid = %d（被它开的窗口就是「shell 自己的」）"
 path = sys.argv[1] if len(sys.argv) > 1 else r"D:\Dev\!tmp"
 duration = float(sys.argv[2]) if len(sys.argv) > 2 else 8.0
 
-seen = {}
-t0 = time.time()
-fired = [False]
-
 ENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 user32.EnumWindows.argtypes = [ENUMPROC, wt.LPARAM]
+
+
+def snapshot():
+    out = []
+
+    def cb(h, _):
+        b = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, b, 64)
+        if b.value in ("CabinetWClass", "ExploreWClass"):
+            out.append(h)
+        return True
+
+    user32.EnumWindows(ENUMPROC(cb), 0)
+    return out
+
+
+baseline = set(snapshot())
+print("触发前已有 %d 扇 CabinetWClass：%s" % (len(baseline), [hex(x) for x in baseline]))
+
+seen = {}
+first_vis = {}
+last_vis = {}
+fired = [False]
+t0 = time.time()
 
 while time.time() - t0 < duration:
     el = time.time() - t0
@@ -160,28 +192,36 @@ while time.time() - t0 < duration:
         print("%7.3fs 触发 shell 打开 %s" % (el, path))
         open_in_shell(path)
     if fired[0]:
-        def cb(h, _):
-            b = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(h, b, 64)
-            if b.value in ("CabinetWClass", "ExploreWClass"):
-                ex = GetExStyle(h, GWL_EXSTYLE) & 0xFFFFFFFF
-                vis = 1 if user32.IsWindowVisible(h) else 0
-                pid = wt.DWORD()
-                user32.GetWindowThreadProcessId(h, byref(pid))
-                prev = seen.get(h)
-                cur = (vis, ex)
-                if prev != cur:
-                    seen[h] = cur
-                    fl = []
-                    if ex & WS_EX_TOOLWINDOW: fl.append("TOOLWIN")
-                    if ex & WS_EX_APPWINDOW: fl.append("APPWIN")
-                    if ex & WS_EX_LAYERED: fl.append("LAYERED")
-                    first = "首次" if prev is None else "变化"
-                    print("%7.3fs %s hwnd=0x%-6X pid=%-6d %s vis=%d ex=0x%08X [%s]"
-                          % (el, first, h, pid.value, "SHELL" if pid.value == CPID else "other",
-                             vis, ex, ",".join(fl) or "-"))
-            return True
-        user32.EnumWindows(ENUMPROC(cb), 0)
+        for h in snapshot():
+            ex = GetExStyle(h, GWL_EXSTYLE) & 0xFFFFFFFF
+            vis = 1 if user32.IsWindowVisible(h) else 0
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(h, byref(pid))
+            if vis:
+                if h not in first_vis:
+                    first_vis[h] = el
+                last_vis[h] = el
+            prev = seen.get(h)
+            cur = (vis, ex)
+            if prev != cur or prev is None:
+                seen[h] = cur
+                fl = []
+                if ex & WS_EX_TOOLWINDOW: fl.append("TOOLWIN")
+                if ex & WS_EX_APPWINDOW: fl.append("APPWIN")
+                if ex & WS_EX_LAYERED: fl.append("LAYERED")
+                tag = ["SHELL" if pid.value == CPID else "pid=%d" % pid.value]
+                if h in baseline: tag.append("触发前就有")
+                print("%7.3fs hwnd=0x%-6X %s vis=%d ex=0x%08X [%s]"
+                      % (el, h, " ".join(tag), vis, ex, ",".join(fl) or "-"))
     time.sleep(0.01)
 
+print("\n-- 可见时长汇总（只看触发后新出现/变化过的）--")
+for h in sorted(seen):
+    fv = first_vis.get(h)
+    lv = last_vis.get(h)
+    if fv is None:
+        print("  hwnd=0x%-6X 全程没可见" % h)
+        continue
+    print("  hwnd=0x%-6X 首次可见 %7.3fs  最后可见 %7.3fs  可见时长 %6.0fms%s"
+          % (h, fv, lv, (lv - fv) * 1000, "  (触发前就有)" if h in baseline else ""))
 print("采样结束")

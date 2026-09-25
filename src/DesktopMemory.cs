@@ -23,6 +23,27 @@ namespace TabbedExplorer
     /// </summary>
     internal static class PathRules
     {
+        // 已知文件夹的 FOLDERID。真身在哪儿因机而异（可能被重定向、也可能在 OneDrive），
+        // 所以表里只存 GUID，真路径运行时问系统要（见 KnownFolderPath）。
+        private const string FolderDesktop   = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}";
+        private const string FolderDownloads = "{374DE290-123F-4565-9164-39C4925E467B}";
+        private const string FolderDocuments = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}";
+        private const string FolderPictures  = "{33E28130-4E1E-4676-835A-98395C3BC3BB}";
+        private const string FolderMusic     = "{4BD8D571-6D19-48D3-BE97-422220080E43}";
+        private const string FolderVideos    = "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}";
+
+        /// <summary>`shell:` 前缀（别名写作的判断用它）。</summary>
+        private const string ShellPrefix = "shell:";
+
+        /// <summary>
+        /// **没有文件系统路径**的那些虚拟位置 —— 只能按 shell 标识存。
+        /// ⚠ 有真身的（桌面 / 下载 / 文档 / 图片 / 音乐 / 视频）**不许往这张表里放**：
+        ///   存成 `shell:xxx` 之后 `explorer.exe /n,"shell:Desktop"` 开出来那扇窗，地址栏报的是
+        ///   `D:\Users\a\Desktop` —— 跟我们要开的那个字符串对不上 ⇒ 归属判定永远认不到它
+        ///   （判据是「地址栏内容 == 目标路径」），那个标签白等 25 秒超时，还把还原链上
+        ///   其余标签一起拖住（实测一次白等 10 秒以上：`EmbedForm: 起 explorer … shell:Desktop`
+        ///   之后 10.7 秒里一个标签都没起来）。
+        /// </summary>
         private static readonly Dictionary<string, string> virtuals =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
@@ -32,30 +53,44 @@ namespace TabbedExplorer
                 { "Recycle Bin",      "shell:RecycleBinFolder" },
                 { "网络",              "shell:NetworkPlacesFolder" },
                 { "Network",          "shell:NetworkPlacesFolder" },
-                { "下载",              "shell:Downloads" },
-                { "Downloads",        "shell:Downloads" },
-                { "桌面",              "shell:Desktop" },
-                { "Desktop",          "shell:Desktop" },
             };
 
         /// <summary>
-        /// 已知文件夹：显示名 → FOLDERID。这几个**不能**像上面那样写 `shell:xxx` 常量，
-        /// 因为重定向位置因机而异（`shell:MyPictures` 这类老令牌在 Win10 上干脆解析不了，实测 0x80070003），
-        /// 而 `shell:::{GUID}` 解析出来是个**虚拟项**（取不到文件系统路径，跟窗口实际在看的那个文件夹不是一回事）。
-        /// 所以这里只存 GUID，真路径运行时问系统要（见 `KnownFolderPath`）。
+        /// 有真身的已知文件夹：显示名 → FOLDERID。
+        /// **不能**写成 `shell:xxx` 常量：重定向位置因机而异（`shell:MyPictures` 这类老令牌在 Win10 上
+        /// 干脆解析不了，实测 0x80070003），而 `shell:::{GUID}` 解析出来是个**虚拟项**
+        ///（取不到文件系统路径，跟窗口实际在看的那个文件夹不是一回事）。
         /// 键只能写死 —— 它是本地化的显示名，没有「反查」的 API，中英文各留一份。
         /// </summary>
         private static readonly Dictionary<string, string> knownFolders =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
-                { "图片",      "{33E28130-4E1E-4676-835A-98395C3BC3BB}" },
-                { "Pictures",  "{33E28130-4E1E-4676-835A-98395C3BC3BB}" },
-                { "视频",      "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" },
-                { "Videos",    "{35286A68-3C57-41A1-BBB1-0EAE73D76C95}" },
-                { "音乐",      "{4BD8D571-6D19-48D3-BE97-422220080E43}" },
-                { "Music",     "{4BD8D571-6D19-48D3-BE97-422220080E43}" },
-                { "文档",      "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}" },
-                { "Documents", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}" },
+                { "桌面",      FolderDesktop },
+                { "Desktop",   FolderDesktop },
+                { "下载",      FolderDownloads },
+                { "Downloads", FolderDownloads },
+                { "图片",      FolderPictures },
+                { "Pictures",  FolderPictures },
+                { "视频",      FolderVideos },
+                { "Videos",    FolderVideos },
+                { "音乐",      FolderMusic },
+                { "Music",     FolderMusic },
+                { "文档",      FolderDocuments },
+                { "Documents", FolderDocuments },
+            };
+
+        /// <summary>
+        /// `shell:xxx` 别名 → FOLDERID。
+        /// `ShellWindows.LocationURL` 对某些位置给的就是这种写法（不是 `file:///…`），
+        /// 实测能换成真路径的只有这三个（`shell:MyPictures` / `MyMusic` / `MyVideos` 已经解析不了，
+        /// 0x80070003；此电脑 / 回收站 / 网络 压根没有文件系统路径，本来就该保持虚拟写法）。
+        /// </summary>
+        private static readonly Dictionary<string, string> shellAliases =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "Desktop",   FolderDesktop },
+                { "Downloads", FolderDownloads },
+                { "Personal",  FolderDocuments },   // 老别名：`shell:Personal` 就是「文档」
             };
 
         /// <summary>地址栏文字 → 存进记忆的值。认不出来的原样存（还原时再判）。</summary>
@@ -66,10 +101,13 @@ namespace TabbedExplorer
             if (addr.Length == 0) return null;
             string v;
             if (virtuals.TryGetValue(addr, out v)) return v;
-            if (knownFolders.TryGetValue(addr, out v))
+            if (knownFolders.TryGetValue(addr, out v)) return KnownFolderPath(v) ?? addr;
+            // `shell:xxx` 这种别名写作（`LocationURL` 给的常常就是它）：有真身的换成真路径，
+            // 换不了（此电脑 / 回收站 / 网络）就原样留着。理由见 `virtuals` 上面那段。
+            if (addr.StartsWith(ShellPrefix, StringComparison.OrdinalIgnoreCase))
             {
-                string real = KnownFolderPath(v);
-                if (real != null) return real;
+                if (shellAliases.TryGetValue(addr.Substring(ShellPrefix.Length), out v))
+                    return KnownFolderPath(v) ?? addr;
             }
             return addr;
         }

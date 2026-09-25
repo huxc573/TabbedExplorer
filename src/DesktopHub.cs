@@ -74,16 +74,28 @@ namespace TabbedExplorer
         /// </summary>
         private readonly Dictionary<IntPtr, ShellCandidate> pendingShell =
             new Dictionary<IntPtr, ShellCandidate>();
+        /// <summary>
+        /// 盯梢线程已经抢出来的路径（值 = 路径 + 当时的事件号），等 UI 线程来兑现（见 <see cref="WatchShellWindow"/>）。
+        /// 单独一份的原因：盯梢线程抢到路径时，那扇窗**已经被关掉了** —— 不能靠「窗口还活着」这个前提。
+        /// </summary>
+        private readonly Dictionary<IntPtr, ShellCandidate> shellReady =
+            new Dictionary<IntPtr, ShellCandidate>();
+        /// <summary>正在被盯的 shell 窗口（避免 CREATE / SHOW 两条事件各起一条线程）。</summary>
+        private readonly HashSet<IntPtr> shellWatched = new HashSet<IntPtr>();
+        /// <summary>被我们清空过绘制区的 shell 窗口（收尾要还原，见 <see cref="BlankShellWindow"/>）。</summary>
+        private readonly HashSet<IntPtr> shellBlanked = new HashSet<IntPtr>();
         /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
         private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
         /// <summary>候选窗口要「晾」多久才收。够短，用户感觉不出来；够长，让标签先把自己起的窗口认领掉。</summary>
         private const int CaptureDelayMs = 700;
         /// <summary>
-        /// shell 窗口「等地址栏填好」的上限。shell 通常是**先导航、再显示**，所以 SHOW 那一刻地址栏
-        /// 往往已经填好了（RegisterShellCandidate 里会当场试一次）。现在从 CREATE 就开始等
-        /// （那 ~0.7 秒是白捡的），超时按**最近一次事件**重新起算，免得早那一次先把点耗光。
-        /// 到点还读不出就当没这回事 —— 我们本来就没碰过它，它还是那个正常窗口，用户自己关。
+        /// shell 窗口「等它报出目标目录」的上限。从 CREATE 就开始等（那 ~0.7 秒是白捡的），
+        /// 超时按**最近一次事件**重新起算，免得早那一次先把点耗光。
+        ///
+        /// 给得这么宽是因为那扇窗从 CREATE 起就被我们按住（`SW_HIDE`，见 `HushShellWindow`）——
+        /// 用户看不到它，慢一点无所谓；反倒是逼得太紧会误判。到点还读不出就把窗口**放开**
+        /// （`UnhushShellWindow`，不留在 shell 进程里），当没这回事：它还是那个正常窗口，用户自己关。
         /// </summary>
         private const int ShellResolveMs = 1200;
         /// <summary>
@@ -408,6 +420,8 @@ namespace TabbedExplorer
         {
             public DateTime SeenAt;
             public int ReactMs;
+            /// <summary>盯梢线程抢出来的路径（只有 <see cref="shellReady"/> 里那份才用）。</summary>
+            public string Path;
         }
 
         /// <summary>
@@ -483,16 +497,39 @@ namespace TabbedExplorer
                 if (shellTake)
                 {
                     // ★ 实测教训（2026-09-24，川报「退出程序后 Win+E / 开始菜单打不开资源管理器」）：
-                    //   对 shell 的窗口**一个字节都不能改** —— 不置透明、不 SW_HIDE。
+                    //   对 shell 的窗口**不能动样式位** —— 不置透明、不摘 APPWINDOW、不 SetParent。
                     //   shell 会预建一些浏览器窗口备着而根本不显示（探针实测到 `vis=0` 的 CabinetWClass），
                     //   而防闪那层透明是在 CREATE 那一刻就上的；那个窗口永远不会 SHOW ⇒ 永远走不到「撕透明」，
                     //   等于在 shell 进程里留了一个**隐形窗口**。Win+E 与开始菜单那条入口只去「激活」
                     //   它自己的窗口、不新建 ⇒ 激活到一个隐形的就是「按下去毫无反应」，而且透明是加在
                     //   shell 的窗口上的，退程序也不恢复。
-                    //   ⇒ shell 这条路上我们只读、只关，不碰样式；代价是那扇窗会可见一小会儿（见 TakeOverShellWindow）。
+                    // ★ 但 `SW_HIDE` 不在这条线上（2026-09-25 改）：它**不改任何样式位**、完全可逆，
+                    //   而且我们只在「它已经可见」那一刻按下去，收尾必定「关掉它」或「原样 SW_SHOW 放开」
+                    //   （见 HushShellWindow / WatchShellWindow 的 finally）——绝不会留隐形窗。
+                    //   为什么非按不可：实测那扇窗的 `LocationURL` 要等**它已经可见之后** 90~116ms 才读得出来，
+                    //   「先读路径、再关窗」根本来不及 —— 屏幕上实打实露的那一百多毫秒就是川说的那一下闪。
+                    //   ⇒ shell 这条路上我们只做三件可逆的事：建窗那一刻清掉绘制区、露脸那一下按住、`SC_CLOSE` 关掉。
+                    //
+                    // ⚠ 两个动作必须排在**任何写日志之前**：日志是每行 open/write/close 落盘的
+                    //   （见 `Diag`），实测那一行能把后面的动作推迟一百多毫秒 —— 而我们抢的就是这几十毫秒。
+                    if (!isShow) BlankShellWindow(h);      // CREATE：离 SHOW 还有 ~430ms
+                    long hz = Environment.TickCount;
+                    bool hushed = (isShow || wasVisible) && HushShellWindow(h);   // 露脸了：按住
+                    int hms = Environment.TickCount - (int)hz;
+                    // ⚠ 别用 `GetWindowRgn` 去验证：它对**别的进程**的窗口恒返回 0（实测），
+                    //   看上去像「没设上」。我们自己的账（shellBlanked）才是真的；
+                    //   「空绘制区确实让出屏幕」是用 `probe/startmenu_timeline_probe.py --grab`
+                    //   抓屏幕前后比对证实的（设上之后那块屏差 80 处、基线只差 1 处）。
+                    bool blankNow = IsShellBlanked(h);
                     Diag.Step(string.Format(
-                        "Hub: 新窗口 -> shell 自己的（不碰样式）（{0}，事件后 {1}ms）cab=0x{2:X}",
-                        isShow ? "SHOW" : "CREATE", react, h.ToInt64()));
+                        "Hub: 新窗口 -> shell 自己的（{0}，事件后 {1}ms，{2}）cab=0x{3:X}",
+                        isShow ? "SHOW" : "CREATE", react,
+                        (blankNow ? "绘制区已清空（不画任何东西）" : "绘制区没清掉") +
+                        (isShow ? (hushed ? "，已按住（耗时 " + hms + "ms）" : "，按住没生效") : ""),
+                        h.ToInt64()));
+                    // ★ 另起一条线程去抢时间关窗（见 WatchShellWindow）：贴回 UI 线程做这一步
+                    //   在冷启动时会排 400ms 队，而窗口 495ms 就可见了。
+                    WatchShellWindow(h, react);
                 }
                 else if (!wasVisible && HiddenByUs(h))
                 {
@@ -636,10 +673,202 @@ namespace TabbedExplorer
             return EmbedApi.IsShellOwned(h);                  // ★ 就是这条跟 IsHideCandidate 反着来
         }
 
+        /// <summary>
+        /// 在**专用线程**上盯 shell 刚开的那扇窗：路径一出来就立刻把它关掉（点 × 走的就是这条），
+        /// 抢在它画到屏幕上之前。
+        ///
+        /// 为什么必须另开一条线程（实测 2026-09-25）：
+        ///   · shell 那扇窗 `CREATE +16ms` 我们就知道了（watcher 线程），但「读路径 + 关窗」原来
+        ///     是 `Post` 回 UI 线程做的 —— **冷启动那一趟 UI 线程正忙着建窗口 / 读书签**，
+        ///     实测这一 Post 排了 **400ms** 才轮到，而窗口在 `CREATE +495ms` 就已经可见了：
+        ///     用户看到的还是「闪一下」（实测那一段可见 169ms）。
+        ///   · 读路径本身现在不贵也不阻塞（`ShellBrowserReg.PathOfWindow` 从队尾倒扫，
+        ///     一次约 10ms），放在这条线程上每 25ms 问一次很划算。
+        ///
+        /// 关闭用 `WM_SYSCOMMAND`/`SC_CLOSE`，**一个字节的样式都不碰** —— 这条红线见 `OnWindowShown` 里那段教训。
+        ///
+        /// ⚠ 不闪靠的**不是**这条线程：真正管用的是建窗那一刻清掉绘制区（`BlankShellWindow`）。
+        ///   实测 `LocationURL` 要到**它已经可见之后** 90~116ms 才读得出来，而 `SHOW` 之后的同步
+        ///   窗口操作（`SW_HIDE` 实测花了 109ms）都赶不上那一帧。这里只负责：**一露脸就按住**
+        ///   （把任务栏按钮也收掉）、等路径、`SC_CLOSE`、把路径存进 `shellReady`。
+        ///
+        /// ⚠ 收尾必做（`finally` 里那句）：只要我们按过它，就必须让它**要么没了、要么恢复可见** ——
+        ///   在 shell 进程里留一扇隐形窗就是「Win+E / 开始菜单按下去毫无反应」那个坑
+        ///   （见 `OnWindowShown` 里那段教训）。
+        ///
+        /// ⚠ 这条线程**只负责按住 + 关窗 + 把路径存进 `shellReady`**，不做转生：转生依旧排回 UI 线程
+        ///   （`RegisterShellCandidate` / `DrainShell`），那两个地方动手前会先看 `shellReady`。
+        ///   这样「关窗」和「开标签」两条道上不会各自开一个标签，也不会让用户那个文件夹凭空消失。
+        ///
+        /// ⚠ **绘制区要等它真没了才还**（`finally` 里那段，2026-09-25 实测补上的一层）：
+        ///   先前是「一读到路径就还」—— 那一下正好落在 shell 把窗 `ShowWindow` 出来之前，
+        ///   于是它一露脸就是**有绘制区**的，实打实画了 ~110ms（我们那一下 `SW_HIDE` 同步落在
+        ///   explorer 正忙的线程上，实测就要 110ms）。这就是用户报的「从开始菜单点文件夹还是会闪」
+        ///   剩下的那一层：清空绘制区只负责到「关掉它」为止。
+        /// </summary>
+        private void WatchShellWindow(IntPtr h, int react)
+        {
+            lock (shellWatched) { if (!shellWatched.Add(h)) return; }
+            Thread t = new Thread(delegate()
+            {
+                bool hushed = false;
+                bool asked = false;          // 已经发过 `SC_CLOSE`
+                try
+                {
+                    DateTime deadline = DateTime.Now.AddMilliseconds(ShellResolveMs);
+                    while (DateTime.Now < deadline)
+                    {
+                        if (quitting) return;
+                        if (!NativeMethods.IsWindow(h)) return;      // 它自己没了（用户关了）
+                        // 它露脸了（或 shell 又把它显出来）：按住。见 HushShellWindow。
+                        if (HushShellWindow(h) && !hushed)
+                        {
+                            hushed = true;
+                            Diag.Step(string.Format("Hub: 盯梢中把 shell 那扇窗按住 cab=0x{0:X}", h.ToInt64()));
+                        }
+                        string p = ShellBrowserReg.PathOfWindow(h);
+                        if (p != null)
+                        {
+                            lock (shellReady) shellReady[h] = new ShellCandidate { Path = p, ReactMs = react };
+                            EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);   // WM_SYSCOMMAND / SC_CLOSE
+                            Diag.Step(string.Format(
+                                "Hub: 关掉 shell 那扇窗（当时{0}）cab=0x{1:X} -> {2}",
+                                hushed ? "被我们按着" : "还没显示", h.ToInt64(), p));
+                            asked = true;
+                            break;
+                        }
+                        Thread.Sleep(25);
+                    }
+                }
+                catch (Exception ex) { Diag.Log("Hub: shell 盯梢线程失败 " + ex.Message); }
+                finally
+                {
+                    // ★ 发过关窗请求就等它**真没了**再走（上限 2 秒）：`SC_CLOSE` 只是「请求」，
+                    //   而它可见的那一段里绘制区还得继续压着（见本方法上面那段教训）。
+                    if (asked)
+                    {
+                        DateTime bye = DateTime.Now.AddMilliseconds(2000);
+                        while (DateTime.Now < bye && NativeMethods.IsWindow(h)) Thread.Sleep(50);
+                    }
+                    // 收尾必做：到这儿它要是还活着，就说明我们没关掉它 —— 那它必须是一扇
+                    // **正常可见的窗**，绝不能是被我们按住 / 被我们清空绘制区的状态
+                    //（在 shell 进程里留隐形窗 = v1.13.1 那个「Win+E 按下去毫无反应」，见 `OnWindowShown`）。
+                    UnblankShellWindow(h);
+                    UnhushShellWindow(h, asked ? "关窗请求没被理" : "等不到路径");
+                    lock (shellWatched) shellWatched.Remove(h);
+                }
+            });
+            t.IsBackground = true;
+            t.Name = "TBE-shell窗口盯梢";
+            t.Start();
+        }
+
+        /// <summary>
+        /// 把 shell 那扇**刚建出来、还没显示**的窗变成「画不出任何东西」的（清空绘制区）。
+        ///
+        /// 为什么非得在 CREATE 做（实测 2026-09-25）：
+        ///   · 那扇窗 `SHOW +0ms` 就可见了，而它的目标路径要到 `SHOW +116ms` 才读得出来；
+        ///   · 退一步「一露脸就 `SW_HIDE`」也不行 —— 跨进程 `ShowWindow` 实测花了 **109ms**
+        ///     （同步调用落在 explorer 正忙的线程上，得等它回到消息循环），我们还是露了 118ms。
+        ///   ⇒ `SHOW` 之后的任何同步窗口操作都赶不上那一帧；只有 CREATE 那一刻
+        ///     （离 SHOW 还有 ~430ms）来得及。
+        ///
+        /// ⚠ 这不是样式位：`SetWindowRgn` 只改绘制区，一句 `SetWindowRgn(h, NULL)` 就还原 ——
+        ///   和那条红线（不置透明 / 不改 exstyle / 不 SetParent）不是一回事。
+        ///   收尾必做：关掉它，或者 `UnblankShellWindow` 还原（见 `WatchShellWindow` 的 finally）。
+        /// </summary>
+        private bool BlankShellWindow(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            if (!EmbedApi.MakeBlank(h)) return false;
+            lock (shellBlanked) shellBlanked.Add(h);
+            return true;
+        }
+
+        /// <summary>去掉我们加在 shell 窗口上的绘制区限制（没加过 / 窗已经没了就什么都不做）。</summary>
+        private void UnblankShellWindow(IntPtr h)
+        {
+            lock (shellBlanked) { if (!shellBlanked.Remove(h)) return; }
+            EmbedApi.Unblank(h);
+        }
+
+        /// <summary>这扇 shell 窗口的绘制区现在是不是被我们清空的（只管我们自己记的账）。</summary>
+        private bool IsShellBlanked(IntPtr h)
+        {
+            lock (shellBlanked) return shellBlanked.Contains(h);
+        }
+
+        /// <summary>
+        /// 把 shell 那扇**已经可见**的窗当场按下去（`SW_HIDE`）。
+        ///
+        /// 为什么值当（实测 2026-09-25）：那扇窗从「可见」到「能读出 `LocationURL`」之间隔着
+        /// 90~116ms，而它可见的那一段里任务栏会多出一个按钮。绘制区已被清空（`BlankShellWindow`），
+        /// 屏幕上本来就不画东西；这里再把**任务栏按钮**一并收掉。
+        ///
+        /// ⚠ 只按已经可见的窗：shell 那批「建出来备着、从不显示」的窗我们碰都不碰。
+        ///   `ShowWindow` 的返回值正好就是「它原来可不可见」—— 返回 false 说明它本来就藏着（我们什么都没做）。
+        /// ⚠ 这是**可逆**动作，和那条红线（不置透明 / 不改扩展样式位）不是一回事：
+        ///   样式位改了会永久留在 shell 进程里（退程序都不恢复），而 `SW_HIDE` 一次 `SW_SHOW` 就回去了。
+        ///   所有按下去的路径都保证收尾（关掉 or 放开），见 `WatchShellWindow` 的 finally 与 `UnhushShellWindow`。
+        /// </summary>
+        /// <returns>这一下真按到了（它之前是可见的）</returns>
+        private bool HushShellWindow(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                if (!EmbedApi.IsWindowVisible(h)) return false;
+                return EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+            }
+            catch (Exception ex) { Diag.Log("Hub: 按住 shell 窗口失败 " + ex.Message); return false; }
+        }
+
+        /// <summary>
+        /// 放开被按住的 shell 窗口（它已经没了 / 已经自己又显出来，就什么都不做）。
+        ///
+        /// 收尾必做，而且是**无条件**叫一次（见 `WatchShellWindow` 的 `finally`）：按住它的一共两条道
+        /// （盯梢线程、UI 线程的 `OnWindowShown`），谁按的都算 —— 只要它还活着、还是隐形的，
+        /// 就必须恢复可见。在 shell 进程里留一扇隐形窗就是 v1.13.1 那个
+        /// 「Win+E / 开始菜单按下去毫无反应」，而那条路只有重启电脑能出来。
+        /// </summary>
+        private void UnhushShellWindow(IntPtr h, string why)
+        {
+            try
+            {
+                if (!NativeMethods.IsWindow(h)) return;
+                if (EmbedApi.IsWindowVisible(h)) return;
+                EmbedApi.ShowWindow(h, EmbedApi.SW_SHOW);
+                Diag.Log("Hub: shell 那扇窗没能关掉（" + why + "），已恢复显示 —— 不留隐形窗");
+            }
+            catch (Exception ex) { Diag.Log("Hub: 恢复 shell 窗口失败 " + ex.Message); }
+        }
+
+        /// <summary>取走盯梢线程交上来的路径（取了就清）。见 <see cref="WatchShellWindow"/>。</summary>
+        private ShellCandidate TakeShellReady(IntPtr h)
+        {
+            lock (shellReady)
+            {
+                ShellCandidate c;
+                if (!shellReady.TryGetValue(h, out c)) return null;
+                shellReady.Remove(h);
+                return c;
+            }
+        }
+
         /// <summary>登记一个「等地址栏」的 shell 窗口（UI 线程）。</summary>
         private void RegisterShellCandidate(IntPtr h, int react)
         {
             if (quitting || !Settings.CaptureAll || !Settings.CaptureShell) return;
+            // ★ 先兑现盯梢线程抢出来的路径：它可能**已经把窗关掉了**，所以这句必须排在 `IsWindow` 前面 ——
+            //   窗口没了不代表这事完了，用户要的那个标签还没开。
+            ShellCandidate fast = TakeShellReady(h);
+            if (fast != null)
+            {
+                Diag.Step(string.Format("Hub: shell 窗口路径就绪（盯梢线程抢的，当时{0}）cab=0x{1:X} -> {2}",
+                    EmbedApi.IsWindowVisible(h) ? "已可见" : "还没显示", h.ToInt64(), fast.Path));
+                TakeOverShellWindow(h, fast.Path, fast.ReactMs);
+                return;
+            }
             if (!NativeMethods.IsWindow(h)) return;
             if (pendingShell.ContainsKey(h))
             {
@@ -672,6 +901,17 @@ namespace TabbedExplorer
             foreach (KeyValuePair<IntPtr, ShellCandidate> kv in new List<KeyValuePair<IntPtr, ShellCandidate>>(pendingShell))
             {
                 IntPtr h = kv.Key;
+                // ★ 先看盯梢线程有没有把路径抢出来 —— 它可能**已经把窗关掉了**，所以这句必须排在
+                //   `IsWindow` 前面（窗口没了不代表不转生了，用户要的那个标签还没开）。
+                ShellCandidate fast = TakeShellReady(h);
+                if (fast != null)
+                {
+                    pendingShell.Remove(h);
+                    Diag.Step(string.Format("Hub: shell 窗口路径就绪（盯梢线程抢的，当时{0}）cab=0x{1:X} -> {2}",
+                        EmbedApi.IsWindowVisible(h) ? "已可见" : "还没显示", h.ToInt64(), fast.Path));
+                    TakeOverShellWindow(h, fast.Path, fast.ReactMs);
+                    continue;
+                }
                 if (!NativeMethods.IsWindow(h))
                 {
                     pendingShell.Remove(h);
@@ -710,8 +950,9 @@ namespace TabbedExplorer
         /// 关它用 `WM_SYSCOMMAND`/`SC_CLOSE`（点 × 走的就是这条），不用手写 `WM_CLOSE` ——
         /// 关一个**别人的**窗口，越接近正常操作越好（shell 那边可能还有它自己的账要结）。
         ///
-        /// ⚠ 我们**没有**藏过它 / 置过透明（见 OnWindowShown 里那段教训），所以这里不需要任何还原动作；
-        ///   万一它没关掉，留在屏幕上的也是一个**正常窗口**，而不是隐形窗口。
+        /// ⚠ 我们**没有**给它置过透明 / 动过样式位（见 OnWindowShown 里那段教训）——只可能清过它的
+        ///   绘制区、`SW_HIDE` 按过它一下；两者都有自己的收尾（`WatchShellWindow` 的 finally），
+        ///   这里只管发关闭请求。它要是没关掉，也是留在屏幕上的一个**正常窗口**，不是隐形窗口。
         /// </summary>
         private void TakeOverShellWindow(IntPtr h, string path, int react)
         {

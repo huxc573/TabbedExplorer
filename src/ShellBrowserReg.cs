@@ -41,6 +41,17 @@ namespace TabbedExplorer
         private static readonly Guid CLSID_ShellWindows = new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
         private static readonly int ownPid = Process.GetCurrentProcess().Id;
 
+        /// <summary>
+        /// <see cref="PathOfWindow"/> 从清单**队尾**往前找几项。
+        ///
+        /// 为什么是队尾（实测 `probe/shellwindows_timing_probe.py`）：新开的浏览窗口是
+        /// **追加在清单末尾**的 —— 触发 shell 开一个文件夹，`Count` 从 130 变 131，
+        /// 第 130 项就是它，而且那一刻 `LocationURL` 已经有值、**窗口还没可见**。
+        /// 从头扫一遍纯属白花：一次全量枚举 16~41ms，而这一问要在 25ms 一轮的盯梢里反复做。
+        /// 留 8 项余量：还原标签那阵子我们自己的窗口也在往队尾追加，会把刚出现的 shell 窗口往后挤。
+        /// </summary>
+        private const int Lookback = 8;
+
         /// <summary>上次全量登记的时间（见 <see cref="ExcludeOurs"/> 里的节流）。</summary>
         private static DateTime lastRun = DateTime.MinValue;
         private static readonly TimeSpan minInterval = TimeSpan.FromSeconds(2);
@@ -137,6 +148,11 @@ namespace TabbedExplorer
         ///   同一个 key（见 `ExplorerHost` 里那段）。shell 那条路我们从不 SetParent，句柄才对得上。
         /// ⚠ 回来还要过同一套筛子（`PathRules.Store` → `Restorable`）：`LocationURL` 对「此电脑」
         ///   这类虚拟位置给的不是 `file:///` 路径，直接交出去会让调用方「先关窗再开标签」两头空。
+        ///
+        /// ⚠ **每次都要重新 CoCreateInstance**，不能把一个根对象留着反复用：复用的那个对象
+        ///   **看不见之后新加的项**（实测：留着用的那份一直只有旧项，每轮新建的立刻就能看到新窗）。
+        ///   好在这一步本身只要 6ms 上下。
+        /// ⚠ 会被**别的线程**调（`DesktopHub` 的 shell 盯梢线程），所以这里不碰任何可变静态字段。
         /// </summary>
         internal static string PathOfWindow(IntPtr hwnd)
         {
@@ -150,9 +166,10 @@ namespace TabbedExplorer
                 if (root == null) return null;
 
                 int total = ReadInt(root, "Count");
-                for (int i = 0; i < total; i++)
+                // 从队尾往前找（理由见 Lookback）。
+                for (int i = 0; i < Lookback && i < total; i++)
                 {
-                    IDispatch item = ReadItem(root, i);
+                    IDispatch item = ReadItem(root, total - 1 - i);
                     if (item == null) continue;
                     if (ReadHwnd(item) != hwnd) continue;      // 不是这一扇
                     string p = FileUrlToPath(ReadString(item, "LocationURL"));

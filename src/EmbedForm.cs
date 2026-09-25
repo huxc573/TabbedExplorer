@@ -148,10 +148,16 @@ namespace TabbedExplorer
         ///
         /// 这一格管的是**起进程**（真正的资源开销在这儿），跟「谁认到哪个窗口」无关：
         /// 窗口认领是各标签自己按地址栏内容认的（见 `EmbedApi.FindNewCab`），同时多漂几个不会认错。
-        /// 900ms 略短于「窗口最晚 1.3 秒出现」，所以在飞的 explorer 是个位数 ——
-        /// 跟 `probe/launch_concurrency_bench.py` 量出来的「4 并发最快」那张表对得上。
+        ///
+        /// **450ms**（2026-09-25 从 900 收紧）：900 是按「窗口最晚 1.3 秒出现」配的，那前提是
+        /// 头一批 explorer 一起抢 CPU。现在「优先那个」独占着先起、落定之后其余才排队
+        ///（见 `StartRestLaunches` 的 waitForHead），所以这一格只管**其余标签多快排完** ——
+        /// 收紧到 450 只是把排队的那几个提前半格，不会去抢用户正在等的那个。
+        /// 实测（`probe/restore_timeline.py`，9 个记忆标签）：第一个标签可用 **1.6 秒**，
+        /// 全部落定冒 11.4 秒；900 那会儿第一个要 4.5 秒（当时「优先那个」还跟其余一起挤）。
+        /// ⚠ 真要再调之前先量一遍：别再把它调回去当「防抢 CPU」的旋钮，那个旋钮现在在 waitForHead 上。
         /// </summary>
-        private const int SpawnSlotMs = 900;
+        private const int SpawnSlotMs = 450;
 
         /// <summary>起进程的格到点放行：队列里还有人时每 200ms 推一把（见 <see cref="SpawnSlotMs"/>）。</summary>
         private readonly Timer pumpTimer = new Timer();
@@ -1239,12 +1245,14 @@ namespace TabbedExplorer
         ///
         /// <paramref name="first"/> = 用户**此刻正等着**的那一个（收编 / 转生那条路传进来的路径），
         /// 它排第一个；其余按记忆里的顺序跟在后面 —— 这就是用户说的「优先处理激活标签、
-        /// 延迟后续并发伪懒加载」：名字早摆好了，内容一个个填（一轮 900ms 一格，见 `PumpLaunch`）。
+        /// 延迟后续并发伪懒加载」：名字早摆好了，内容一个个填（一轮一格，见 `SpawnSlotMs`）。
         /// 不传就退回「记忆里当时选中的那个」优先。
         ///
-        /// <paramref name="waitForHead"/> = 其余的**等第一个落定**再放。只有「用户正在等一扇窗」
-        /// 那两条路（`DesktopHub` 的收编 / 转生）传 true —— 提前放会让十几个 explorer 一起抢
-        /// CPU、把用户那个的收编拖慢；后台还原（`RestoreRememberedTabs`）则是越早并上越好，传 false。
+        /// <paramref name="waitForHead"/> = 其余的**等第一个落定**再放。三个调用点（`DesktopHub`
+        /// 的收编 / 转生、`RestoreRememberedTabs`）全都是「用户正在等一扇窗」—— **一律传 true**。
+        /// 提前放会让十几个 explorer 一起抢 CPU，把用户等的那个的收编拖慢（实测 196ms → 687ms），
+        /// 更要命的是它连「第一个可用的标签」都要拖到 4.5 秒才出来（用户盯着的正是那一个）。
+        /// 真出了问题也不会干等：落定不了有 4 秒兜底（见 `StartRestFallback`）。
         /// </summary>
         internal void StartRestLaunches(string first, bool waitForHead)
         {
@@ -1270,7 +1278,7 @@ namespace TabbedExplorer
             if (firstIdx < 0) firstIdx = 0;
             if (hosts.Count == 0) return;
             ExplorerHost head = hosts[firstIdx];
-            StartDeferred(firstIdx);          // 不管它排第几，先起（收编进来的不是占位，会自动跳过）
+            StartDeferred(firstIdx, true);    // 不管它排第几，先起（收编进来的不是占位，会自动跳过）
 
             // ★ 其余的**等它落定**再放。放早了就是十几个 explorer 一起起舞抢 CPU，
             //   它自己的收编会被拖慢（实测 196ms → 687ms —— 用户看到的就是「还是在打开中」）。
@@ -1280,12 +1288,19 @@ namespace TabbedExplorer
             StartRestFallback();              // 它要是一直不回来（起失败卡超时），别把其余饿死
         }
 
-        /// <summary>兜底：优先那个迟迟没落定（起失败卡超时之类），照旧把其余的放出去。</summary>
+        /// <summary>
+        /// 兜底：优先那个迟迟没落定（起失败卡 25 秒超时之类），照旧把其余的放出去。
+        ///
+        /// 4 秒而不是更久：这一步的代价是**全队列干等**。实测一次「优先那个」因为目标写错
+        ///（`shell:Desktop`，见 `PathRules.virtuals` 那段）认不到窗口，10 秒里一个标签都没起来 ——
+        /// 用户等的那个既没出来，其余 9 个也被按着不动。正常情况优先那个 1~3 秒就落定，
+        /// 4 秒足够；真出了问题越早放越好。
+        /// </summary>
         private void StartRestFallback()
         {
             if (restFallback != null) return;
             restFallback = new System.Windows.Forms.Timer();
-            restFallback.Interval = 10000;
+            restFallback.Interval = 4000;
             restFallback.Tick += delegate
             {
                 restFallback.Stop();
@@ -1341,11 +1356,15 @@ namespace TabbedExplorer
         /// 还原记忆标签（老入口，把两步串起来）——「摆名字 + 记忆里选中那个优先起」。
         /// ⚠ 收编 / 转生那条路**不要**用它：它们要在两步之间插一次「收下用户那扇窗」，
         ///   见 `DesktopHub.AdoptWindow` / `TakeOverShellWindow`。
+        /// ⚠ 它的唯一调用点是 `EnsureFirstTab`，也就是**用户刚按了 Win+E、窗口已经亮在眼前**的那一刻 ——
+        ///   所以这里传 `waitForHead = true`：先让**当前选中的那个标签**独占着起，落定之后再放其余的。
+        ///   （原来传 false「越早并上越好」，实测是反的：9 个 explorer 一起起舞，第一个可用的标签
+        ///   要 4.5 秒才出来，而**用户盯着的正是那一个**。见 `StartRestLaunches` 的 waitForHead。）
         /// </summary>
         internal bool RestoreRememberedTabs()
         {
             if (StageRememberedTabs() == 0) return false;
-            StartRestLaunches(null, false);      // 后台还原：不用等谁，越早并上越好（见 waitForHead）
+            StartRestLaunches(null, true);
             if (hosts.Count == 0) return false;
             int act = IndexOfPath(stagedActive);
             Activate(act >= 0 ? act : 0);
@@ -1633,11 +1652,27 @@ namespace TabbedExplorer
             tabStrip.SetPath(i, TabStrip.PathLine(PathRules.Store(path)));
             h.PresetTarget(path);     // 排队期间也得知道要去哪儿（否则中途保存记忆会把它丢掉）
             Diag.Step("EmbedForm: 排入队列 " + path);
-            launchQueue.Enqueue(new Launch { Host = h, Path = path });
+            // ★ 用户当场要的那一个插队头：还原期间后面还排着十几个记忆标签（见 EnqueueFront）
+            EnqueueFront(new Launch { Host = h, Path = path });
             PumpLaunch();
             if (activate) Activate(i);
             MarkDirty();
             return h;
+        }
+
+        /// <summary>
+        /// 把一条启动请求**插到队头**。用户当场要的那一个走这儿（按 `+` / Ctrl+T、点到还没加载的标签）。
+        ///
+        /// 为什么值当：还原那阵子队列里排着十几个记忆标签，`Enqueue` 到队尾意味着用户那一按
+        /// 要等前面全部起完（一轮 900ms 一格，见 `SpawnSlotMs`）—— 用户报的「按+号也好慢」就是这个。
+        /// 队列里的先后**不影响归属判定**：每个标签认的是「地址栏内容 == 我要开的路径」那个窗口。
+        /// </summary>
+        private void EnqueueFront(Launch j)
+        {
+            Queue<Launch> rest = new Queue<Launch>();
+            while (launchQueue.Count > 0) rest.Enqueue(launchQueue.Dequeue());
+            launchQueue.Enqueue(j);
+            while (rest.Count > 0) launchQueue.Enqueue(rest.Dequeue());
         }
 
         /// <summary>
@@ -1690,14 +1725,18 @@ namespace TabbedExplorer
         ///   加载完 `OnHostReady` 写回来的还是同一个名字。这中间一改反而让标签条闪一下 ——
         ///   用户要的就是「界面没什么变化」。
         /// </summary>
-        private void StartDeferred(int idx)
+        private void StartDeferred(int idx) { StartDeferred(idx, false); }
+
+        /// <param name="urgent">true = 插到队头。用户**当场**要的那一个用（见 `EnqueueFront`）。</param>
+        private void StartDeferred(int idx, bool urgent)
         {
             if (idx < 0 || idx >= hosts.Count) return;
             ExplorerHost h = hosts[idx];
             if (h == null || !h.Deferred) return;
             h.Deferred = false;
             Diag.Step("EmbedForm: 标签开始加载「" + h.TargetPath + "」");
-            launchQueue.Enqueue(new Launch { Host = h, Path = h.TargetPath });
+            Launch j = new Launch { Host = h, Path = h.TargetPath };
+            if (urgent) EnqueueFront(j); else launchQueue.Enqueue(j);
             PumpLaunch();
         }
 
@@ -2094,7 +2133,8 @@ namespace TabbedExplorer
             // 懒加载的占位标签：切到它才算「要用它」，这时候才真起 explorer。
             // 得排在下面那句 `Host.Visible` 之前 —— 先把队列上的活派出去，界面这一帧先显示空面板，
             // 内容出来时 `OnHostReady` 会把标题 / 图标 / 路径再刷一遍。
-            if (hosts[idx].Deferred) StartDeferred(idx);
+            // urgent：用户点的就是「现在要」——插队头，别排在还原那十几个后面（见 EnqueueFront）。
+            if (hosts[idx].Deferred) StartDeferred(idx, true);
             // 伪懒加载下「标签已经在、内容还在后台排队」是常态，用户点它 = 现在就要它，提到队头。
             else PromoteLaunch(hosts[idx]);
             for (int i = 0; i < hosts.Count; i++) hosts[i].Host.Visible = (i == idx);

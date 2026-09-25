@@ -96,6 +96,43 @@ namespace TabbedExplorer
 
         public const uint WM_CLOSE = 0x0010;
 
+        // ---- 窗口绘制区（`SetWindowRgn`）----
+        // 用途只有一个：把 shell 自己那扇刚要显示的窗临时变成「什么都画不出来」的 —— 见
+        // `DesktopHub.BlankShellWindow`。**不是样式位**（那条红线管的是 exstyle / 透明），
+        // `SetWindowRgn(h, IntPtr.Zero, true)` 就还原成没区域。
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
+
+        [DllImport("user32.dll")]
+        public static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
+
+        /// <summary>问一扇窗现在有没有绘制区。返回值只用得上 <see cref="RGN_NULL"/>。</summary>
+        [DllImport("user32.dll")]
+        public static extern int GetWindowRgn(IntPtr h, IntPtr rgn);
+
+        /// <summary>`GetWindowRgn` 的返回值：区域是**空的** ⇒ 这扇窗一个像素都不画。</summary>
+        public const int RGN_NULL = 1;
+
+        /// <summary>
+        /// 把一扇窗变成「画不出东西」的（空绘制区）。返回它原来有没有区域 —— 原来就有的话
+        /// 我们不该动它（那说明它自己有用途），调用方据此放弃。
+        /// </summary>
+        public static bool MakeBlank(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            if (GetWindowRgn(h, IntPtr.Zero) != 0) return false;    // 已经有区域了：不碰
+            IntPtr r = CreateRectRgn(0, 0, 0, 0);
+            if (r == IntPtr.Zero) return false;
+            return SetWindowRgn(h, r, true) != 0;
+        }
+
+        /// <summary>还原 `MakeBlank`（去掉绘制区限制）。</summary>
+        public static void Unblank(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            try { SetWindowRgn(h, IntPtr.Zero, true); } catch { }
+        }
+
         /// <summary>读窗口样式，统一按 32 位无符号处理（避免 0x80000000 位被符号扩展搞乱）。</summary>
         public static uint GetStyle(IntPtr h)
         {
@@ -682,8 +719,19 @@ namespace TabbedExplorer
                     h = probeQueue.Dequeue();
                 }
                 string got = null;
-                try { got = AddressPathOf(h); }
+                // ★ 先问 shell 自己的浏览器清单（`ShellWindows.LocationURL`，按 hwnd 对上号）：
+                //   它建窗后 0.3~0.6 秒就有值，而地址栏要等窗口把那一排工具条建出来、更晚；
+                //   而且这条路**不往那扇窗发消息**，对方忙也拖不住我们。
+                //   实测这一句就是「重启进程后第一次开标签」里最长那一截的解药：原来「起 explorer」
+                //   到「认出自己那扇窗」要等 2.0 秒（地址栏读空后按 150/300/600/1200ms 退避重试，
+                //   外加 1.2 秒的负缓存），换上它之后第一轮问就能命中。
+                try { got = ShellBrowserReg.PathOfWindow(h); }
                 catch { }
+                if (got == null)
+                {
+                    try { got = AddressPathOf(h); }
+                    catch { }
+                }
                 lock (probeLock)
                 {
                     CabProbe p;

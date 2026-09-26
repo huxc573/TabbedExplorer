@@ -1036,9 +1036,11 @@ namespace TabbedExplorer
                 Rectangle tab = bounds[i];
                 if (tab.Right < 0 || tab.Left > Width) continue;
 
-                Color fill = tabs[i].Active ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
-                             : (sel.Contains(i) ? Theme.AccentDim
-                                : (i == hoverIndex ? Theme.Hover : bar));
+                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）。
+                // 两者仍分得出来：贴边那条指示条只画在激活的那一个上（见下面 accent 那一段）。
+                bool lit = tabs[i].Active || sel.Contains(i);
+                Color fill = lit ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
+                                 : (i == hoverIndex ? Theme.Hover : bar);
                 g.FillRectangle(new SolidBrush(fill), tab);
 
                 // 选中标签那条蓝线**不在这儿画** —— 见循环后面那一段（挪到底部，避开顶部滚动条）。
@@ -1073,8 +1075,8 @@ namespace TabbedExplorer
                 int textW = textRight - textLeft;
                 if (textW < 0) textW = 0;
 
-                Color c1 = tabs[i].Active ? (inactive ? Theme.TextInactive : Theme.Text)
-                                          : (inactive ? Theme.TextInactive : Theme.TextDim);
+                Color c1 = lit ? (inactive ? Theme.TextInactive : Theme.Text)
+                               : (inactive ? Theme.TextInactive : Theme.TextDim);
 
                 // 置顶标记：紧挨着文件夹图标右边那枚小图钉（用户：小标志，别太占地方）。
                 // 画在图标和标题之间而不是右边 —— 右边那格是关闭按钮的地盘，两个图标叠在一起会很挤。
@@ -1085,7 +1087,7 @@ namespace TabbedExplorer
                     g.FillRectangle(new SolidBrush(bar), new Rectangle(pxx, tab.Top, PinAreaWidth, tab.Height));
                     TextRenderer.DrawText(g, "\uE718", pinFont,
                         new Rectangle(pxx, tab.Top + (tab.Height - ps) / 2, ps, ps),
-                        tabs[i].Active ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
+                        lit ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                         TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping);
                     textLeft = pxx + PinAreaWidth;
@@ -1236,9 +1238,11 @@ namespace TabbedExplorer
                 Rectangle row = bounds[i];
                 if (row.Bottom <= tabsTopV || row.Top >= tabsBottomV) continue;
 
-                Color fill = tabs[i].Active ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
-                             : (sel.Contains(i) ? Theme.AccentDim
-                                : (i == hoverIndex ? Theme.Hover : bar));
+                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）。
+                // 两者仍分得出来：贴边那条指示条只画在激活的那一个上（见下面 accent 那一段）。
+                bool lit = tabs[i].Active || sel.Contains(i);
+                Color fill = lit ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
+                                 : (i == hoverIndex ? Theme.Hover : bar);
                 // 半透明态下「底色那一档」不再补一刀：底下已经按不透明度铺过底色了，
                 // 再叠一次那几行就更实（标签区比工具行更不透，一眼就看出来）；只补高亮那一档。
                 if (Glass == null || !Glass.On || fill != bar)
@@ -1260,8 +1264,8 @@ namespace TabbedExplorer
                 Rectangle close = VCloseBounds(row);
                 int textRight = row.Right - (showClose && roomForClose ? CloseAreaWidth : Px(8));
 
-                Color c1 = tabs[i].Active ? (inactive ? Theme.TextInactive : Theme.Text)
-                                          : (inactive ? Theme.TextInactive : Theme.TextDim);
+                Color c1 = lit ? (inactive ? Theme.TextInactive : Theme.Text)
+                               : (inactive ? Theme.TextInactive : Theme.TextDim);
 
                 int textLeft = ix + isz + Px(IconGap);
                 int textW = textRight - textLeft;
@@ -1277,7 +1281,7 @@ namespace TabbedExplorer
                 {
                     TextRenderer.DrawText(g, "\uE718", pinFont,
                         new Rectangle(row.Left, row.Top, Px(12), row.Height),
-                        tabs[i].Active ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
+                        lit ? (inactive ? Theme.AccentDim : Theme.Accent) : c1,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                         TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping);
                 }

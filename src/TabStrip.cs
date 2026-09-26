@@ -1036,8 +1036,8 @@ namespace TabbedExplorer
                 Rectangle tab = bounds[i];
                 if (tab.Right < 0 || tab.Left > Width) continue;
 
-                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）。
-                // 两者仍分得出来：贴边那条指示条只画在激活的那一个上（见下面 accent 那一段）。
+                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）——
+                // 底色、文字、图钉、贴边那条蓝色指示条，全部按激活那一档画。
                 bool lit = tabs[i].Active || sel.Contains(i);
                 Color fill = lit ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
                                  : (i == hoverIndex ? Theme.Hover : bar);
@@ -1128,15 +1128,16 @@ namespace TabbedExplorer
 
             g.DrawLine(new Pen(Theme.Border), 0, Height - 1, Width, Height - 1);
 
-            // ---- 选中标签的蓝色指示条：**贴在标签条底部**（用户指定）----
+            // ---- 激活 / 多选中的标签那条蓝色指示条：**贴在标签条底部**（用户指定）----
             // 原来画在顶上，会跟顶部的滚动条轨道抢同一排像素。挪到底部后各占一边，互不打架。
             // ⚠ 必须**画在上面那条分隔线之后**：分隔线压在 Height-1，先画蓝线会被它盖掉一像素。
+            // ★ 多选中的标签**也画**（用户：激活条下面那条蓝的，多选也得有，不然不统一）。
             int accentH = Math.Max(2, Px(2));
             Region clipForAccent = g.Clip;
             g.SetClip(new Rectangle(0, 0, clipR, Height));
             for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
             {
-                if (!tabs[i].Active) continue;
+                if (!tabs[i].Active && !sel.Contains(i)) continue;
                 Rectangle ab = bounds[i];
                 if (ab.Right < 0 || ab.Left > Width) continue;
                 g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),
@@ -1238,8 +1239,8 @@ namespace TabbedExplorer
                 Rectangle row = bounds[i];
                 if (row.Bottom <= tabsTopV || row.Top >= tabsBottomV) continue;
 
-                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）。
-                // 两者仍分得出来：贴边那条指示条只画在激活的那一个上（见下面 accent 那一段）。
+                // 多选中的标签跟**激活标签**用同一个样式（用户：多选条和激活条要一个样式，不然太丑）——
+                // 底色、文字、图钉、贴边那条蓝色指示条，全部按激活那一档画。
                 bool lit = tabs[i].Active || sel.Contains(i);
                 Color fill = lit ? (inactive ? Theme.TabActiveOff : Theme.TabActive)
                                  : (i == hoverIndex ? Theme.Hover : bar);
@@ -1301,10 +1302,10 @@ namespace TabbedExplorer
                 }
             }
 
-            // 选中标签的指示条：竖向靠**左**（横向那条是贴底，两边各占一边，不抢地方）
+            // 激活 / 多选中的标签那条指示条：竖向靠**左**（横向那条是贴底，两边各占一边，不抢地方）
             for (int i = 0; i < bounds.Count && i < tabs.Count; i++)
             {
-                if (!tabs[i].Active) continue;
+                if (!tabs[i].Active && !sel.Contains(i)) continue;
                 Rectangle ab = bounds[i];
                 if (ab.Bottom <= tabsTopV || ab.Top >= tabsBottomV) continue;
                 g.FillRectangle(new SolidBrush(inactive ? Theme.AccentDim : Theme.Accent),

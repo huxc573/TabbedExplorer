@@ -750,7 +750,7 @@ namespace TabbedExplorer
                     lab.SetBounds(pad, y + Px(3), Px(300), Px(22));
                     page.Controls.Add(lab);
 
-                    NumericUpDown num = new NumericUpDown();
+                    NumBox num = new NumBox();
                     num.Minimum = nd.NumMin;
                     num.Maximum = nd.NumMax;
                     num.Increment = Math.Max(1, nd.NumStep);
@@ -769,7 +769,13 @@ namespace TabbedExplorer
                     num.ValueChanged += delegate
                     {
                         if (syncing || node.NumSet == null) return;
-                        node.NumSet((int)num.Value);
+                        applying = true;
+                        try { node.NumSet((int)num.Value); }
+                        finally { applying = false; }
+                        // ★ 数值框也要让标题上那个「有未保存的改动」跟上 ——
+                        //   它走的是 `NumSet` 而不是 `ApplyNode`，原来这条路上就没刷标题
+                        //   （用户报：「透明度和宽度那里，鼠标滚轮滑动变了，没提示变动」）。
+                        RefreshTitle();
                     };
                     page.Controls.Add(num);
                     syncers.Add(delegate
@@ -1177,10 +1183,6 @@ namespace TabbedExplorer
     }
 
     /// <summary>
-    /// 「按键捕获框」—— 其实就是个按钮，唯一特别的是**所有键都当普通输入收下来**
-    /// （`IsInputKey` 返回 true），否则 Tab / 方向键会被对话框当成「移动焦点」，绑不了。
-    /// </summary>
-    /// <summary>
     /// 自绘 `TabControl` —— 只管一件事：**把 tab 头带自己刷一遍底色**。
     /// 系统画的 tab 头带（最后一个 tab 右边那一截、最左边那条留白）永远用系统色，
     /// 深色模式下就是一条白 —— 用户报的「tab 背景颜色未适配颜色模式」。
@@ -1214,8 +1216,32 @@ namespace TabbedExplorer
         }
     }
 
+    /// <summary>
+    /// 「按键捕获框」—— 其实就是个按钮，唯一特别的是**所有键都当普通输入收下来**
+    /// （`IsInputKey` 返回 true），否则 Tab / 方向键会被对话框当成「移动焦点」，绑不了。
+    /// </summary>
     internal sealed class KeyBox : Button
     {
         protected override bool IsInputKey(Keys keyData) { return true; }
+    }
+
+    /// <summary>
+    /// 数值输入框（标签页宽度 / 侧边栏不透明度）—— **只有鼠标点进去过（自己有焦点）才让滚轮改值**。
+    ///
+    /// 为什么要盖这一层：net48 的 `NumericUpDown` **没焦点时也吃滚轮**
+    /// （这个行为一直到 .NET Core 才改），于是「拿滚轮滚这一页、光标正好路过这个框」
+    /// 就把值改了 —— 用户报的 BUG 一半是这个，另一半是改完标题没提示
+    /// （见 `BuildGeneral` 里那个 `ValueChanged`）。
+    ///
+    /// 没焦点时**不调 base** ⇒ 不会把 `HandledMouseEventArgs.Handled` 置上，
+    /// 这一滚轮继续往上传给开着 `AutoScroll` 的页面去滚（和「滚轮停在普通 Label 上」一样）。
+    /// </summary>
+    internal sealed class NumBox : NumericUpDown
+    {
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (!ContainsFocus) return;
+            base.OnMouseWheel(e);
+        }
     }
 }

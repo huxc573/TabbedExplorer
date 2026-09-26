@@ -108,6 +108,27 @@ namespace TabbedExplorer
         /// <summary>订阅 Theme.Changed 的那个处理器（关窗时要退订，否则静态事件会把窗口吊着不放）。</summary>
         private EventHandler themeHandler;
 
+        // ==================================================================
+        // 「保存」这一套（用户：设置项用保存按钮，有变动在窗口标题提示，关窗时问一句）
+        //
+        // 口径：**这个窗口开着的期间，所有改动只改内存**（界面 / 功能照旧立刻生效），
+        // 落盘要等用户点「保存」。做法是拿 `Settings.BeginHold()` 压住写盘闸（见 Settings 里注释），
+        // 点「保存」时放闸写一次、再压回去。
+        // ==================================================================
+
+        /// <summary>开窗那一刻的设置快照 —— 判「有没有未保存的改动」和「不保存时回滚」都用它。</summary>
+        private Settings.Snapshot baseline;
+        /// <summary>`baseline` 序列化成的正文 —— 比「当前值序列化出来」就知道有没有改动。</summary>
+        private string baselineJson;
+        /// <summary>现在有还没保存的改动（窗口标题上那个提示就是它）。</summary>
+        private bool dirty;
+        /// <summary>我们正压着 `Settings` 的写盘闸。⚠ 关窗必须放掉，否则以后所有设置都写不进盘。</summary>
+        private bool holdOn;
+        /// <summary>正在「应用 / 回滚 / 保存」—— 这期间别去算 dirty（会把中间态当成改动）。</summary>
+        private bool applying;
+        /// <summary>程序要退了（`DesktopHub.Dispose` 顺手关这个窗）：别再弹「要不要保存」。</summary>
+        public bool Quitting;
+
         /// <summary>两个 Tab（自绘 —— 系统画的 Tab 头在深色下是一块白，跟外壳两套皮）。</summary>
         private TabControl tabs;
         /// <summary>重建时保住当前选中的是哪一页（换颜色模式会整窗重建）。</summary>
@@ -150,6 +171,13 @@ namespace TabbedExplorer
             ForeColor = Theme.Text;
             Font = new Font("Segoe UI", Px(12), FontStyle.Regular, GraphicsUnit.Pixel);
 
+            // 压住写盘闸（**必须在 `Build()` 之前**：建界面读到的值也要按「还没落盘」的口径来）。
+            // 从这一刻起设置项只改内存，落盘等用户点「保存」——见 `SaveEdits` / `DiscardEdits`。
+            baseline = Settings.Snap();
+            baselineJson = Settings.ToJson();
+            holdOn = true;
+            Settings.BeginHold();
+
             Build();
 
             // 颜色模式改了：整窗重建一遍（比逐个控件换色靠谱，反正这个窗口很小、开着的概率也低）。
@@ -186,8 +214,38 @@ namespace TabbedExplorer
             Theme.ApplyTitleBar(Handle);
         }
 
+        /// <summary>
+        /// 关窗前问一句：有没保存的改动就「保存 / 不保存 / 取消」，**没改动不打扰**
+        /// （用户：「关闭时也询问是否保存、无变动不管」）。
+        /// 「取消」= 什么都不做、窗口留着（点 × 或按 Esc 也算取消，见 `Confirm.AskSave`）。
+        /// </summary>
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (Quitting)
+            {
+                // 程序自己在退，别在关机路上弹框（内存里的值反正也随进程一起没了）
+                ReleaseHold();
+                base.OnFormClosing(e);
+                return;
+            }
+            if (dirty && !applying)
+            {
+                DialogResult r = Confirm.AskSave(this, AppInfo.Name + " 设置",
+                    "有改动还没保存。\r\n\r\n" +
+                    "「保存」= 存下来再关；\r\n" +
+                    "「不保存」= 改回去（本次已经立刻生效的那几项也会退回来）；\r\n" +
+                    "「取消」= 接着改。");
+                if (r == DialogResult.Yes) SaveEdits();
+                else if (r == DialogResult.No) DiscardEdits();
+                else { e.Cancel = true; return; }      // 取消：别关
+            }
+            ReleaseHold();
+            base.OnFormClosing(e);
+        }
+
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            ReleaseHold();       // 兜底：`OnFormClosing` 没走到也不能把闸一直压着
             if (themeHandler != null)
             {
                 try { Theme.Changed -= themeHandler; } catch { }
@@ -386,7 +444,7 @@ namespace TabbedExplorer
             LoadLogIfNeeded();         // 重建时如果正停在这一页，得把它填回来
             y += tabsH + Px(8);
 
-            // ---- 底部：提示行 + 关闭 ----
+            // ---- 底部：提示行 + 保存 / 关闭 ----
             notice = TextLabel("", Px(11), false);
             notice.ForeColor = Theme.TextDim;
             notice.SetBounds(pad, y, w - pad * 2, Px(18));
@@ -396,11 +454,20 @@ namespace TabbedExplorer
             Button close = FlatButton("关闭", w - pad - Px(90), y, Px(90), Px(28));
             close.Click += delegate { Close(); };
             Controls.Add(close);
+
+            // 「保存」摆在「关闭」左边、用强调色当主按钮 —— 用户要的就是这一颗
+            Button save = FlatButton("保存", w - pad - Px(90) * 2 - Px(8), y, Px(90), Px(28));
+            save.BackColor = Theme.Accent;
+            save.ForeColor = Color.White;
+            save.FlatAppearance.BorderColor = Theme.Accent;
+            save.Click += delegate { SaveEdits(); };
+            Controls.Add(save);
             y += Px(28) + pad;
 
             ClientSize = new Size(w, y);
 
             SyncAll();
+            RefreshTitle();      // 标题上的「有未保存的改动」也跟着重建刷一遍
         }
 
         /// <summary>
@@ -891,9 +958,14 @@ namespace TabbedExplorer
                     Hotkeys.Split(e.KeyData, out vk, out ctrl, out shift, out alt);
                     if (vk == 0) return;
                     string why;
-                    if (Hotkeys.Assign(cmd, vk, ctrl, shift, alt, out why)) SetNotice("已保存：" + Hotkeys.LabelOf(cmd) + " = " + Hotkeys.Format(vk, ctrl, shift, alt));
+                    bool ok;
+                    applying = true;
+                    try { ok = Hotkeys.Assign(cmd, vk, ctrl, shift, alt, out why); }
+                    finally { applying = false; }
+                    if (ok) SetNotice("已改为：" + Hotkeys.LabelOf(cmd) + " = " + Hotkeys.Format(vk, ctrl, shift, alt));
                     else SetNotice("没改成：" + why);
                     RefreshKeyBoxes();
+                    RefreshTitle();
                 };
                 page.Controls.Add(box);
                 keyBoxes.Add(new KeyValuePair<string, KeyBox>(cmd, box));
@@ -910,7 +982,14 @@ namespace TabbedExplorer
             y = AddRule(page, y, w, pad);
 
             Button reset = FlatButton("全部恢复默认", pad, y, Px(140), Px(26));
-            reset.Click += delegate { Hotkeys.ResetAll(); RefreshKeyBoxes(); SetNotice("已全部恢复默认。"); };
+            reset.Click += delegate
+            {
+                applying = true;
+                try { Hotkeys.ResetAll(); } finally { applying = false; }
+                RefreshKeyBoxes();
+                SetNotice("已全部恢复默认。");
+                RefreshTitle();
+            };
             page.Controls.Add(reset);
             y += Px(34);
 
@@ -968,14 +1047,19 @@ namespace TabbedExplorer
         private void ApplyNode(SettingsMenu.Node nd)
         {
             if (nd == null) return;
+            applying = true;      // 期间 `Settings.Save()` 是空转的（闸压着），dirty 也别在这会儿算
             try
             {
                 if (nd.Click != null) nd.Click();
             }
             catch (Exception ex) { Diag.Log("设置窗口: 应用设置失败 " + ex.Message); }
+            finally { applying = false; }
 
             // 值可能连带改了别的项（比如切捕获方式会把记忆搬家），所以整窗刷一遍
             SyncAll();
+
+            // 标题上的「有未保存的改动」跟着变 —— 改了但还没点「保存」时用户能看见
+            RefreshTitle();
 
             // 点完给一句反馈（「清理日志」那种干完什么都不说的动作，不说一句看不出来做过）
             if (nd.RebuildAfter)
@@ -987,6 +1071,75 @@ namespace TabbedExplorer
                 try { BeginInvoke(new Action(Rebuild)); } catch { }
             }
             else if (nd.Notice != null) SetNotice(nd.Notice);
+        }
+
+        // ==================================================================
+        // 「保存」这一套
+        // ==================================================================
+
+        /// <summary>放掉写盘闸。**幂等** —— `OnFormClosing` 与 `OnFormClosed` 都会叫它。</summary>
+        private void ReleaseHold()
+        {
+            if (!holdOn) return;
+            holdOn = false;
+            Settings.EndHold();
+        }
+
+        /// <summary>
+        /// 算一遍「有没有还没保存的改动」，并把它写进**窗口标题**（用户指定的提示位置）。
+        /// 判据 = 当前这些值序列化出来跟开窗那一刻的正文比 —— 比逐项比较可靠（以后加设置项不用改这里）。
+        /// </summary>
+        private void RefreshTitle()
+        {
+            if (IsDisposed || Disposing) return;
+            dirty = !applying && !string.Equals(Settings.ToJson(), baselineJson, StringComparison.Ordinal);
+            Text = AppInfo.Name + " 设置" + (dirty ? "  •  有未保存的改动" : "");
+        }
+
+        /// <summary>
+        /// 点「保存」：把攒着的改动真写进 `settings.json`。
+        /// 顺序是「先放闸、再写、再压回去」—— 闸压着的时候 `Settings.Save()` 是空转的。
+        /// </summary>
+        private void SaveEdits()
+        {
+            ReleaseHold();
+            try { Settings.Save(); }
+            finally { holdOn = true; Settings.BeginHold(); }   // 窗口还开着：后面的改动继续攒
+
+            baseline = Settings.Snap();
+            baselineJson = Settings.ToJson();
+            dirty = false;
+            RefreshTitle();
+            SetNotice("已保存。");
+            Diag.Step("设置窗口: 已保存 " + Settings.Describe());
+        }
+
+        /// <summary>
+        /// 「不保存」：把值退回开窗那一刻 —— 包括**已经立刻生效**的那些
+        /// （颜色模式 / 标签宽度 / 捕获方式 / 快捷键……都当用户没点过）。
+        ///
+        /// ⚠ `hub.RestoreSettings` 必须排在 `Settings.ApplySnapshot` **前面**：
+        ///   那些 `SetXxx` 第一句都是「值没变就 return」，此刻 `Settings` 里必须还是**改过的值**
+        ///   它们才会真的执行（执行时自己会把 `Settings` 写回快照里的值）。详见 `DesktopHub.RestoreSettings`。
+        /// </summary>
+        private void DiscardEdits()
+        {
+            if (baseline == null) { dirty = false; return; }
+            applying = true;
+            try
+            {
+                hub.RestoreSettings(baseline);
+                Settings.ApplySnapshot(baseline);
+                Hotkeys.Reload();        // 快捷键是改完立刻生效的，也得跟着退回去
+            }
+            catch (Exception ex) { Diag.Log("设置窗口: 回滚失败 " + ex.Message); }
+            finally { applying = false; }
+
+            SyncAll();
+            baselineJson = Settings.ToJson();
+            dirty = false;
+            RefreshTitle();
+            Diag.Step("设置窗口: 已丢弃未保存的改动，退回开窗时的样子");
         }
 
         private void SyncAll()

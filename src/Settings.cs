@@ -307,11 +307,76 @@ namespace TabbedExplorer
             }
         }
 
-        public static void Save()
+        /// <summary>
+        /// 设置窗口里改一项是**先攒着**的：`SettingsForm.ApplyNode` 在那一次同步点击里
+        /// `BeginHold()`..`EndHold()`，这期间的 `Save()` 全部空转，等用户点「保存」才真落盘。
+        /// 托盘菜单那条路也在同一根界面线程上、不可能跟它交错，所以不会被误挡。
+        /// </summary>
+        private static int saveHold;
+
+        public static void BeginHold() { saveHold++; }
+        public static void EndHold() { if (saveHold > 0) saveHold--; }
+
+        /// <summary>
+        /// 一份设置值的快照 —— **设置窗口**开窗时取一份当底（`SettingsForm.baseline`）：
+        ///   ① 判「有没有还没保存的改动」时拿它跟当前值比；
+        ///   ② 用户点「不保存」时用它把值回滚回去。
+        ///
+        /// ⚠ 「开机自启」不在里面：它的真相在注册表（见 `DesktopHub.SetAutoStart`），
+        ///   不落 settings.json，所以本来就不属于「攒着等保存」这一套。
+        /// </summary>
+        internal sealed class Snapshot
+        {
+            public CaptureMode Capture; public ColorMode Color;
+            public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
+                        FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug;
+            public int TabWidth, VPaneAlpha;
+            public readonly Dictionary<string, string> Hotkeys =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>把**现在**的值抄一份（不碰磁盘、不碰 hub）。</summary>
+        public static Snapshot Snap()
+        {
+            Snapshot s = new Snapshot();
+            s.Capture = Capture; s.Color = Color;
+            s.KeepTabs = KeepTabs; s.LazyTabs = LazyTabs; s.ParallelLaunch = ParallelLaunch;
+            s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit;
+            s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
+            s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
+            s.Debug = Debug; s.TabWidth = TabWidth; s.VPaneAlpha = VPaneAlpha;
+            foreach (KeyValuePair<string, string> kv in hotkeys) s.Hotkeys[kv.Key] = kv.Value;
+            return s;
+        }
+
+        /// <summary>
+        /// 把一份快照写回静态字段（**不落盘**，`Save()` 该空转还空转）。
+        ///
+        /// ⚠ 它只管 `Settings` 自己这一层。用户点「不保存」时「让已经立刻生效的那些改动退回去」
+        /// 还得先叫 `DesktopHub.RestoreSettings(snap)`（趁 `Settings` 里还是改过的值、
+        /// 每个 `SetXxx` 才会真的执行），顺序见 `SettingsForm.DiscardEdits`。
+        /// </summary>
+        public static void ApplySnapshot(Snapshot s)
+        {
+            if (s == null) return;
+            Capture = s.Capture; Color = s.Color;
+            KeepTabs = s.KeepTabs; LazyTabs = s.LazyTabs; ParallelLaunch = s.ParallelLaunch;
+            TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit;
+            FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
+            WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
+            Debug = s.Debug; TabWidth = s.TabWidth; VPaneAlpha = s.VPaneAlpha;
+            hotkeys.Clear();
+            foreach (KeyValuePair<string, string> kv in s.Hotkeys) hotkeys[kv.Key] = kv.Value;
+        }
+
+        /// <summary>
+        /// 当前这些值序列化成 settings.json 的那份正文（`Save()` 写的就是它）。
+        /// 另一处用处：设置窗口拿它跟**开窗时的快照**比对，判「有没有还没保存的改动」。
+        /// </summary>
+        public static string ToJson()
         {
             try
             {
-                Directory.CreateDirectory(AppPaths.DataDir);
                 StringBuilder sb = new StringBuilder();
                 // 说明写在 `_` 开头的键里 —— 既是**合法 JSON**（任何 JSON 工具都读得动），
                 // 又能让用户打开文件就看见每一项是什么意思（JSON 本体不支持注释）。
@@ -367,9 +432,20 @@ namespace TabbedExplorer
                 sb = new StringBuilder(body.Substring(0, last) + "\r\n");
                 sb.Append("}\r\n");
 
+                return sb.ToString();
+            }
+            catch (Exception ex) { Diag.Log("设置: 序列化失败 " + ex.Message); return ""; }
+        }
+
+        public static void Save()
+        {
+            if (saveHold > 0) return;        // ★ 攒着，等用户点「保存」
+            try
+            {
+                Directory.CreateDirectory(AppPaths.DataDir);
                 // 跟记忆一样：先写临时文件再换过去，半途被硬杀不会留下半截文件。
                 string tmp = FileName + ".tmp";
-                File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
+                File.WriteAllText(tmp, ToJson(), new UTF8Encoding(false));
                 if (File.Exists(FileName)) File.Delete(FileName);
                 File.Move(tmp, FileName);
             }

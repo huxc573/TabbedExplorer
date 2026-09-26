@@ -1663,6 +1663,39 @@ namespace TabbedExplorer
             Diag.Step("Hub: 开机自启 -> " + (on ? "开" : "关"));
         }
 
+        /// <summary>
+        /// 把每个设置项**再推一遍**（设置窗口点「不保存」时用它把已经立刻生效的改动退回去）。
+        ///
+        /// ⚠ 顺序上必须**先调这个、再 `Settings.ApplySnapshot`**：这些 `SetXxx` 第一句都是
+        /// 「值没变就 return」，所以此刻 `Settings` 里必须还是**改过的值**，它们才会真的执行；
+        /// 而它们执行时自己会把 `Settings` 那一项写回快照里的值（`Settings.SetXxx`）。
+        /// 详见 `SettingsForm.DiscardEdits`。
+        ///
+        /// 已知的不可逆项：**捕获方式**那一项切换时会搬「标签记忆」（`MoveMemory`），
+        /// 从 migrate 退回 perdesktop 只会把记忆落到当前桌面、不会还原成原来分散在各桌面的样子。
+        /// 这一点在开窗那一刻点下去就已经发生了，跟「保存 / 不保存」无关。
+        /// </summary>
+        public void RestoreSettings(Settings.Snapshot s)
+        {
+            if (s == null) return;
+            SetCaptureMode(s.Capture);
+            SetColorMode(s.Color);
+            SetKeepTabs(s.KeepTabs);
+            SetLazyTabs(s.LazyTabs);
+            SetParallelLaunch(s.ParallelLaunch);
+            SetTabWidth(s.TabWidth);
+            SetTabAutoWiden(s.TabAutoWiden);
+            SetTabAutoFit(s.TabAutoFit);
+            SetFavBar(s.FavBar);
+            SetCaptureAll(s.CaptureAll);
+            SetCaptureShell(s.CaptureShell);
+            SetWindowSize(s.WindowSize);
+            SetVerticalTabs(s.VTabs);
+            SetVTabCollapse(s.VTabsCollapse);
+            SetVPaneAlpha(s.VPaneAlpha);
+            SetDebug(s.Debug);
+        }
+
         /// <summary>把 from 桶的内容搬进 to 桶 —— **只在 to 还空着的时候**搬，不覆盖已记过的。</summary>
         private void MoveMemory(string from, string to)
         {
@@ -1830,7 +1863,13 @@ namespace TabbedExplorer
             if (quitWait != null) { try { quitWait.Unregister(null); } catch { } quitWait = null; }
             if (quitEvent != null) { try { quitEvent.Close(); } catch { } quitEvent = null; }
             if (captureWatch != null) { try { captureWatch.Dispose(); } catch { } captureWatch = null; }
-            if (settingsForm != null) { try { settingsForm.Close(); } catch { } settingsForm = null; }
+            if (settingsForm != null)
+            {
+                // ⚠ 先标记「程序在退」—— 不然关它的时候会弹「有改动还没保存」的确认框，
+                //   而这一路是关机流程，弹出来就卡在那儿了（见 `SettingsForm.OnFormClosing`）。
+                try { settingsForm.Quitting = true; settingsForm.Close(); } catch { }
+                settingsForm = null;
+            }
             if (favManager != null) { try { favManager.Close(); } catch { } favManager = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }

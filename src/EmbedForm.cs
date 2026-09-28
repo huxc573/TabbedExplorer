@@ -420,10 +420,9 @@ namespace TabbedExplorer
                 // 垂直侧边栏那条也是「标签条」：滚轮落在窗格里走的还是切标签（见 WheelHook）。
                 Pane = vPane.Handle,
                 FavBar = favBar.Handle,
-                // ⚠ 这两个都可能在**钩子线程**上被求值，所以只能读已算好的状态（见 WheelHook 的三条约束）。
-                //   `TabBar` 只是选一下是哪一个实例，`OverflowCached` 是个 volatile bool。
-                HasOverflow = delegate { return TabBar.OverflowCached; },
                 // 标签条上：左半边（标签）切前后标签，右半边（那排按钮）横向滑标签（用户）
+                // ⚠ 这个回调可能在**钩子线程**上被求值，只能读已算好的状态
+                //   （见 WheelHook 的三条约束）；`TabBar` 只是选一下是哪一个实例。
                 StripWheel = delegate(int x, int delta)
                 {
                     TabStrip bar = TabBar;
@@ -436,8 +435,7 @@ namespace TabbedExplorer
                     }
                     Defer(delegate { CycleTab(delta > 0 ? -1 : 1); });
                     return true;
-                },
-                ScrollStrip = delegate(int delta) { Defer(delegate { TabBar.ScrollTabsBy(delta > 0 ? -TabScrollStep : TabScrollStep); }); }
+                }
             });
 
             // 起进程的并发窗口按**时间**放行，所以得有个人定期推一把队列

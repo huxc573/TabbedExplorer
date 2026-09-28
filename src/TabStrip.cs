@@ -835,18 +835,16 @@ namespace TabbedExplorer
             return toolsLeft > 0 && x >= toolsLeft;
         }
 
-        /// <summary>标签有没有多到需要横向滚动（没开自动缩窄时会出现）。</summary>
-        public bool HasOverflow { get { return maxScroll > 0; } }
-
         /// <summary>
-        /// 同上，但**不重算布局** —— 只读上一次排版的结果。
-        /// 给滚轮钩子的判定用（钩子线程上只准读、不准触发重排，见 MouseWheelHook 类注释）。
+        /// 标签有没有多到需要横向滚动（没开自动缩窄时会出现）。
+        /// **不重算布局** —— 只读上一次排版的结果。
+        /// ⚠ 这个属性可能在**钩子线程**上被读（按钮区那个滚轮回调），所以只能是纯读（见 MouseWheelHook 的三条约束）。
         /// </summary>
         public bool OverflowCached { get { return overflow; } }
 
         private volatile bool overflow;
 
-        /// <summary>横向滚动标签区（滚轮在**非标签条**区域时用它）。返回是否真的动了。</summary>
+        /// <summary>横向滚动标签区（鼠标压在**右边那排按钮**上滚轮时用它）。返回是否真的动了。</summary>
         public bool ScrollTabsBy(int dx)
         {
             EnsureLayout();
@@ -2012,7 +2010,8 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 标签条上的滚轮 = **切换前后标签页**（用户）。
-        /// 横向滚动标签条是另一个入口：滚轮在非标签条区域时由上层（EmbedForm）转发到 `ScrollTabsBy`。
+        /// 横向滚动标签条是另一个入口：鼠标压在**右边那排按钮**上时，由上层（EmbedForm）转发到 `ScrollTabsBy`。
+        /// ⚠ 落在**内容区**（嵌进来的原生资源管理器）的滚轮我们一概不管 —— 它是 explorer 的文件列表。
         /// </summary>
         protected override void OnMouseWheel(MouseEventArgs e)
         {

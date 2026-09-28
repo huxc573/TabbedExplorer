@@ -101,7 +101,7 @@ namespace TabbedExplorer
         private bool hoverNew;
         private int hoverTool = -1;
         private int hoverWBtn = -1;
-        /// <summary>现在弹着提示的是谁（`"tab:3"` / `"close:0"` / `"tool:2"` …）。换了才重弹，不然鼠标一动就闪。</summary>
+        /// <summary>现在弹着提示的是谁（`"tab:3"` / `"tool:2"` …）。换了才重弹，不然鼠标一动就闪。</summary>
         private string tipKey;
         private int dragFromIndex = -1;
         private int dragOverIndex = -1;
@@ -1648,19 +1648,13 @@ namespace TabbedExplorer
             }
             else if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
             {
+                // ⚠ **关闭按钮不再单独给提示**（用户：鼠标在标签内挪来挪去时提示在两个框之间
+                //   一闪一闪；正常情况下有标签自己那条提示就够了）。
+                //   所以 `hc`（悬停在 × 上）现在只管画 × 的高亮，不参与提示分派。
+                key = "tab:" + idx;
+                // 名字（被省略号截了也能看全）+ 完整路径；两者一样就只留一个
+                text = TipTextFor(tabs[idx]);
                 anchor = bounds[idx];
-                if (hc == idx)
-                {
-                    key = "close:" + idx;
-                    text = "关闭标签页(Ctrl+W)";
-                    anchor = CloseBounds(anchor);
-                }
-                else
-                {
-                    key = "tab:" + idx;
-                    // 名字（被省略号截了也能看全）+ 完整路径；两者一样就只留一个
-                    text = TipTextFor(tabs[idx]);
-                }
             }
             ShowTip(key, text, anchor);
 
@@ -1741,9 +1735,10 @@ namespace TabbedExplorer
             }
             else if (idx >= 0 && idx < tabs.Count && idx < bounds.Count)
             {
+                // 同横向：**关闭按钮不给单独提示**（鼠标在标签内移动时，提示会一直重弹 ⇒ 闪）
+                key = "vtab:" + idx;
+                text = TipTextFor(tabs[idx]);
                 anchor = bounds[idx];
-                if (hc == idx) { key = "vclose:" + idx; text = "关闭标签页(Ctrl+W)"; anchor = VCloseBounds(anchor); }
-                else { key = "vtab:" + idx; text = TipTextFor(tabs[idx]); }
             }
 
             if (idx != hoverIndex || hp != hoverPin || hc != hoverCloseIndex ||

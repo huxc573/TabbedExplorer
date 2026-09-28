@@ -153,6 +153,19 @@ namespace TabbedExplorer
         private int CloseAreaWidth { get { return Px(22); } }
         private int CloseBoxSize { get { return Px(16); } }
 
+        /// <summary>
+        /// 标签窄到这个宽度以下就真放不下「图标 + 关闭按钮」了，× 才不画。
+        /// （`TextPadLeft` + `IconSize` + `IconGap` + `CloseAreaWidth` = 6+16+5+22 = 49，留 3 像素余量。）
+        ///
+        /// ⚠ **必须 ≤ `MinTabWidth`**（现在 72；用户把「标签页宽度」调到下限 64 时就是 64）：
+        /// 标签被「挤不下自动缩窄」压满时会**停在 `MinTabWidth` 上** —— 阈值一旦比它大
+        /// （原来写的是 `Px(80)`），满屏标签的 × 就**全部消失**（用户报的「标签页撑满后，
+        /// 各自的关闭按钮没了」）。
+        /// ⚠ 这个判据**画和点必须用同一个**，否则会出现「看不见的 ×，点一下就关」——
+        /// 原来就是这样：`roomForClose` 只管画，`OnCloseButton` 没管。
+        /// </summary>
+        private int CloseRoomWidth { get { return Px(52); } }
+
         private static int IconSize { get { return Px(16); } }
         /// <summary>置顶标签名前那枚小图钉占的宽度（含右侧留白）。</summary>
         private int PinAreaWidth { get { return Px(15); } }
@@ -970,10 +983,26 @@ namespace TabbedExplorer
             return -1;
         }
 
+        /// <summary>
+        /// 某个位置是不是落在**标签的关闭按钮**上（横向那条）。
+        /// ⚠ 宽度判据跟画那边（`CloseRoomWidth`）共用：窄到画不出 × 的时候这里也不能认。
+        /// </summary>
         private bool OnCloseButton(int index, Point p)
         {
             if (index < 0 || index >= bounds.Count) return false;
+            if (bounds[index].Width < CloseRoomWidth) return false;
             return CloseBounds(bounds[index]).Contains(p);
+        }
+
+        /// <summary>
+        /// 同上，竖向侧边栏那一行。⚠ 几何用的是 `VCloseBounds`（横竖两套摆法不一样），
+        /// 但**宽度判据还是那一条** `CloseRoomWidth` —— 跟画那边保持一致。
+        /// </summary>
+        private bool OnVCloseButton(int index, Point p)
+        {
+            if (index < 0 || index >= bounds.Count) return false;
+            if (bounds[index].Width < CloseRoomWidth) return false;
+            return VCloseBounds(bounds[index]).Contains(p);
         }
 
         /// <summary>空白处（不是标签、不是任何按钮）—— 这块地方现在兼任标题栏，能拖窗口。</summary>
@@ -1050,7 +1079,7 @@ namespace TabbedExplorer
 
                 bool showClose = tabs[i].Active || i == hoverIndex;
                 Rectangle close = CloseBounds(tab);
-                bool roomForClose = tab.Width > Px(80);
+                bool roomForClose = tab.Width >= CloseRoomWidth;
                 int textRight = tab.Right - (showClose && roomForClose ? CloseAreaWidth : Px(8));
 
                 // 标签左边那颗图标：优先用 explorer 窗口给的那颗（当前文件夹的实时图标），
@@ -1259,7 +1288,7 @@ namespace TabbedExplorer
                 if (collapsed) continue;    // 折叠态到此为止：一行只有一个图标
 
                 bool showClose = tabs[i].Active || i == hoverIndex;
-                bool roomForClose = row.Width > Px(80);
+                bool roomForClose = row.Width >= CloseRoomWidth;
                 Rectangle close = VCloseBounds(row);
                 int textRight = row.Right - (showClose && roomForClose ? CloseAreaWidth : Px(8));
 
@@ -1679,7 +1708,7 @@ namespace TabbedExplorer
             EnsureLayout();
             int idx = VHitTest(e.Location);
             bool hp = pinRect.Contains(e.Location);
-            int hc = (idx >= 0 && !collapsed && VCloseBounds(bounds[idx]).Contains(e.Location)) ? idx : -1;
+            int hc = (idx >= 0 && !collapsed && OnVCloseButton(idx, e.Location)) ? idx : -1;
             int ht = ToolAt(e.Location);
             int hw = WBtnAt(e.Location);
             bool hn = NewButtonBounds().Contains(e.Location);
@@ -1838,7 +1867,7 @@ namespace TabbedExplorer
 
             int idx = VHitTest(e.Location);
             if (idx < 0) { blankDrag = false; DropSelectionOnPlainClick(); return; }
-            if (!collapsed && VCloseBounds(bounds[idx]).Contains(e.Location))
+            if (!collapsed && OnVCloseButton(idx, e.Location))
             {
                 if (TabCloseClicked != null) TabCloseClicked(this, idx);
                 return;

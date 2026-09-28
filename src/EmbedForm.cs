@@ -1146,7 +1146,7 @@ namespace TabbedExplorer
                     if (o == VdOutcome.Failed)
                     {
                         if (!Visible) Show();
-                        Toast.Show("打不开：窗口在别的虚拟桌面",
+                        Toast.Show(ToastKind.Err, "打不开：窗口在别的虚拟桌面",
                             "没能把这个窗口搬到当前桌面。回到它所在的桌面再试。");
                         return;
                     }
@@ -1154,7 +1154,7 @@ namespace TabbedExplorer
                 else if (!VirtualDesktop.IsOnCurrentDesktop(Handle))
                 {
                     Diag.Step("EmbedForm: 窗口不在当前桌面 -> 不显示、不抢前台（不切走）");
-                    Toast.Show("打不开：窗口在别的虚拟桌面",
+                    Toast.Show(ToastKind.Err, "打不开：窗口在别的虚拟桌面",
                         "这个窗口属于另一张虚拟桌面。回到那张桌面再按 Win+E。");
                     return;
                 }
@@ -1515,7 +1515,7 @@ namespace TabbedExplorer
             if (!trayTipShown)
             {
                 trayTipShown = true;
-                Toast.Show("TabbedExplorer 还在后台", "按 Win+E 随时打开；右键托盘图标可以退出。");
+                Toast.Show(ToastKind.Sys, "TabbedExplorer 还在后台", "按 Win+E 随时打开；右键托盘图标可以退出。");
             }
         }
 
@@ -2676,7 +2676,7 @@ namespace TabbedExplorer
             if (closedTabs.Count == 0)
             {
                 Diag.Step("EmbedForm: 恢复关闭的标签，但栈是空的");
-                Toast.Show("没有可恢复的标签页", "这次运行里还没关过标签。");
+                Toast.Show(ToastKind.Hint, "没有可恢复的标签页", "这次运行里还没关过标签。");
                 return;
             }
             string p = closedTabs[closedTabs.Count - 1];
@@ -2743,7 +2743,7 @@ namespace TabbedExplorer
             {
                 if (!PathRules.Restorable(target))
                 {
-                    Toast.Show("开不了", "这个位置没有真实路径（库/虚拟文件夹）。");
+                    Toast.Show(ToastKind.Err, "开不了", "这个位置没有真实路径（库/虚拟文件夹）。");
                     return;
                 }
                 string p = target;
@@ -2753,7 +2753,7 @@ namespace TabbedExplorer
             {
                 if (!PathRules.Restorable(target))
                 {
-                    Toast.Show("复制不了", "这个位置没有真实路径（库/虚拟文件夹）。");
+                    Toast.Show(ToastKind.Err, "复制不了", "这个位置没有真实路径（库/虚拟文件夹）。");
                     return;
                 }
                 string p = target;
@@ -2826,7 +2826,7 @@ namespace TabbedExplorer
             if (selIdx.Length >= hosts.Count)
             {
                 tabStrip.ClearSelection();
-                Toast.Show("留一个", "标签全被选中了，至少得留一个。");
+                Toast.Show(ToastKind.Hint, "留一个", "标签全被选中了，至少得留一个。");
                 return;
             }
             // 当前标签不在这一批里的话，关完要切回它（在的话就就近落一个）
@@ -2966,7 +2966,7 @@ namespace TabbedExplorer
             string name;
             if (!FavStore.Add(path, out name))
             {
-                Toast.Show("加不进书签", string.IsNullOrEmpty(name)
+                Toast.Show(ToastKind.Err, "加不进书签", string.IsNullOrEmpty(name)
                     ? "这个位置没有真实路径（库 / 虚拟文件夹），书签放不了。"
                     : "「" + name + "」已经在书签里了。");
                 return;
@@ -2975,7 +2975,7 @@ namespace TabbedExplorer
             // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
             // 书签栏开着的话，那一项会**立刻出现在标签条下面那条栏上**，那就够了，不再弹气泡。
             // 只有书签栏是关着的时候才提示一句（那时界面上真的什么都没发生，不说一声就成了「点了没反应」）。
-            if (favBar == null || !favBar.Visible) Toast.Show("已加入书签", name);
+            if (favBar == null || !favBar.Visible) Toast.Show(ToastKind.Ok, "已加入书签", name);
         }
 
         /// <summary>
@@ -3030,7 +3030,7 @@ namespace TabbedExplorer
             try
             {
                 Clipboard.SetText(text);
-                Toast.Show("已复制" + what, text);
+                Toast.Show(ToastKind.Ok, "已复制" + what, text);
             }
             catch (Exception ex) { Diag.Log("EmbedForm: 复制失败 " + ex.Message); }
         }

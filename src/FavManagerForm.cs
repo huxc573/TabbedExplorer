@@ -161,13 +161,13 @@ namespace TabbedExplorer
                 // 加成功了新项**当场就出现在右边这一列里**，那就是反馈，所以成功这条路什么都不弹；
                 // 只有没加进去（重复 / 没有真实路径）才说一句。
                 if (!FavStore.Add(p, out name))
-                    Toast.Show("加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
+                    Toast.Show(ToastKind.Err, "加不了", string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
             });
             bx = AddButton("删除所选", bx, y, delegate { DeleteTargets(); });
             bx = AddButton("打开 json", bx, y, delegate
             {
                 try { Process.Start(FavStore.FileName); }
-                catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
             });
             bx = AddButton("回到书签栏", bx, y, delegate { sel = FavStore.BarFolder; Rebuild(); Invalidate(); });
 
@@ -562,7 +562,7 @@ namespace TabbedExplorer
                 if (n.Bar && n.IsFolder) { blocked = true; continue; }
                 ok.Add(n);
             }
-            if (blocked) Toast.Show("删不了", "「书签栏」这一层是横向那条栏的根，它没被删。");
+            if (blocked) Toast.Show(ToastKind.Hint, "删不了", "「书签栏」这一层是横向那条栏的根，它没被删。");
             if (ok.Count == 0) return;
 
             FavNode[] arr = ok.ToArray();
@@ -937,7 +937,7 @@ namespace TabbedExplorer
             else
             {
                 try { Process.Start(new ProcessStartInfo(n.Path) { UseShellExecute = true }); }
-                catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
             }
         }
 
@@ -1023,7 +1023,7 @@ namespace TabbedExplorer
                         if (oldBar != null) oldBar.Bar = false;
                         n.Bar = true;
                     });
-                    Toast.Show("书签栏", "现在横着那条栏显示的是「" + FavStore.NameOf(n) + "」。");
+                    Toast.Show(ToastKind.Ok, "书签栏", "现在横着那条栏显示的是「" + FavStore.NameOf(n) + "」。");
                     Rebuild();
                 }));
 

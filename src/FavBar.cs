@@ -660,13 +660,13 @@ namespace TabbedExplorer
                     // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
                     // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
                 }
-                else if (dup > 0 && bad == 0) Toast.Show("书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
-                else Toast.Show("书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
+                else if (dup > 0 && bad == 0) Toast.Show(ToastKind.Hint, "书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
+                else Toast.Show(ToastKind.Err, "书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
             }
             catch (Exception ex)
             {
                 Diag.Log("书签栏: 拖放失败 " + ex.Message);
-                Toast.Show("书签", "加入失败：" + ex.Message);
+                Toast.Show(ToastKind.Err, "书签", "加入失败：" + ex.Message);
             }
         }
 
@@ -726,7 +726,7 @@ namespace TabbedExplorer
                 Diag.Step("书签栏: 打开文件 " + p);
                 Process.Start(new ProcessStartInfo(p) { UseShellExecute = true });
             }
-            catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+            catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
         }
 
         /// <summary>
@@ -824,7 +824,7 @@ namespace TabbedExplorer
             if (index < 0 || index >= items.Count) return;
             FavNode nd = items[index].Node;
             PopItem[] kids = ItemsOf(nd);
-            if (kids.Length == 0) { Toast.Show(nd.Display, "这个文件夹里还没有书签。"); return; }
+            if (kids.Length == 0) { Toast.Show(ToastKind.Hint, nd.Display, "这个文件夹里还没有书签。"); return; }
             Rectangle r = BoundsOf(index);
             // 竖排时子菜单往**右边**弹（栏本身就在最左边，往下列会盖住下一行）
             Point at = vertical ? new Point(r.Right + Px(1), r.Top) : new Point(r.Left, r.Bottom + Px(1));
@@ -851,7 +851,7 @@ namespace TabbedExplorer
                         else
                         {
                             try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
-                            catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                            catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
                         }
                     }));
                 }
@@ -892,7 +892,7 @@ namespace TabbedExplorer
                         m.Add(PopMenu.It("用默认程序打开", delegate
                         {
                             try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
-                            catch (Exception ex) { Toast.Show("打不开", ex.Message); }
+                            catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
                         }));
                     m.Add(PopMenu.It("复制完整路径", delegate
                     {

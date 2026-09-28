@@ -1239,15 +1239,15 @@ namespace TabbedExplorer
         /// ⚠改了实现（用户报「显示提醒的背景和字体颜色没适配颜色模式」）：
         /// 原来走 `NotifyIcon.ShowBalloonTip`，那个气泡是**系统画的**，配色跟系统主题走，
         /// 我们强制浅色/深色时它不认 —— 外壳和气泡两套皮。现在换成自己画的 `Toast`。
-        /// 方法签名留着不动，调用点一个都不用改。
+        /// `kind` 是气泡类别（谁该弹、默认开不开，见 `Settings.NotifyOn`）。
         /// </summary>
-        public void Notify(string title, string text, bool once)
+        public void Notify(ToastKind kind, string title, string text, bool once)
         {
             try
             {
                 if (once && trayTipShown) return;
                 trayTipShown = true;
-                Toast.Show(title, text);
+                Toast.Show(kind, title, text);
             }
             catch { }
         }
@@ -1524,6 +1524,17 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 通知分类开关（设置窗口里那四项，见 `Settings.NotifyPartOn`）。
+        /// **立刻生效** —— 每次弹之前现读，没有缓存；这几项是 `WinOnly`，托盘菜单里不排。
+        /// </summary>
+        public void SetNotifyPart(ToastKind k, bool on)
+        {
+            if (Settings.NotifyPartOn(k) == on) return;
+            Settings.SetNotifyPart(k, on);
+            Diag.Step("Hub: 通知分类 " + k + " -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
         /// 重启本程序（设置里那一项）。
         ///
         /// 顺序不能反：**先起新进程、再退自己** —— 单实例锁是我们退出那一刻才放开的，
@@ -1553,7 +1564,7 @@ namespace TabbedExplorer
             {
                 // 新进程没起来就**先别退**，否则用户两头空（旧程序没了、新的也没来）
                 Diag.Log("Hub: 重启失败 " + ex.Message);
-                Toast.Show("重启失败", ex.Message);
+                Toast.Show(ToastKind.Err, "重启失败", ex.Message);
                 return;
             }
             Quit("重启本程序");
@@ -1759,7 +1770,7 @@ namespace TabbedExplorer
             if (!ok)
             {
                 // 改不动是「出错」，得说一声；成功就不弹了（用户：非重要变更不用弹窗）
-                Notify("开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
+                Notify(ToastKind.Err, "开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
                 return;
             }
             Diag.Step("Hub: 开机自启 -> " + (on ? "开" : "关"));
@@ -1789,6 +1800,10 @@ namespace TabbedExplorer
             SetAutoSleep(s.AutoSleep);
             SetSleepDelay(s.SleepDelaySec);
             SetNotify(s.Notify);
+            SetNotifyPart(ToastKind.Err, s.NotifyErr);
+            SetNotifyPart(ToastKind.Sys, s.NotifySys);
+            SetNotifyPart(ToastKind.Ok, s.NotifyOk);
+            SetNotifyPart(ToastKind.Hint, s.NotifyHint);
             SetTabWidth(s.TabWidth);
             SetTabAutoWiden(s.TabAutoWiden);
             SetTabAutoFit(s.TabAutoFit);

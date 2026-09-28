@@ -108,8 +108,22 @@ namespace TabbedExplorer
         ///
         /// 关掉**只**影响这些气泡的显示 —— 功能一件不少，只是不再弹那一下。
         /// 总闸挂在 `Toast.Show` 头上：全项目所有气泡都从那儿出去，所以开关一处就全关。
+        ///
+        /// 总闸下面再分四类（见 `NotifyOn`）—— 用户：「右下角通知提供更多可选项」：
+        /// `NotifyErr` / `NotifySys` 是**重要**的（默认开，非 Debug 模式也开）；
+        /// `NotifyOk` / `NotifyHint` 只是「我干了活」的反馈，看多了烦（默认**关**）。
+        /// ⚠ 这四类的**默认值看 Debug 模式**（用户：「Debug 模式默认开启全部，非 Debug 模式
+        ///   只默认开启重要的部分」）⇒ 见 `DefNotify`；已经写进 json 的就以 json 为准。
         /// </summary>
         public static bool Notify = true;
+        /// <summary>①「出错与失败」（打不开 / 复制不了 / 加入失败…）。重要，默认开。</summary>
+        public static bool NotifyErr = true;
+        /// <summary>②「启动与后台状态」（「程序还在后台运行」这类）。重要，默认开。</summary>
+        public static bool NotifySys = true;
+        /// <summary>③「操作结果」（已复制 / 已加入书签 / 换了书签栏）。非 Debug 模式默认关。</summary>
+        public static bool NotifyOk = false;
+        /// <summary>④「轻提示」（已经在了 / 至少留一个 / 这个文件夹没书签）。非 Debug 模式默认关。</summary>
+        public static bool NotifyHint = false;
         /// <summary>
         /// 并发起 explorer（默认**开**）。
         ///
@@ -273,7 +287,14 @@ namespace TabbedExplorer
                     AutoPreload  = Json.GetBool(json, "autopreload", true);
                     AutoSleep    = Json.GetBool(json, "autosleep", true);
                     SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
+                    // ⚠ Debug 得**先**读 —— 下面通知那四类的默认值要看它（用户：「Debug 模式默认
+                    //   开启全部，非 Debug 模式只默认开启重要的部分」），不能等到底下那一行。
+                    bool dbg = Json.GetBool(json, "debug", false);
                     Notify       = Json.GetBool(json, "notify", true);
+                    NotifyErr    = Json.GetBool(json, "notifyerr",  DefNotify(dbg, true));
+                    NotifySys    = Json.GetBool(json, "notifysys",  DefNotify(dbg, true));
+                    NotifyOk     = Json.GetBool(json, "notifyok",   DefNotify(dbg, false));
+                    NotifyHint   = Json.GetBool(json, "notifyhint", DefNotify(dbg, false));
                     Color        = ParseColor(Json.Get(json, "theme"));
                     TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
@@ -285,7 +306,7 @@ namespace TabbedExplorer
                     VTabs        = Json.GetBool(json, "vtabs", false);
                     VTabsCollapse = Json.GetBool(json, "vtabscollapse", true);
                     VPaneAlpha   = ClampAlpha(Json.GetInt(json, "vpanealpha", VPaneAlpha));
-                    Debug        = Json.GetBool(json, "debug", false);
+                    Debug        = dbg;          // 上面提前读过了（通知分类的默认值要用）
                     Diag.Enabled = Debug;        // 读完才是最终口径（见 Diag.Enabled 的说明）
                     hotkeys.Clear();
                     for (int i = 0; i < HotkeyKeys.Length; i++)
@@ -327,7 +348,19 @@ namespace TabbedExplorer
         /// <summary>读老格式（`key=value` 纯文本，v1/v2）。</summary>
         private static void LoadLegacyText()
         {
-            foreach (string raw in File.ReadAllLines(LegacyFileName, Encoding.UTF8))
+            string[] lines = File.ReadAllLines(LegacyFileName, Encoding.UTF8);
+            // ⚠ 先扫一遍 debug —— 通知那四类的默认值要看它（同 `Load` 里的说明）；
+            //   老的 settings.txt 里 debug 可能排在 notify 后面，边读边判就来不及。
+            foreach (string raw in lines)
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#') continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                if (line.Substring(0, eq).Trim().ToLowerInvariant() == "debug")
+                    Debug = ParseBool(line.Substring(eq + 1).Trim(), false);
+            }
+            foreach (string raw in lines)
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == '#') continue;
@@ -345,6 +378,10 @@ namespace TabbedExplorer
                     case "autosleep":   AutoSleep = ParseBool(v, true); break;
                     case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
                     case "notify":      Notify = ParseBool(v, true); break;
+                    case "notifyerr":   NotifyErr = ParseBool(v, DefNotify(Debug, true)); break;
+                    case "notifysys":   NotifySys = ParseBool(v, DefNotify(Debug, true)); break;
+                    case "notifyok":    NotifyOk = ParseBool(v, DefNotify(Debug, false)); break;
+                    case "notifyhint":  NotifyHint = ParseBool(v, DefNotify(Debug, false)); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
@@ -384,7 +421,7 @@ namespace TabbedExplorer
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
-                        AutoPreload, AutoSleep, Notify;
+                        AutoPreload, AutoSleep, Notify, NotifyErr, NotifySys, NotifyOk, NotifyHint;
             public int TabWidth, VPaneAlpha, SleepDelaySec;
             public readonly Dictionary<string, string> Hotkeys =
                 new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -398,6 +435,8 @@ namespace TabbedExplorer
             s.KeepTabs = KeepTabs; s.LazyTabs = LazyTabs; s.ParallelLaunch = ParallelLaunch;
             s.AutoPreload = AutoPreload; s.AutoSleep = AutoSleep; s.SleepDelaySec = SleepDelaySec;
             s.Notify = Notify;
+            s.NotifyErr = NotifyErr; s.NotifySys = NotifySys;
+            s.NotifyOk = NotifyOk; s.NotifyHint = NotifyHint;
             s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit;
             s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
@@ -421,6 +460,8 @@ namespace TabbedExplorer
             KeepTabs = s.KeepTabs; LazyTabs = s.LazyTabs; ParallelLaunch = s.ParallelLaunch;
             AutoPreload = s.AutoPreload; AutoSleep = s.AutoSleep; SleepDelaySec = s.SleepDelaySec;
             Notify = s.Notify;
+            NotifyErr = s.NotifyErr; NotifySys = s.NotifySys;
+            NotifyOk = s.NotifyOk; NotifyHint = s.NotifyHint;
             TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit;
             FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
@@ -455,6 +496,10 @@ namespace TabbedExplorer
                 sb.Append("  \"_autosleep\": \"true = 切走的标签停留够久就把它那个 explorer 进程的驻留内存收一收、切回来重新读回；false = 一个都不收（常驻内存更高，切标签最快）\",\r\n");
                 sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
                 sb.Append("  \"_notify\": \"true = 操作反馈弹一条右下角气泡（已复制 / 留一个 / 还在后台 这类）；false = 一个都不弹（功能一件不少）\",\r\n");
+                sb.Append("  \"_notifyerr\": \"true = 出错 / 失败时弹（打不开、复制不了、加入失败、重启失败…）。重要，默认开（Debug 模式下四类默认全开）\",\r\n");
+                sb.Append("  \"_notifysys\": \"true = 启动与后台状态提示（「程序还在后台运行」这类）。重要，默认开\",\r\n");
+                sb.Append("  \"_notifyok\": \"true = 操作结果提示（已复制 / 已加入书签 / 换了书签栏）。非 Debug 模式默认关\",\r\n");
+                sb.Append("  \"_notifyhint\": \"true = 轻提示（已经在了 / 至少留一个 / 这个文件夹没书签）。非 Debug 模式默认关\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
                 sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");
@@ -469,6 +514,10 @@ namespace TabbedExplorer
                 sb.Append("  \"autosleep\": ").Append(AutoSleep ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"sleepdelay\": ").Append(SleepDelaySec).Append(",\r\n");
                 sb.Append("  \"notify\": ").Append(Notify ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"notifyerr\": ").Append(NotifyErr ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"notifysys\": ").Append(NotifySys ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"notifyok\": ").Append(NotifyOk ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"notifyhint\": ").Append(NotifyHint ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
@@ -525,11 +574,12 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20} notifyerr={21} notifysys={22} notifyok={23} notifyhint={24}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
-                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0);
+                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0,
+                NotifyErr ? 1 : 0, NotifySys ? 1 : 0, NotifyOk ? 1 : 0, NotifyHint ? 1 : 0);
         }
 
         // ==================================================================
@@ -613,6 +663,27 @@ namespace TabbedExplorer
             return "跟随系统";
         }
 
+        /// <summary>
+        /// 通知四类各自的默认值（json 里没这个键时用它）。
+        /// 用户：「Debug 模式默认开启全部，非 Debug 模式只默认开启重要的部分」。
+        /// </summary>
+        private static bool DefNotify(bool debug, bool important) { return debug || important; }
+
+        /// <summary>这一类本身开着没有（**不看总闸**，设置窗口画勾要用它）。</summary>
+        public static bool NotifyPartOn(ToastKind k)
+        {
+            if (k == ToastKind.Err) return NotifyErr;
+            if (k == ToastKind.Ok) return NotifyOk;
+            if (k == ToastKind.Hint) return NotifyHint;
+            return NotifySys;
+        }
+
+        /// <summary>
+        /// 这一类气泡现在该不该弹（**总闸 + 分类闸**）。`Toast.Show` 就调它 ——
+        /// 每次现读静态字段，所以设置里一改立刻生效、不用重启。
+        /// </summary>
+        public static bool NotifyOn(ToastKind k) { return Notify && NotifyPartOn(k); }
+
         // ==================================================================
         // 改一项就存一次（都从菜单里点，频率极低，不用攒）
         // ==================================================================
@@ -626,6 +697,15 @@ namespace TabbedExplorer
         public static void SetAutoSleep(bool on) { AutoSleep = on; Save(); }
         public static void SetSleepDelay(int sec) { SleepDelaySec = ClampSleepSec(sec); Save(); }
         public static void SetNotify(bool on) { Notify = on; Save(); }
+        /// <summary>改某一类通知开不开（设置窗口里那四项）。</summary>
+        public static void SetNotifyPart(ToastKind k, bool on)
+        {
+            if (k == ToastKind.Err) NotifyErr = on;
+            else if (k == ToastKind.Ok) NotifyOk = on;
+            else if (k == ToastKind.Hint) NotifyHint = on;
+            else NotifySys = on;
+            Save();
+        }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }

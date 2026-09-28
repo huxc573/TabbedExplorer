@@ -187,6 +187,22 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("右下角通知（操作提示气泡）",
                        () => Settings.Notify,
                        () => hub.SetNotify(!Settings.Notify))));
+            // ③⁷ 通知分类（用户：「右下角通知提供更多可选项，还有 Debug 模式默认开启全部，
+            //     非 Debug 模式只默认开启重要的部分」）。四类各一个开关，**全 WinOnly** ——
+            //     托盘那棵子树本来就挤，这四项是「进设置窗口才调」的东西。
+            //     默认值看 Debug 模式，见 `Settings.DefNotify`；总闸关着时这四项照旧记着各自的值。
+            n.Add(WinOnly(Leaf("　└ 出错与失败（打不开 / 复制不了 / 加入失败）",
+                       () => Settings.NotifyErr,
+                       () => hub.SetNotifyPart(ToastKind.Err, !Settings.NotifyErr))));
+            n.Add(WinOnly(Leaf("　└ 启动与后台状态（「程序还在后台运行」这类）",
+                       () => Settings.NotifySys,
+                       () => hub.SetNotifyPart(ToastKind.Sys, !Settings.NotifySys))));
+            n.Add(WinOnly(Leaf("　└ 操作结果（已复制 / 已加入书签 / 换了书签栏）",
+                       () => Settings.NotifyOk,
+                       () => hub.SetNotifyPart(ToastKind.Ok, !Settings.NotifyOk))));
+            n.Add(WinOnly(Leaf("　└ 轻提示（已经在了 / 至少留一个 / 这个文件夹没书签）",
+                       () => Settings.NotifyHint,
+                       () => hub.SetNotifyPart(ToastKind.Hint, !Settings.NotifyHint))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。

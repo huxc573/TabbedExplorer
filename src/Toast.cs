@@ -6,6 +6,24 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
+    /// 气泡的**类别** —— 决定它归设置里哪一个开关管（见 `Settings.NotifyOn`）。
+    ///
+    /// 为什么分：出错必须让人看见；「我干了活」那种反馈（已复制 / 已加入书签）看多了反而烦。
+    /// 所以两类的默认值不一样（用户：「Debug 模式默认开启全部，非 Debug 模式只默认开启重要的部分」）。
+    /// </summary>
+    internal enum ToastKind
+    {
+        /// <summary>出错 / 失败（打开不了、复制不了、加入失败、重启失败…）。**重要**。</summary>
+        Err,
+        /// <summary>启动与后台状态（「程序还在后台运行」这类）。**重要**。</summary>
+        Sys,
+        /// <summary>操作结果（已复制、已加入书签、换了书签栏…）。非 Debug 模式默认关。</summary>
+        Ok,
+        /// <summary>轻提示（已经在了、至少留一个、这个文件夹没书签…）。非 Debug 模式默认关。</summary>
+        Hint
+    }
+
+    /// <summary>
     /// 自己画的提示气泡 —— 替代 `NotifyIcon.ShowBalloonTip`。
     ///
     /// 为什么不用系统的（用户报「显示提醒的背景和字体颜色没适配颜色模式」）：
@@ -45,15 +63,22 @@ namespace TabbedExplorer
         private readonly Font headFont = new Font("Segoe UI", Px(12), FontStyle.Bold, GraphicsUnit.Pixel);
         private readonly Font bodyFont = new Font("Segoe UI", Px(11), FontStyle.Regular, GraphicsUnit.Pixel);
 
-        /// <summary>弹一条提示。任何线程都能调 —— 不在 UI 线程时自己转过去。</summary>
-        public static void Show(string title, string text)
+        /// <summary>
+        /// 弹一条提示，**不写类别**（按 `Sys` 算）。
+        ///
+        /// 兜底刻意的：`Sys` 默认开，万一新加调用点忘了标类别，也**不会把该说的话藏起来**。
+        /// 任何线程都能调 —— 不在 UI 线程时自己转过去。
+        /// </summary>
+        public static void Show(string title, string text) { Show(ToastKind.Sys, title, text); }
+
+        /// <summary>弹一条提示。`kind` 决定它归设置里哪个开关管（见 `Settings.NotifyOn`）。</summary>
+        public static void Show(ToastKind kind, string title, string text)
         {
             try
             {
-                // ★ 「右下角通知」关着：一个气泡都不弹（见 Settings.Notify）。
-                //   挂在这儿是刻意的 —— 全项目所有气泡都从这一个口出去，一处开关就全关；
-                //   散在二十几个调用点各判一次，早晚会漏。
-                if (!Settings.Notify) return;
+                // ★ 总闸 + 分类闸都在这里判：全项目所有气泡都从这一个口出去，
+                //   一处开关就全管住；散在二十几个调用点各判一次，早晚会漏。
+                if (!Settings.NotifyOn(kind)) return;
                 if (current != null && !current.IsDisposed && current.InvokeRequired)
                 {
                     Toast f = current;

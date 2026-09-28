@@ -103,6 +103,14 @@ namespace TabbedExplorer
         public const int SleepDelaySecMin = 1;
         public const int SleepDelaySecMax = 300;
         /// <summary>
+        /// 「右下角通知」（默认**开**）：操作反馈那种气泡弹不弹（「已复制完整路径」「留一个」
+        /// 「TabbedExplorer 还在后台」…… 就是屏幕右下角冒一下的那一条）。
+        ///
+        /// 关掉**只**影响这些气泡的显示 —— 功能一件不少，只是不再弹那一下。
+        /// 总闸挂在 `Toast.Show` 头上：全项目所有气泡都从那儿出去，所以开关一处就全关。
+        /// </summary>
+        public static bool Notify = true;
+        /// <summary>
         /// 并发起 explorer（默认**开**）。
         ///
         /// 关着的时候是一个一个来（`EmbedForm.PumpLaunch` 从前只放一个）：开标签慢，但「新出现的窗口就是我的」
@@ -265,6 +273,7 @@ namespace TabbedExplorer
                     AutoPreload  = Json.GetBool(json, "autopreload", true);
                     AutoSleep    = Json.GetBool(json, "autosleep", true);
                     SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
+                    Notify       = Json.GetBool(json, "notify", true);
                     Color        = ParseColor(Json.Get(json, "theme"));
                     TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
@@ -335,6 +344,7 @@ namespace TabbedExplorer
                     case "autopreload": AutoPreload = ParseBool(v, true); break;
                     case "autosleep":   AutoSleep = ParseBool(v, true); break;
                     case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
+                    case "notify":      Notify = ParseBool(v, true); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
@@ -374,7 +384,7 @@ namespace TabbedExplorer
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
-                        AutoPreload, AutoSleep;
+                        AutoPreload, AutoSleep, Notify;
             public int TabWidth, VPaneAlpha, SleepDelaySec;
             public readonly Dictionary<string, string> Hotkeys =
                 new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -387,6 +397,7 @@ namespace TabbedExplorer
             s.Capture = Capture; s.Color = Color;
             s.KeepTabs = KeepTabs; s.LazyTabs = LazyTabs; s.ParallelLaunch = ParallelLaunch;
             s.AutoPreload = AutoPreload; s.AutoSleep = AutoSleep; s.SleepDelaySec = SleepDelaySec;
+            s.Notify = Notify;
             s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit;
             s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
@@ -409,6 +420,7 @@ namespace TabbedExplorer
             Capture = s.Capture; Color = s.Color;
             KeepTabs = s.KeepTabs; LazyTabs = s.LazyTabs; ParallelLaunch = s.ParallelLaunch;
             AutoPreload = s.AutoPreload; AutoSleep = s.AutoSleep; SleepDelaySec = s.SleepDelaySec;
+            Notify = s.Notify;
             TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit;
             FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
@@ -442,6 +454,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_autopreload\": \"true = 程序起来后就算还没打开窗口，也先在后台把本桌面记着的标签起出来（第一次 Win+E 就是热的）；false = 等按 Win+E 再还原\",\r\n");
                 sb.Append("  \"_autosleep\": \"true = 切走的标签停留够久就把它那个 explorer 进程的驻留内存收一收、切回来重新读回；false = 一个都不收（常驻内存更高，切标签最快）\",\r\n");
                 sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
+                sb.Append("  \"_notify\": \"true = 操作反馈弹一条右下角气泡（已复制 / 留一个 / 还在后台 这类）；false = 一个都不弹（功能一件不少）\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
                 sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");
@@ -455,6 +468,7 @@ namespace TabbedExplorer
                 sb.Append("  \"autopreload\": ").Append(AutoPreload ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"autosleep\": ").Append(AutoSleep ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"sleepdelay\": ").Append(SleepDelaySec).Append(",\r\n");
+                sb.Append("  \"notify\": ").Append(Notify ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
@@ -511,11 +525,11 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
-                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec);
+                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0);
         }
 
         // ==================================================================
@@ -611,6 +625,7 @@ namespace TabbedExplorer
         public static void SetAutoPreload(bool on) { AutoPreload = on; Save(); }
         public static void SetAutoSleep(bool on) { AutoSleep = on; Save(); }
         public static void SetSleepDelay(int sec) { SleepDelaySec = ClampSleepSec(sec); Save(); }
+        public static void SetNotify(bool on) { Notify = on; Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }

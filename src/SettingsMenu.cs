@@ -182,6 +182,11 @@ namespace TabbedExplorer
                       Settings.SleepDelaySecMin, Settings.SleepDelaySecMax, 1,
                       delegate { return Settings.SleepDelaySec; },
                       delegate(int s) { hub.SetSleepDelay(s); }));
+            // ③⁶ 右下角通知（默认开，用户要的）：操作反馈那种气泡（已复制 / 留一个 / 还在后台…）。
+            //     总闸在 `Toast.Show` 头上 ⇒ 关掉是**一处生效、全部不弹**，功能一件不少。
+            n.Add(WinOnly(Leaf("右下角通知（操作提示气泡）",
+                       () => Settings.Notify,
+                       () => hub.SetNotify(!Settings.Notify))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。

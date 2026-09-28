@@ -50,6 +50,10 @@ namespace TabbedExplorer
         {
             try
             {
+                // ★ 「右下角通知」关着：一个气泡都不弹（见 Settings.Notify）。
+                //   挂在这儿是刻意的 —— 全项目所有气泡都从这一个口出去，一处开关就全关；
+                //   散在二十几个调用点各判一次，早晚会漏。
+                if (!Settings.Notify) return;
                 if (current != null && !current.IsDisposed && current.InvokeRequired)
                 {
                     Toast f = current;

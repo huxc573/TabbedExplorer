@@ -1512,6 +1512,18 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 「右下角通知」（默认开，见 `Settings.Notify`）：屏幕右下角那种操作反馈气泡弹不弹。
+        /// **立刻生效** —— 总闸就在 `Toast.Show` 头上，每次现读，关掉之后下一条就不弹了。
+        /// </summary>
+        public void SetNotify(bool on)
+        {
+            if (Settings.Notify == on) return;
+            Settings.SetNotify(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 右下角通知 -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
         /// 重启本程序（设置里那一项）。
         ///
         /// 顺序不能反：**先起新进程、再退自己** —— 单实例锁是我们退出那一刻才放开的，
@@ -1776,6 +1788,7 @@ namespace TabbedExplorer
             SetAutoPreload(s.AutoPreload);
             SetAutoSleep(s.AutoSleep);
             SetSleepDelay(s.SleepDelaySec);
+            SetNotify(s.Notify);
             SetTabWidth(s.TabWidth);
             SetTabAutoWiden(s.TabAutoWiden);
             SetTabAutoFit(s.TabAutoFit);

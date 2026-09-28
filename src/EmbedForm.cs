@@ -2778,6 +2778,19 @@ namespace TabbedExplorer
                 delegate { Defer(ReopenClosedTab); }));
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
+            // ---- 合并同路径标签页（用户新增）----
+            // 同一个位置开了好几个标签（记忆文件里的重复行、连开两次、收编来的窗跟已有标签撞了路径）时，
+            // 给一条「把它们收成一页」的路 —— 关掉其余同路径的，**只留右键点的这一个**。
+            // ⚠ 没有重复就置灰（跟「关闭其它标签页」同一个规矩）：点了什么都不发生的项不如直接灰着。
+            string myKey = PathKeyOf(hosts[idx]);
+            int samePath = 0;
+            if (myKey.Length > 0)
+            {
+                for (int i = 0; i < hosts.Count; i++)
+                    if (i != idx && PathKeyOf(hosts[i]) == myKey) samePath++;
+            }
+            m.Add(Mi(samePath > 0 ? "合并同路径标签页（关掉另外 " + samePath + " 个）" : "合并同路径标签页",
+                samePath > 0 ? (Action)delegate { Defer(delegate { MergeSamePathTabs(idx); }); } : null));
             // ---- 多选了一批（Ctrl / Shift 点出来的）→ 给一条「一次关掉它们」----
             // 只在「右键点的这一个也在选中里」时出现 —— 否则用户会以为关的是他点的那一个。
             if (tabStrip.HasMultiSelection && tabStrip.IsSelected(idx))
@@ -2832,6 +2845,53 @@ namespace TabbedExplorer
             int n = keep == null ? -1 : IndexOfHost(keep);
             if (n < 0) n = hosts.Count - 1;
             if (n >= 0) Activate(n);
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// 一个标签「现在在哪个位置」的**归一化**键 —— 判两个标签是不是同一个文件夹只有这一个口，
+        /// 口径跟 `IndexOfPath` 完全一致：地址栏给的常常是「下载」「此电脑」这种显示名，
+        /// 不 `Store` + `Norm` 一次就永远比不相等。返回空 = 这个标签还不知道自己在哪儿（还没就绪）。
+        /// </summary>
+        private string PathKeyOf(ExplorerHost h)
+        {
+            if (h == null) return "";
+            return PathRules.Norm(PathRules.Store(LivePath(h)));
+        }
+
+        /// <summary>
+        /// 「合并同路径标签页」（用户要的）：把**跟右键这一个指向同一个位置**的其它标签全关掉，
+        /// 只留它。同一个文件夹被开了好几页时整排标签没法看，而一条「关闭其它标签页」又会把
+        /// 不同路径的一起关掉 —— 所以单开一条。
+        ///
+        /// ⚠ 判据只走 `PathKeyOf`（= `IndexOfPath` 那套），别在这儿另写一份。
+        /// ⚠ 关的时候**从后往前**（下标不漂），中间的 `Activate` 全按掉（见 `CloseTabsQuiet`）；
+        ///   保留那一个按**引用**认（`mine`），不靠下标 —— 前面关掉几个之后下标就变了。
+        /// </summary>
+        private void MergeSamePathTabs(int keep)
+        {
+            if (keep < 0 || keep >= hosts.Count) return;
+            ExplorerHost mine = hosts[keep];
+            string want = PathKeyOf(mine);
+            if (want.Length == 0) return;
+
+            int n = 0;
+            for (int i = 0; i < hosts.Count; i++)
+                if (i != keep && PathKeyOf(hosts[i]) == want) n++;
+            if (n == 0) return;
+
+            Diag.Step("EmbedForm: 合并同路径标签页「" + want + "」-> 关掉另外 " + n + " 个，保留右键那一个");
+            CloseTabsQuiet(delegate
+            {
+                for (int i = hosts.Count - 1; i >= 0; i--)
+                {
+                    if (i >= hosts.Count) continue;
+                    if (hosts[i] == mine || PathKeyOf(hosts[i]) != want) continue;
+                    CloseTab(i, false);
+                }
+            });
+            int k = IndexOfHost(mine);
+            if (k >= 0) Activate(k);      // 关完把焦点/可见性落回保留的那个
             MarkDirty();
         }
 

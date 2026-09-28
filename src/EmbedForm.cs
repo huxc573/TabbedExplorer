@@ -160,6 +160,15 @@ namespace TabbedExplorer
         /// </summary>
         private const int SpawnSlotMs = 450;
 
+        /// <summary>
+        /// **预加载那一批专用**的格（见 <see cref="preloadBatch"/>）—— 比 <see cref="SpawnSlotMs"/> 宽一倍。
+        ///
+        /// 预加载没有任何人在等，拿「整台机器卡一下」去换「早两秒就绪」完全不值：用户报的
+        /// 「预加载后很卡」就是 18 个 explorer 在几秒里一起起舞（4 个并发 × 450ms）。拉宽到这一格
+        /// 之后是**一个接一个**慢慢起，峰值 CPU 落下来，代价只是整批所需时间变长（后台的事，没人在等）。
+        /// </summary>
+        private const int PreloadSpawnSlotMs = 900;
+
         /// <summary>起进程的格到点放行：队列里还有人时每 200ms 推一把（见 <see cref="SpawnSlotMs"/>）。</summary>
         private readonly Timer pumpTimer = new Timer();
 
@@ -208,6 +217,17 @@ namespace TabbedExplorer
         /// 那比不省内存还糟（每次切回来都要重新缺页）。
         /// </summary>
         private readonly Timer trimTimer = new Timer();
+
+        /// <summary>
+        /// 现在这一批标签是**预加载**出来的（见 `PreloadTabs`）。预加载的区别只有一条：**没人在等**，
+        /// 所以可以（也应该）慢慢来：
+        ///   · 起进程**一个一个来**、格放宽到 `PreloadSpawnSlotMs`（见 `PumpLaunch`）—— 否则 18 个
+        ///     explorer 一口气起舞，整台机器都卡（用户报的「预加载后很卡」）；
+        ///   · **不排「备用窗口」**（见 `StartRestNow`）—— 那是为了 `+` 号秒开，不急在这一批里多烧一个 explorer。
+        /// 用户一按 Win+E（`ShowForUser` / `ShowForCapture`）就立刻取消：有人在等了，该快就得快。
+        /// 这一批起完（`PumpLaunch` 里队列空掉那一刻）也自动取消。
+        /// </summary>
+        private bool preloadBatch;
 
         /// <summary>
         /// 「临时摊开侧边栏」那个定时器（Ctrl+Shift+B 这类看不见的开关给个反馈，见 PeekPane）。
@@ -468,8 +488,9 @@ namespace TabbedExplorer
                 catch { revealPosting = 0; }   // 窗体句柄还没建 / 正在销毁
             }, null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
 
-            // 非激活标签的内存：切完标签 3 秒后收一次（见 TrimInactiveTabs）。
-            trimTimer.Interval = 3000;
+            // 非激活标签的内存：切完标签过一会儿收一次（多久见 Settings.SleepDelaySec，见 TrimInactiveTabs）。
+            // ⚠ 重排一律走 `ArmTrim`（它会按**当前**设置重设 Interval），这里只是给个初始值。
+            trimTimer.Interval = Settings.SleepDelaySec * 1000;
             trimTimer.Tick += delegate
             {
                 trimTimer.Stop();
@@ -1141,6 +1162,7 @@ namespace TabbedExplorer
                 ApplyRememberedBounds();
                 if (!Visible) Show();
                 windowShown = true;
+                preloadBatch = false;      // 有人在等了 —— 预加载那档「慢慢来」到此为止（见 preloadBatch）
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
 
@@ -1185,8 +1207,14 @@ namespace TabbedExplorer
             {
                 if (!Visible) Show();
                 windowShown = true;
+                preloadBatch = false;      // 见 preloadBatch
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
+                // ★ 前面那句「收标签」（`NewAdoptedTab` → `Activate`）可能是在 `windowShown` 还是 false
+                //   的时候跑的（收编这条路的顺序就是「先收标签、再 ShowForCapture」）—— 那一下可见性
+                //   被那道闸挡掉了。这会儿是真露面了，按 activeIndex 把「谁可见、谁有焦点」补一遍；
+                //   不补的话窗口出来了、里面却是一块空的。
+                ApplyVisibility();
                 MarkDirty();
             }
             catch (Exception ex) { Diag.Log("EmbedForm: ShowForCapture 失败 " + ex.Message); }
@@ -1368,7 +1396,9 @@ namespace TabbedExplorer
             Diag.Step("记忆: 优先那个已落定，其余标签开始排队（共 " + hosts.Count + " 个）");
             // ★ 顺手把备用窗口也排到队尾（见 WarmUpQueued）：等这一批全落定再预热要十几秒，
             //   那段时间里按 `+` 都得现起 explorer。
-            WarmUpQueued();
+            //   ⚠ 预加载那一批（`preloadBatch`）**不排**：那时没人在等，多烧一个 explorer 正是
+            //     「很卡」的一部分；等这一批起完 `PumpLaunch` 自然会预热（`WarmUp`）。
+            if (!preloadBatch) WarmUpQueued();
         }
 
         /// <summary>
@@ -1435,6 +1465,8 @@ namespace TabbedExplorer
             if (!Settings.AutoPreload) return;      // 中途被关掉就算了（设置里改完只影响下次启动）
             if (windowShown) return;                // 已经露过面：正常路径会管，别插一脚
             if (hosts.Count > 0 || restored) return;
+            // 这一批是「没人在等」的那种：起进程降到一格、也不排备用窗口（见 preloadBatch）。
+            preloadBatch = true;
             Diag.Step("EmbedForm: 预加载 -> 后台把桌面 " + DesktopKey + " 记着的标签起出来");
             RestoreRememberedTabs();
         }
@@ -1842,7 +1874,8 @@ namespace TabbedExplorer
             if (IsDisposed || Disposing) return;
             ReleaseSpawnSlots();
 
-            int cap = Settings.ParallelLaunch ? MaxConcurrentLaunch : 1;
+            // 预加载那一批（见 preloadBatch）一律一个一个来：没人在等，别把机器压住。
+            int cap = preloadBatch ? 1 : (Settings.ParallelLaunch ? MaxConcurrentLaunch : 1);
             while (launchQueue.Count > 0 && launching.Count < cap)
             {
                 Launch j = launchQueue.Dequeue();
@@ -1859,8 +1892,15 @@ namespace TabbedExplorer
             // 还原 8 个标签时它累计要 5 秒多、还全压在一个 UI 线程上 —— 那就是「非激活标签还在加载时
             // 整个程序几乎不可用」。挂起来之后由 500ms 心跳在这一批结束的 2 秒内补上。
             if (launchQueue.Count > 0 || launching.Count > 0) ShellBrowserReg.KeepQuiet(1500);
-            // 队列空、手里也没有在起的 → 预热下一个「新建标签页」的窗口
-            if (launchQueue.Count == 0 && launching.Count == 0) WarmUp();
+            // 队列空、手里也没有在起的 → 这一批结束了：预加载那档也随之作废，预热下一个「新建标签页」的窗口
+            // ⚠ 但「优先那个刚起好」这一刻不算结束（见 StartRestLaunches）：其余的还在 `restPending`
+            //   里等它落定，那一刻队列确实是空的 —— 实测就是在这儿把预加载那档提前关掉的，
+            //   结果后面 5 个又按 4 并发 / 450ms 一口气冲出去（日志里 `并发 1/1` 紧跟着 `并发 1/4`）。
+            if (launchQueue.Count == 0 && launching.Count == 0 && !(preloadBatch && restPending))
+            {
+                preloadBatch = false;
+                WarmUp();
+            }
             // 什么时候还要 200ms 回来一趟：
             //   · 队列里还有活 —— 回来放行「到点的格」（见 SpawnSlotMs）
             //   · 队列空了但手里没备用窗口 —— 回来把预热补上（预热失败进了冷却期时全靠它自愈）
@@ -1879,11 +1919,13 @@ namespace TabbedExplorer
             // 串行模式（用户关掉了并发）就老老实实等「认到窗口」再放行 —— 那正是那个开关的含义
             //（「一次只起一个」），不能靠时间偷偷并起来。
             if (!Settings.ParallelLaunch) return;
+            // 预加载那一批用宽格（见 PreloadSpawnSlotMs）
+            int slotMs = preloadBatch ? PreloadSpawnSlotMs : SpawnSlotMs;
             DateTime now = DateTime.Now;
             List<ExplorerHost> done = null;
             foreach (KeyValuePair<ExplorerHost, DateTime> kv in launching)
             {
-                if ((now - kv.Value).TotalMilliseconds < SpawnSlotMs) continue;
+                if ((now - kv.Value).TotalMilliseconds < slotMs) continue;
                 if (done == null) done = new List<ExplorerHost>();
                 done.Add(kv.Key);
             }
@@ -1891,7 +1933,7 @@ namespace TabbedExplorer
             for (int i = 0; i < done.Count; i++)
             {
                 launching.Remove(done[i]);
-                Diag.Step("EmbedForm: 起进程的格到点放行（这一格占了 " + SpawnSlotMs + "ms）");
+                Diag.Step("EmbedForm: 起进程的格到点放行（这一格占了 " + slotMs + "ms）");
             }
         }
 
@@ -2223,14 +2265,24 @@ namespace TabbedExplorer
             History.Add(LivePath(h));                // 真打开了才算「去过」
             if (i == activeIndex)
             {
-                h.Host.Visible = true;
                 Text = tabStrip.Tabs[i].Title;       // 任务栏 / Alt+Tab 的显示名
-                h.Focus();
+                // ⚠ 窗口还没露过面（预加载那批）时**不显示、不抢焦点** —— 标题/图标/路径照刷，
+                //   但内容不往桌面上摆。用户报的「预加载后为什么要主动打开窗口，以前是不打开的」
+                //   根因就是这里：以前一律 `Visible = true` + `Focus()`。
+                //   露窗体那一下（`ShowForUser` / `ShowForCapture`）才由 `Activate` / `ApplyVisibility` 摆好。
+                if (windowShown)
+                {
+                    h.Host.Visible = true;
+                    h.Focus();
+                }
             }
             // ★ 用户要的那一个**落定**了 ⇒ 这时候才让记忆里其余的标签排进启动队列
             //   （见 StartRestLaunches）：提前放会把它自己的收编拖慢近 0.5 秒。
             if (restPending && h == restFirstHost) StartRestNow();
             MarkDirty();     // 嵌好了 = 可以记了（TabPaths 会跳过还没嵌好的）
+            // ★ 每落定一个就重排一次休眠（见 ArmTrim）：预加载那一批就是靠这一句才能被收掉内存 ——
+            //   光靠 `Activate` 那次排的话，那一拍必然落在整批还没就绪的时候，一个都收不了。
+            ArmTrim();
             LaunchDone(h);   // 兜底：正常早就在 `Claimed` 那一步放行过了（见那个事件的注释）
         }
 
@@ -2342,20 +2394,21 @@ namespace TabbedExplorer
             // ⚠ 还在等导航到位的那个标签（见 UseReserve / OnRevealTick）**先别露面**：
             //   让它 Visible 一下再藏回去，白付一次「跨进程把 explorer 窗口显示出来」的钱（实测 85~165ms），
             //   而那一下还正好撞在 explorer 忙的时候。到点露面时 `RevealNow` 会把它放出来。
+            // ⚠ `windowShown` 那道闸（见 `OnHostReady`）：窗口还没露过面时一个都不显示、不抢焦点。
             for (int i = 0; i < hosts.Count; i++)
-                hosts[i].Host.Visible = (i == idx) && hosts[i] != revealPending;
+                hosts[i].Host.Visible = windowShown && (i == idx) && hosts[i] != revealPending;
             tabStrip.SetActive(idx);
             if (vPane != null && verticalOn) vPane.ScrollActiveIntoView();   // 竖排那份也要把选中的那行拉进视线
             long tUi = sw.ElapsedMilliseconds;
             // 同理：内容还没换过来，这时候把键盘焦点塞给它是白等一次跨进程 SetFocus（实测 70~172ms）；
             // 它露面时 `RevealNow` 会补上（那一下它已经是 active 了）。
-            if (hosts[idx] != revealPending) hosts[idx].Focus();
+            if (windowShown && hosts[idx] != revealPending) hosts[idx].Focus();
             long tFocus = sw.ElapsedMilliseconds;
             Text = tabStrip.Tabs[idx].Title;   // 任务栏 / Alt+Tab 的显示名（自绘标题栏删了，就剩这一处用途）
             MarkDirty();     // 「当时选中那个」也要记
-            // 刚离开的那个标签先别动：过 3 秒还没被切回来，才当它真的凉了。
-            trimTimer.Stop();
-            trimTimer.Start();
+            // 刚离开的那个标签先别动：过一会儿（多久见 `Settings.SleepDelaySec`）还没被切回来，
+            // 才当它真的凉了。
+            ArmTrim();
             long tEnd = sw.ElapsedMilliseconds;
             // 只记慢的：正常切标签是几毫秒，超过 30ms 就说明某一步卡住了（点书签为什么慢的拆账）
             if (tEnd >= 30)
@@ -2375,12 +2428,14 @@ namespace TabbedExplorer
         {
             if (IsDisposed || Disposing) return;
             if (!Settings.AutoSleep) return;      // ★ 「非激活标签自动休眠」关着：一个都不收
-            int n = 0;
+            int n = 0, pending = 0;
             for (int i = 0; i < hosts.Count; i++)
             {
                 if (i == activeIndex) continue;      // 当前标签留着，不然切回去要重新载入
                 ExplorerHost h = hosts[i];
                 if (h == null) continue;
+                // 还没认出进程（预加载那批起得慢，头几拍都落在这一支上）—— 现在问它没意义，下一拍再来
+                if (h.ExplorerPid == 0) { pending++; continue; }
                 h.TrimMemory();
                 n++;
             }
@@ -2388,6 +2443,60 @@ namespace TabbedExplorer
             // 标签那边收完，把我们自己这一份也收一收（见 ExplorerHost.TrimSelf）。
             // 不放在 `if (n > 0)` 里 —— 只有一个标签的时候本进程照样会涨（图标、历史、重绘的位图）。
             ExplorerHost.TrimSelf();
+            // ★ 还有标签没就绪（`ExplorerPid == 0`）、而「起标签」这条道还在忙 ⇒ 过一会儿再来一遍。
+            //   没有这一句，「预加载 + 自动休眠」这套形同虚设：收内存只发生在那唯一的一拍上，
+            //   而那一拍必然落在整批标签还在起、一个都还没认出来的时候（用户报的「预加载后
+            //   非激活标签应当主动休眠」就是这个）。
+            //   后半个条件不能省：有标签开失败、或懒加载的占位一直没起时，「没就绪」会永远成立，
+            //   那就成了每 N 秒醒一次的定时器。
+            if (pending > 0 && (launchQueue.Count > 0 || launching.Count > 0)) ArmTrim();
+        }
+
+        /// <summary>
+        /// 重排一次「非激活标签收内存」（见 `TrimInactiveTabs` / `Settings.SleepDelaySec`）。
+        ///
+        /// 所有要排它的地方都请走这一个口（切标签 / 一个标签落定 / 上一拍还有没就绪的 / 设置里改了延时），
+        /// 这样「延时」只有一处取值，改设置能立刻生效。
+        /// </summary>
+        private void ArmTrim()
+        {
+            if (IsDisposed || Disposing) return;
+            trimTimer.Stop();
+            int ms = Settings.SleepDelaySec * 1000;
+            if (ms < 1000) ms = 1000;
+            if (trimTimer.Interval != ms) trimTimer.Interval = ms;
+            trimTimer.Start();
+        }
+
+        /// <summary>
+        /// 「非激活标签多久之后收内存」改了（见 `Settings.SleepDelaySec` / `DesktopHub.SetSleepDelay`）。
+        /// 立刻生效：重排一下这次的定时器，下一次就按新值。
+        /// </summary>
+        internal void ApplySleepDelay()
+        {
+            if (IsDisposed || Disposing) return;
+            if (trimTimer.Enabled) ArmTrim();
+            else trimTimer.Interval = Settings.SleepDelaySec * 1000;
+        }
+
+        /// <summary>
+        /// 按 `activeIndex` 把「哪个标签可见、谁拿键盘焦点」重新摆一遍。
+        ///
+        /// `Activate` 里已经有一份了，这一份专给「露窗体」那两条路补刀 —— 见 `ShowForCapture`：
+        /// 收编那条路是**先**收标签（会调 `Activate`、那时可能还没 `windowShown`）、**后**露窗体的。
+        /// </summary>
+        private void ApplyVisibility()
+        {
+            if (IsDisposed || Disposing) return;
+            if (!windowShown) return;
+            for (int i = 0; i < hosts.Count; i++)
+            {
+                ExplorerHost h = hosts[i];
+                if (h == null) continue;
+                h.Host.Visible = (i == activeIndex) && h != revealPending;
+            }
+            if (activeIndex >= 0 && activeIndex < hosts.Count && hosts[activeIndex] != revealPending)
+                hosts[activeIndex].Focus();
         }
 
         private void CloseTab(int idx) { CloseTab(idx, true); }

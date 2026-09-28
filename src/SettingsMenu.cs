@@ -175,6 +175,13 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("非激活标签自动休眠（切走的标签过一会儿收回内存，切回来重新载入）",
                        () => Settings.AutoSleep,
                        () => hub.SetAutoSleep(!Settings.AutoSleep))));
+            // ③⁵ 休眠延时（数值项，用户要的「自动休眠增加时间设置」）：上面那个开关管「收不收」，
+            //     这一项管「切走多久之后才收」。收完再切回去要按需读回（有一点加载感），
+            //     所以来回对比两个目录时把它调大更顺；想更省内存就调小。实时生效。
+            n.Add(Num("非激活标签多久之后收内存（秒，" + Settings.SleepDelaySecMin + " ~ " + Settings.SleepDelaySecMax + "）",
+                      Settings.SleepDelaySecMin, Settings.SleepDelaySecMax, 1,
+                      delegate { return Settings.SleepDelaySec; },
+                      delegate(int s) { hub.SetSleepDelay(s); }));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。

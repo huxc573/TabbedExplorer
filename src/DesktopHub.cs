@@ -1495,6 +1495,23 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 非激活标签**停留多久之后**收内存（秒，见 `Settings.SleepDelaySec`）。**立刻生效** ——
+        /// 除了写进设置，还要把已经开着的窗口那个定时器重排一下（不然得等下次切标签才用上新值）。
+        /// </summary>
+        public void SetSleepDelay(int sec)
+        {
+            int v = Settings.ClampSleepSec(sec);
+            if (Settings.SleepDelaySec == v) return;
+            Settings.SetSleepDelay(v);
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f == null || f.IsDisposed) continue;
+                f.ApplySleepDelay();
+            }
+            Diag.Step("Hub: 非激活标签多久之后收内存 -> " + Settings.SleepDelaySec + " 秒");
+        }
+
+        /// <summary>
         /// 重启本程序（设置里那一项）。
         ///
         /// 顺序不能反：**先起新进程、再退自己** —— 单实例锁是我们退出那一刻才放开的，
@@ -1756,6 +1773,9 @@ namespace TabbedExplorer
             SetKeepTabs(s.KeepTabs);
             SetLazyTabs(s.LazyTabs);
             SetParallelLaunch(s.ParallelLaunch);
+            SetAutoPreload(s.AutoPreload);
+            SetAutoSleep(s.AutoSleep);
+            SetSleepDelay(s.SleepDelaySec);
             SetTabWidth(s.TabWidth);
             SetTabAutoWiden(s.TabAutoWiden);
             SetTabAutoFit(s.TabAutoFit);

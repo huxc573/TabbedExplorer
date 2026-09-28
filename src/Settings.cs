@@ -82,7 +82,7 @@ namespace TabbedExplorer
         /// </summary>
         public static bool AutoPreload = true;
         /// <summary>
-        /// 非激活标签自动休眠（默认**开**）：切走的标签停留够久（3 秒，见 `EmbedForm.trimTimer`），
+        /// 非激活标签自动休眠（默认**开**）：切走的标签停留够久（默认 3 秒，见 <see cref="SleepDelaySec"/>），
         /// 就把它那个**独立 explorer 进程**的驻留内存收一收（`EmptyWorkingSet`）——
         /// 进程本身、它开的窗口、里面的状态**一动都不动**，只是那些页下次被访问时按需读回，
         /// 所以切回去会有极短的一点「加载感」。见 `EmbedForm.TrimInactiveTabs` / `ExplorerHost.TrimMemory`。
@@ -90,6 +90,18 @@ namespace TabbedExplorer
         /// 关掉 = 一个都不收（常驻内存更高，但切标签永远是最快的）。
         /// </summary>
         public static bool AutoSleep = true;
+        /// <summary>
+        /// 非激活标签**停留多久之后**才收内存（秒，默认 3 —— 见 <see cref="AutoSleep"/>）。
+        ///
+        /// 为什么要有这个数：收内存（`EmptyWorkingSet`）本身是好事，但**收完再切回去要按需读回**，
+        /// 有一点点「加载感」。所以只有「切走够久」的标签才值得收。用户来回对比两个目录就调大，
+        /// 想省内存就调小。范围 <see cref="SleepDelaySecMin"/> ~ <see cref="SleepDelaySecMax"/>。
+        /// 实时生效：`EmbedForm.ArmTrim` 每次重排都现读这个值（见 `DesktopHub.SetSleepDelay`）。
+        /// </summary>
+        public static int SleepDelaySec = 3;
+        /// <summary>「非激活标签多久之后收内存」的合法范围（秒）。</summary>
+        public const int SleepDelaySecMin = 1;
+        public const int SleepDelaySecMax = 300;
         /// <summary>
         /// 并发起 explorer（默认**开**）。
         ///
@@ -252,6 +264,7 @@ namespace TabbedExplorer
                     ParallelLaunch = Json.GetBool(json, "parallel", true);
                     AutoPreload  = Json.GetBool(json, "autopreload", true);
                     AutoSleep    = Json.GetBool(json, "autosleep", true);
+                    SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
                     Color        = ParseColor(Json.Get(json, "theme"));
                     TabWidth     = ClampWidth(Json.GetInt(json, "tabwidth", TabWidth));
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
@@ -321,6 +334,7 @@ namespace TabbedExplorer
                     case "parallel":   ParallelLaunch = ParseBool(v, true); break;
                     case "autopreload": AutoPreload = ParseBool(v, true); break;
                     case "autosleep":   AutoSleep = ParseBool(v, true); break;
+                    case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
                     case "theme":      Color = ParseColor(v); break;
                     case "tabwidth":   TabWidth = ClampWidth(ParseInt(v, TabWidth)); break;
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
@@ -361,7 +375,7 @@ namespace TabbedExplorer
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
                         AutoPreload, AutoSleep;
-            public int TabWidth, VPaneAlpha;
+            public int TabWidth, VPaneAlpha, SleepDelaySec;
             public readonly Dictionary<string, string> Hotkeys =
                 new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
@@ -372,11 +386,12 @@ namespace TabbedExplorer
             Snapshot s = new Snapshot();
             s.Capture = Capture; s.Color = Color;
             s.KeepTabs = KeepTabs; s.LazyTabs = LazyTabs; s.ParallelLaunch = ParallelLaunch;
-            s.AutoPreload = AutoPreload; s.AutoSleep = AutoSleep;
+            s.AutoPreload = AutoPreload; s.AutoSleep = AutoSleep; s.SleepDelaySec = SleepDelaySec;
             s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit;
             s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
             s.Debug = Debug; s.TabWidth = TabWidth; s.VPaneAlpha = VPaneAlpha;
+            s.SleepDelaySec = SleepDelaySec;
             foreach (KeyValuePair<string, string> kv in hotkeys) s.Hotkeys[kv.Key] = kv.Value;
             return s;
         }
@@ -393,7 +408,7 @@ namespace TabbedExplorer
             if (s == null) return;
             Capture = s.Capture; Color = s.Color;
             KeepTabs = s.KeepTabs; LazyTabs = s.LazyTabs; ParallelLaunch = s.ParallelLaunch;
-            AutoPreload = s.AutoPreload; AutoSleep = s.AutoSleep;
+            AutoPreload = s.AutoPreload; AutoSleep = s.AutoSleep; SleepDelaySec = s.SleepDelaySec;
             TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit;
             FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
@@ -426,6 +441,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_lazytabs\": \"true = 还原标签时只把当时选中那个真起出来、其它点开才加载（省开程序那一下的等待）；false = 一次全起出来（默认）\",\r\n");
                 sb.Append("  \"_autopreload\": \"true = 程序起来后就算还没打开窗口，也先在后台把本桌面记着的标签起出来（第一次 Win+E 就是热的）；false = 等按 Win+E 再还原\",\r\n");
                 sb.Append("  \"_autosleep\": \"true = 切走的标签停留够久就把它那个 explorer 进程的驻留内存收一收、切回来重新读回；false = 一个都不收（常驻内存更高，切标签最快）\",\r\n");
+                sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
                 sb.Append("  \"_winsize\": \"true = 退出时记住窗口位置和大小，下次起来照原样摆（按虚拟桌面分别记在 desktops.json 的 bounds 里）\",\r\n");
                 sb.Append("  \"_vtabs\": \"true = 垂直侧边栏（标签竖排在左边窗格，Ctrl+Shift+,）；false = 标签横排在顶上（默认）\",\r\n");
                 sb.Append("  \"_vtabscollapse\": \"true = 垂直窗格的「折叠窗格」：鼠标不在窗格上时只显示图标，移进去临时展开；false = 一直显示完整标题\",\r\n");
@@ -438,6 +454,7 @@ namespace TabbedExplorer
                 sb.Append("  \"parallel\": ").Append(ParallelLaunch ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"autopreload\": ").Append(AutoPreload ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"autosleep\": ").Append(AutoSleep ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"sleepdelay\": ").Append(SleepDelaySec).Append(",\r\n");
                 sb.Append("  \"theme\": \"").Append(Text(Color)).Append("\",\r\n");
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
@@ -494,11 +511,11 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
-                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0);
+                VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec);
         }
 
         // ==================================================================
@@ -517,6 +534,13 @@ namespace TabbedExplorer
             if (a < VPaneAlphaMin) return VPaneAlphaMin;
             if (a > VPaneAlphaMax) return VPaneAlphaMax;
             return a;
+        }
+
+        public static int ClampSleepSec(int s)
+        {
+            if (s < SleepDelaySecMin) return SleepDelaySecMin;
+            if (s > SleepDelaySecMax) return SleepDelaySecMax;
+            return s;
         }
 
         private static bool ParseBool(string v, bool dflt)
@@ -586,6 +610,7 @@ namespace TabbedExplorer
         public static void SetParallelLaunch(bool on) { ParallelLaunch = on; Save(); }
         public static void SetAutoPreload(bool on) { AutoPreload = on; Save(); }
         public static void SetAutoSleep(bool on) { AutoSleep = on; Save(); }
+        public static void SetSleepDelay(int sec) { SleepDelaySec = ClampSleepSec(sec); Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }

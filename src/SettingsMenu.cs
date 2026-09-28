@@ -162,6 +162,19 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("并发起标签页（一次同时起多个，开标签更快）",
                        () => Settings.ParallelLaunch,
                        () => hub.SetParallelLaunch(!Settings.ParallelLaunch))));
+            // ③‴ 预加载（默认开，用户要的）：程序起来后**就算还没打开窗口**，也先在后台把本桌面记着的标签
+            //     起出来 —— 第一次 Win+E 时窗口一出来就是热的。它跟「懒加载」是同一件事的两头，
+            //     所以紧挨着排；两者不冲突（预加载走的就是正常还原那条路，懒加载开着就只起选中那个）。
+            //     ⚠ 它是**启动时的一次性动作**：改了只影响下次启动，当前这次已经预加载出来的标签不动。
+            n.Add(WinOnly(Leaf("预加载标签页（程序起来就在后台把标签加载好，不用等 Win+E）",
+                       () => Settings.AutoPreload,
+                       () => hub.SetAutoPreload(!Settings.AutoPreload))));
+            // ③⁗ 非激活标签自动休眠（默认开，用户要的）：切走的标签停留够久就把那个 explorer 进程的
+            //     驻留内存收一收。跟预加载正好配一对：预加载让它**提前就绪**，休眠让闲着的**别占着内存**。
+            //     改完立刻生效（收内存那条路每次现读这个闸）。
+            n.Add(WinOnly(Leaf("非激活标签自动休眠（切走的标签过一会儿收回内存，切回来重新载入）",
+                       () => Settings.AutoSleep,
+                       () => hub.SetAutoSleep(!Settings.AutoSleep))));
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。

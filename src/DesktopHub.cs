@@ -45,6 +45,12 @@ namespace TabbedExplorer
         /// <summary>记忆不急着每改一下就写盘，攒一下再写（导航一次会连改好几项）。</summary>
         private readonly System.Windows.Forms.Timer saveTimer = new System.Windows.Forms.Timer();
 
+        /// <summary>
+        /// 预加载：**一次性**的延时器 —— 起来之后隔一会儿再去后台把本桌面的标签起出来（见 Settings.AutoPreload）。
+        /// 为什么不立刻做：启动那一下要先把托盘图标、键盘钩子、图标缓存摆好，别跟它抢（用户能感觉到「启动慢」）。
+        /// </summary>
+        private System.Windows.Forms.Timer preloadTimer;
+
         private NotifyIcon tray;
         private WinEHook hook;
         /// <summary>
@@ -151,6 +157,23 @@ namespace TabbedExplorer
             {
                 Diag.Step("Hub: --open -> 立刻在当前桌面开一个窗口");
                 OnWinE();
+            }
+            else if (Settings.AutoPreload)
+            {
+                // 预加载（见 Settings.AutoPreload）：窗口都还没开，先在后台把本桌面记着的标签起出来。
+                // 隔一秒再干 —— 启动那一下的活（托盘图标 / 钩子 / 图标缓存）先让完，
+                // 不然用户会觉得「这程序怎么越起越慢」。到点也只管**当前这张桌面**。
+                preloadTimer = new System.Windows.Forms.Timer();
+                preloadTimer.Interval = 1000;
+                preloadTimer.Tick += delegate
+                {
+                    preloadTimer.Stop();
+                    preloadTimer.Dispose();
+                    preloadTimer = null;
+                    PreloadCurrentDesktop();
+                };
+                preloadTimer.Start();
+                Diag.Step("Hub: 预加载已排上（1 秒后后台起本桌面记着的标签）");
             }
         }
 
@@ -1244,6 +1267,31 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 把「当前这张桌面」记着的标签在后台先起出来（见 `Settings.AutoPreload`）。
+        ///
+        /// 跟 `OnWinE` 的差别就一条：**不 Show、不抢前台** —— 窗口还是等用户第一次 Win+E 才出现，
+        /// 只是那时候标签已经是热的。所以这个方法不能调 `ShowForUser`，只调 `EmbedForm.PreloadTabs`。
+        ///
+        /// 只管当前桌面：别的桌面的窗口得建在别的桌面上（`EmbedForm` 的归属按它实际挂在哪张桌面认），
+        /// 在这儿替它们建会建错桌面。
+        /// </summary>
+        private void PreloadCurrentDesktop()
+        {
+            if (quitting || !Settings.AutoPreload) return;
+            try
+            {
+                Guid d = VirtualDesktop.CurrentDesktopId();
+                EmbedForm f = EnsureForm(d);
+                if (f == null) return;
+                f.PreloadTabs();
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("Hub: 预加载失败 " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 当前桌面的窗口。两种模式两条路：
         ///
         /// **按虚拟桌面分别捕获**（perdesktop，默认）：① 先按「窗口实际挂在哪张桌面」认领
@@ -1419,6 +1467,31 @@ namespace TabbedExplorer
             Settings.SetParallelLaunch(on);
             RefreshTrayMenu();
             Diag.Step("Hub: 并发起 explorer -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
+        /// 预加载（默认开，见 `Settings.AutoPreload`）。
+        /// ⚠ 它是**启动时的一次性动作** —— 改完只影响**下次**启动；当前这次已经预加载出来的标签不动
+        ///   （跟「懒加载」一个道理，那个也是「只影响下次还原」）。
+        /// </summary>
+        public void SetAutoPreload(bool on)
+        {
+            if (Settings.AutoPreload == on) return;
+            Settings.SetAutoPreload(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 预加载 -> " + (on ? "开（下次启动生效）" : "关"));
+        }
+
+        /// <summary>
+        /// 非激活标签自动休眠（默认开）。**立刻生效** —— `EmbedForm.TrimInactiveTabs` 每次现读这个闸，
+        /// 所以关掉之后下一次切标签起就不会再收内存了（已经收掉的也会在切回去时自然读回）。
+        /// </summary>
+        public void SetAutoSleep(bool on)
+        {
+            if (Settings.AutoSleep == on) return;
+            Settings.SetAutoSleep(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 非激活标签自动休眠 -> " + (on ? "开" : "关"));
         }
 
         /// <summary>
@@ -1872,6 +1945,7 @@ namespace TabbedExplorer
             }
             if (favManager != null) { try { favManager.Close(); } catch { } favManager = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
+            if (preloadTimer != null) { try { preloadTimer.Stop(); preloadTimer.Dispose(); } catch { } preloadTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
             if (wheelHook != null) { try { wheelHook.Dispose(); } catch { } wheelHook = null; }
             if (tray != null)

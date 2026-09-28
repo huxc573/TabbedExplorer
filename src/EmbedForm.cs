@@ -1418,6 +1418,28 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// **预加载**（`Settings.AutoPreload`，默认开）：程序刚起来、窗口还没露过面的时候，
+        /// 先把本桌面记着的标签在后台摆好、起出来 —— 用户第一次按 Win+E 时窗口一出来就是热的。
+        ///
+        /// 做法就是走**正常还原**那一整条（<see cref="RestoreRememberedTabs"/>），只是**不 Show、不抢前台**：
+        /// 窗口还是等用户按 Win+E 才出现（`ShowForUser`），区别只在于那时候标签已经在了。
+        ///
+        /// ⚠ 只做一次：`restored` / `restLaunched` / `hosts.Count > 0` 三道闸把重复调用挡掉，
+        ///   所以之后 `ShowForUser` → `EnsureFirstTab` 走的是「已经有标签，直接收工」。
+        /// ⚠ 不兜「此电脑」：没记忆就什么都别开（凭空多一页，用户还以为自己昨天没关干净）。
+        /// ⚠ **不妨碍自动休眠**：起出来的这批仍然是非激活标签，停留够久照样被 `TrimInactiveTabs` 收内存。
+        /// </summary>
+        internal void PreloadTabs()
+        {
+            if (IsDisposed || Disposing) return;
+            if (!Settings.AutoPreload) return;      // 中途被关掉就算了（设置里改完只影响下次启动）
+            if (windowShown) return;                // 已经露过面：正常路径会管，别插一脚
+            if (hosts.Count > 0 || restored) return;
+            Diag.Step("EmbedForm: 预加载 -> 后台把桌面 " + DesktopKey + " 记着的标签起出来");
+            RestoreRememberedTabs();
+        }
+
+        /// <summary>
         /// 把窗口提到前台。最小化时先还原 —— 光调 SetForegroundWindow 会被 Windows 的前台锁定
         /// 拒掉（表现就是只闪任务栏、窗口不上来）；借当前前台线程的输入队列一用才有资格。
         /// </summary>
@@ -2352,6 +2374,7 @@ namespace TabbedExplorer
         private void TrimInactiveTabs()
         {
             if (IsDisposed || Disposing) return;
+            if (!Settings.AutoSleep) return;      // ★ 「非激活标签自动休眠」关着：一个都不收
             int n = 0;
             for (int i = 0; i < hosts.Count; i++)
             {

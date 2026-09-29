@@ -44,6 +44,16 @@ namespace TabbedExplorer
             /// </summary>
             public bool WindowOnly;
             /// <summary>
+            /// 缩进档（0 = 顶格，1 = 缩进一档）。
+            /// 「通知管理」页里大节标题顶格、它下面那几条明细缩一档 —— 一眼看出谁属于谁。
+            /// </summary>
+            public int Indent;
+            /// <summary>
+            /// 三态勾选框（大节标题那种）：返回 0 = 全不勾 / 1 = 部分 / 2 = 全勾。null = 普通两态。
+            /// `Checked` 仍要一起给 —— 别的渲染路径（托盘菜单）只认它。
+            /// </summary>
+            public Func<int> TriState;
+            /// <summary>
             /// 数值项（设置窗口里画成数字输入框，可自己敲）。`NumMax &gt; 0` 表示「这是一条数值项」。
             /// 托盘菜单里一律不排（`WindowOnly` 会自动置上）。
             /// </summary>
@@ -99,6 +109,33 @@ namespace TabbedExplorer
         private static Node Info(string text)
         {
             return new Node { Text = text, WindowOnly = true };
+        }
+
+        /// <summary>
+        /// 三态勾选框（「通知管理」页里那几个大节标题）：点一下 = 这一类**整批**开 / 整批关。
+        /// 点下去的**目标状态**由当前状态算：不是「全开」就全开，已经全开就全不勾。
+        /// </summary>
+        private static Node Tri(string text, Func<int> state, Action<bool> set)
+        {
+            return new Node
+            {
+                Text = text,
+                Checked = delegate { return state() == 2; },
+                Click = delegate { set(state() != 2); },
+                TriState = state
+            };
+        }
+
+        /// <summary>缩进一档的叶子 —— 大节下面那些明细。</summary>
+        private static Node Sub(string text, Func<bool> check, Action click)
+        {
+            return new Node { Text = text, Checked = check, Click = click, Indent = 1 };
+        }
+
+        /// <summary>缩进一档的小字说明（挂在大节标题下面）。</summary>
+        private static Node Note(string text)
+        {
+            return new Node { Text = text, WindowOnly = true, Indent = 1 };
         }
 
         /// <summary>
@@ -292,49 +329,59 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 「通知管理」页的规格 —— 用户：「把通知相关的摘出来单做一个 tab「通知管理」，
-        /// 放更新日志左边，里面包含所有通知明细的设置」。
+        /// 「通知管理」页的规格。
         ///
-        /// 全页都是 `WinOnly`：托盘那棵「设置」子树本来就挤，通知这些是「进设置窗口才调」的东西。
-        /// 「所有通知明细」= 总开关 + 四类 + 停留时间 + 试弹一条。
-        /// ⚠ 加一项要跟 `Settings.cs` 哪几处同步，见 `MEMORY-internals.md` 的 36.1。
+        /// 用户两次要求叠起来的结果：「把通知相关的摘出来单做一个 tab「通知管理」」+
+        /// 「不够细，比如「出错与失败」算一列，用一条线隔开，然后具体在里面的明细可以多选」。
+        ///
+        /// 结构：总开关 → 四个大节（节标题 = 三态勾选框，点一下整批开 / 关；底下一档缩进 = 逐条明细）
+        /// → 停留秒数 → 试弹一条。节与节之间就是那条**横线**（`Sep()`）。
+        ///
+        /// ⚠ 有哪几条、各属哪类、默认开不开，全在 `NotifyItems` 里 ——
+        ///   加一条通知只改那个文件 + 一个调用点，这一页自动跟着变。
+        /// ⚠ 全页都是 `WinOnly`：托盘那棵「设置」子树本来就挤，通知这些是「进设置窗口才调」的东西。
         /// </summary>
         internal static List<Node> SpecNotify(DesktopHub hub)
         {
             List<Node> n = new List<Node>();
 
-            // ① 总开关（关掉 = 下面四类一个都不弹，功能一件不少）
-            n.Add(WinOnly(Leaf("右下角通知（总开关，关掉下面几类一个都不弹）",
+            // ① 总开关（关掉 = 下面一条都不弹，功能一件不少）
+            n.Add(WinOnly(Leaf("右下角通知（总开关，关掉下面一条都不弹）",
                        () => Settings.Notify,
                        () => hub.SetNotify(!Settings.Notify))));
-            n.Add(Sep());
 
-            // ② 四类明细。默认值看 Debug 模式，见 `Settings.DefNotify`；
-            //    总闸关着时这四项照旧记着各自的值（下次开总闸就按各自的值来）。
-            n.Add(WinOnly(Leaf("出错与失败（打不开 / 复制不了 / 加入失败 / 重启失败）",
-                       () => Settings.NotifyErr,
-                       () => hub.SetNotifyPart(ToastKind.Err, !Settings.NotifyErr))));
-            n.Add(WinOnly(Leaf("启动与后台状态（「程序还在后台运行」这类）",
-                       () => Settings.NotifySys,
-                       () => hub.SetNotifyPart(ToastKind.Sys, !Settings.NotifySys))));
-            n.Add(WinOnly(Leaf("操作结果（已复制 / 已加入书签 / 换了书签栏）",
-                       () => Settings.NotifyOk,
-                       () => hub.SetNotifyPart(ToastKind.Ok, !Settings.NotifyOk))));
-            n.Add(WinOnly(Leaf("轻提示（已经在了 / 至少留一个 / 这个文件夹没书签）",
-                       () => Settings.NotifyHint,
-                       () => hub.SetNotifyPart(ToastKind.Hint, !Settings.NotifyHint))));
-            n.Add(Info("上面四类的默认值：Debug 模式全开；平时只开「出错与失败」和「启动与后台状态」。"));
-            n.Add(Sep());
+            // ② 四个大节：横线 + 节标题（三态）+ 小字说明 + 逐条明细
+            ToastKind[] order = NotifyItems.KindOrder;
+            for (int k = 0; k < order.Length; k++)
+            {
+                ToastKind kind = order[k];
+                n.Add(Sep());
+                n.Add(WinOnly(Tri(NotifyItems.KindTitle(kind),
+                          delegate { return Settings.NotifyKindState(kind); },
+                          delegate(bool on) { hub.SetNotifyKind(kind, on); })));
+                n.Add(Note(NotifyItems.KindNote(kind)));
+
+                List<NotifyItem> items = NotifyItems.Of(kind);
+                for (int i = 0; i < items.Count; i++)
+                {
+                    NotifyItem it = items[i];
+                    n.Add(WinOnly(Sub(it.Text,
+                               delegate { return Settings.NotifyItemBase(it); },
+                               delegate { hub.SetNotifyItem(it, !Settings.NotifyItemBase(it)); })));
+                }
+            }
 
             // ③ 停留时间（原本写死 4200ms，现在可调）
+            n.Add(Sep());
             n.Add(Num("一条气泡停留多少秒（" + Settings.NotifySecMin + " ~ " + Settings.NotifySecMax + "，到点自己收）",
                       Settings.NotifySecMin, Settings.NotifySecMax, 1,
                       delegate { return Settings.NotifySec; },
                       delegate(int s) { hub.SetNotifySec(s); }));
             n.Add(Info("气泡点一下就收；它**不抢焦点**，不会把你正在打字的窗口顶掉。"));
+            n.Add(Info("上面每一条的默认值：Debug 模式全开；平时只开「出错与失败」和「启动与后台状态」里的。"));
             n.Add(Sep());
 
-            // ④ 试弹一条（纯动作）—— 改了类别或停留时间，点它当场看效果。
+            // ④ 试弹一条（纯动作）—— 改了哪一条、停留多久，点它当场看效果。
             n.Add(Act("试弹一条通知", delegate
                       {
                           Toast.Preview("这是一条测试通知",

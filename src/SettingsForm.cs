@@ -894,7 +894,7 @@ namespace TabbedExplorer
                 {
                     Label info = TextLabel(nd.Text, Px(11), false);
                     info.ForeColor = Theme.TextDim;
-                    info.SetBounds(pad, y, inner, Px(18));
+                    info.SetBounds(pad + nd.Indent * Px(18), y, inner - nd.Indent * Px(18), Px(18));
                     page.Controls.Add(info);
                     y += Px(22);
                     continue;
@@ -911,6 +911,35 @@ namespace TabbedExplorer
                     continue;
                 }
 
+                // 三态勾选框（「通知管理」页里那几个大节标题）：点一下 = 这一类整批开 / 整批关。
+                // ⚠ `AutoCheck = false` 是必须的 —— 三态自带的轮转是「不勾→部分→全勾」，
+                //   而我们要的是「不是全开就全开、已经全开就全关」，目标状态得自己算。
+                //   所以状态一律由 `TriState()` 说了算：点完走 `ApplyNode`（跑 `Click` → 整窗刷）。
+                if (nd.TriState != null)
+                {
+                    CheckBox tk = new CheckBox();
+                    tk.FlatStyle = FlatStyle.Standard;
+                    tk.BackColor = BackColor;
+                    tk.ForeColor = ForeColor;
+                    tk.Font = Font;
+                    tk.ThreeState = true;
+                    tk.AutoCheck = false;
+                    tk.Text = nd.Text;
+                    tk.SetBounds(Px(4), y, inner - Px(8), rowH);
+                    SettingsMenu.Node node = nd;
+                    tk.Click += delegate { if (!syncing) ApplyNode(node); };
+                    page.Controls.Add(tk);
+                    syncers.Add(delegate
+                    {
+                        int st = node.TriState != null ? node.TriState() : 0;
+                        CheckState cs = st == 2 ? CheckState.Checked
+                                      : (st == 1 ? CheckState.Indeterminate : CheckState.Unchecked);
+                        if (tk.CheckState != cs) tk.CheckState = cs;
+                    });
+                    y += rowH + Px(4);
+                    continue;
+                }
+
                 // 普通勾选框
                 CheckBox ck = new CheckBox();
                 ck.FlatStyle = FlatStyle.Standard;
@@ -918,7 +947,7 @@ namespace TabbedExplorer
                 ck.ForeColor = ForeColor;
                 ck.Font = Font;
                 ck.Text = nd.Text;
-                ck.SetBounds(Px(4), y, inner - Px(8), rowH);
+                ck.SetBounds(Px(4) + nd.Indent * Px(18), y, inner - Px(8) - nd.Indent * Px(18), rowH);
                 SettingsMenu.Node n2 = nd;
                 ck.CheckedChanged += delegate
                 {

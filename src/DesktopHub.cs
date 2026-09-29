@@ -1239,15 +1239,15 @@ namespace TabbedExplorer
         /// ⚠改了实现（用户报「显示提醒的背景和字体颜色没适配颜色模式」）：
         /// 原来走 `NotifyIcon.ShowBalloonTip`，那个气泡是**系统画的**，配色跟系统主题走，
         /// 我们强制浅色/深色时它不认 —— 外壳和气泡两套皮。现在换成自己画的 `Toast`。
-        /// `kind` 是气泡类别（谁该弹、默认开不开，见 `Settings.NotifyOn`）。
+        /// `item` 是「这是哪一条通知」（谁该弹、默认开不开，见 `Settings.NotifyItemOn`）。
         /// </summary>
-        public void Notify(ToastKind kind, string title, string text, bool once)
+        public void Notify(NotifyItem item, string title, string text, bool once)
         {
             try
             {
                 if (once && trayTipShown) return;
                 trayTipShown = true;
-                Toast.Show(kind, title, text);
+                Toast.Show(item, title, text);
             }
             catch { }
         }
@@ -1536,14 +1536,21 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 通知分类开关（设置窗口里那四项，见 `Settings.NotifyPartOn`）。
-        /// **立刻生效** —— 每次弹之前现读，没有缓存；这几项是 `WinOnly`，托盘菜单里不排。
+        /// 设**一条**通知的开关（设置页里最小那一行，见 `Settings.NotifyItemBase`）。
+        /// **立刻生效** —— 每次弹之前现读，没有缓存；这些是 `WinOnly`，托盘菜单里不排。
         /// </summary>
-        public void SetNotifyPart(ToastKind k, bool on)
+        public void SetNotifyItem(NotifyItem it, bool on)
         {
-            if (Settings.NotifyPartOn(k) == on) return;
-            Settings.SetNotifyPart(k, on);
-            Diag.Step("Hub: 通知分类 " + k + " -> " + (on ? "开" : "关"));
+            if (it == null || Settings.NotifyItemBase(it) == on) return;
+            Settings.SetNotifyItem(it, on);
+            Diag.Step("Hub: 通知明细 " + it.Id + " -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>设**一大类**（设置页点节标题那个三态勾：整批开 / 整批关）。</summary>
+        public void SetNotifyKind(ToastKind k, bool on)
+        {
+            Settings.SetNotifyKind(k, on);
+            Diag.Step("Hub: 通知大类 " + NotifyItems.KindTitle(k) + " -> " + (on ? "全开" : "全关"));
         }
 
         /// <summary>
@@ -1576,7 +1583,7 @@ namespace TabbedExplorer
             {
                 // 新进程没起来就**先别退**，否则用户两头空（旧程序没了、新的也没来）
                 Diag.Log("Hub: 重启失败 " + ex.Message);
-                Toast.Show(ToastKind.Err, "重启失败", ex.Message);
+                Toast.Show(NotifyItems.RestartFail, "重启失败", ex.Message);
                 return;
             }
             Quit("重启本程序");
@@ -1782,7 +1789,7 @@ namespace TabbedExplorer
             if (!ok)
             {
                 // 改不动是「出错」，得说一声；成功就不弹了（用户：非重要变更不用弹窗）
-                Notify(ToastKind.Err, "开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
+                Notify(NotifyItems.AutoStartFail, "开机自启", "改不了启动项（注册表写不进去），还是原样。", false);
                 return;
             }
             Diag.Step("Hub: 开机自启 -> " + (on ? "开" : "关"));
@@ -1812,10 +1819,9 @@ namespace TabbedExplorer
             SetAutoSleep(s.AutoSleep);
             SetSleepDelay(s.SleepDelaySec);
             SetNotify(s.Notify);
-            SetNotifyPart(ToastKind.Err, s.NotifyErr);
-            SetNotifyPart(ToastKind.Sys, s.NotifySys);
-            SetNotifyPart(ToastKind.Ok, s.NotifyOk);
-            SetNotifyPart(ToastKind.Hint, s.NotifyHint);
+            // ⚠ 通知的**逐条开关表**在这儿**不用**管（以前这里有四行 `SetNotifyPart`）：
+            //   它是纯数据、没有副作用（不像捕获方式会搬记忆、休眠要重排定时器），
+            //   而紧随其后的 `Settings.ApplySnapshot` 会把整张表抄回去 —— 抄一遍就够了。
             SetNotifySec(s.NotifySec);
             SetTabWidth(s.TabWidth);
             SetTabAutoWiden(s.TabAutoWiden);

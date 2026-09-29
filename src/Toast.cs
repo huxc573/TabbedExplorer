@@ -6,10 +6,11 @@ using System.Windows.Forms;
 namespace TabbedExplorer
 {
     /// <summary>
-    /// 气泡的**类别** —— 决定它归设置里哪一个开关管（见 `Settings.NotifyOn`）。
+    /// 气泡的**大类** —— 设置窗口「通知管理」页里一个「节」就是它（节标题 + 一条横线隔开）。
     ///
     /// 为什么分：出错必须让人看见；「我干了活」那种反馈（已复制 / 已加入书签）看多了反而烦。
-    /// 所以两类的默认值不一样（用户：「Debug 模式默认开启全部，非 Debug 模式只默认开启重要的部分」）。
+    /// 大类的默认值只管**它下面每一条**的默认（见 `NotifyItem.Important`）——
+    /// 真正落地的粒度是**逐条**（`Settings.NotifyItemOn`），要更细就自己在设置页里勾。
     /// </summary>
     internal enum ToastKind
     {
@@ -64,21 +65,18 @@ namespace TabbedExplorer
         private readonly Font bodyFont = new Font("Segoe UI", Px(11), FontStyle.Regular, GraphicsUnit.Pixel);
 
         /// <summary>
-        /// 弹一条提示，**不写类别**（按 `Sys` 算）。
+        /// 弹一条提示。`item` = 这是**哪一条**通知 —— 设置窗口「通知管理」页里的开关就是逐条管的
+        /// （见 `NotifyItem` / `Settings.NotifyItemOn`）。
         ///
-        /// 兜底刻意的：`Sys` 默认开，万一新加调用点忘了标类别，也**不会把该说的话藏起来**。
+        /// ⚠ 只留这一个入口：全项目所有气泡都从这儿出去，所以「总闸 + 这一条自己的开关」一处判完；
+        ///   散在二十几个调用点各判一次，早晚会漏。第几大类不用传 —— 那是条目的固有属性。
         /// 任何线程都能调 —— 不在 UI 线程时自己转过去。
         /// </summary>
-        public static void Show(string title, string text) { Show(ToastKind.Sys, title, text); }
-
-        /// <summary>弹一条提示。`kind` 决定它归设置里哪个开关管（见 `Settings.NotifyOn`）。</summary>
-        public static void Show(ToastKind kind, string title, string text)
+        public static void Show(NotifyItem item, string title, string text)
         {
             try
             {
-                // ★ 总闸 + 分类闸都在这里判：全项目所有气泡都从这一个口出去，
-                //   一处开关就全管住；散在二十几个调用点各判一次，早晚会漏。
-                if (!Settings.NotifyOn(kind)) return;
+                if (!Settings.NotifyItemOn(item)) return;
                 Post(title, text);
             }
             catch { }

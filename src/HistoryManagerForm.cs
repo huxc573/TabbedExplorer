@@ -141,7 +141,7 @@ namespace TabbedExplorer
                 {
                     Clipboard.SetText(string.Join("\r\n", ps.ToArray()));
                     // 复制是看不见的操作（不在页面上留任何痕迹），所以这一条**保留**右下角提示。
-                    Toast.Show(ToastKind.Ok, ps.Count == 1 ? "已复制" : ("已复制 " + ps.Count + " 条"),
+                    Toast.Show(NotifyItems.HistCopy, ps.Count == 1 ? "已复制" : ("已复制 " + ps.Count + " 条"),
                                ps.Count == 1 ? ps[0] : "路径已按行拼好，直接粘就行。");
                 }
                 catch { }
@@ -150,7 +150,7 @@ namespace TabbedExplorer
             bx = AddButton("打开 json", bx, y, delegate
             {
                 try { Process.Start(History.FileName); }
-                catch (Exception ex) { Toast.Show(ToastKind.Err, "打不开", ex.Message); }
+                catch (Exception ex) { Toast.Show(NotifyItems.HistOpenFail, "打不开", ex.Message); }
             });
             bx = AddButton("清空历史", bx, y, delegate
             {

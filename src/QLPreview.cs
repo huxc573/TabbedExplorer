@@ -34,6 +34,11 @@ namespace TabbedExplorer
     /// 所以我们一旦在按住 CapsLock 时吞掉空格，**后面那个钩子就再也收不到这一下**
     /// （返回 1 的事件不会再往后传，也不会进目标窗口），用户的 CapsLock+空格 直接哑掉。
     /// 所以 `WantsSpace` 把 CapsLock / Win 也当成「按着就别管」。
+    ///
+    /// ⚠ **也绝不抢文本框里的空格**：中文输入法上屏就是按空格。在标签里**改文件名**、点**地址栏**、
+    /// 用**搜索框**时，焦点在内嵌窗口的一个 `Edit` 上，而前台窗口仍然是我们的宿主窗体 ——
+    /// 只看宿主白名单就会把他的中文输入直接吞成预览（用户实测报过）。判据见 `TextInputFocused`：
+    /// 用 `GetGUIThreadInfo` 看前台线程里**真正有焦点的控件**，是文本框就整条让路。
     /// </summary>
     internal static class QLPreview
     {
@@ -100,7 +105,8 @@ namespace TabbedExplorer
         /// <summary>
         /// 这次空格该不该归我们管（**钩子线程**：只读字段 + 纯 Win32，不做 COM / IO）。
         /// 四条：开关开着、**没按着别的键**（见 `HeldModifiers` —— Ctrl+空格、Win+空格、
-        /// CapsLock+空格 一个都不能抢）、这一次按下还没处理过、前台是我们某个宿主窗体。
+        /// CapsLock+空格 一个都不能抢）、这一次按下还没处理过、前台是我们某个宿主窗体
+        /// **且焦点不在文本框里**（否则是在改名字/打地址，空格归输入法）。
         /// </summary>
         public static bool WantsSpace()
         {
@@ -117,15 +123,53 @@ namespace TabbedExplorer
             // 但焦点可能落在子窗口上，所以两头都认（`GA_ROOT` 一路走到最外层父窗口）。
             IntPtr root = NativeMethods.GetAncestor(fg, GA_ROOT);
             IntPtr[] hs = hosts;
-            for (int i = 0; i < hs.Length; i++)
+            bool ours = false;
+            for (int i = 0; i < hs.Length && !ours; i++)
             {
-                if (hs[i] == fg || hs[i] == root)
-                {
-                    spaceDown = true;
-                    return true;
-                }
+                if (hs[i] == fg || hs[i] == root) ours = true;
             }
-            return false;
+            if (!ours) return false;
+
+            // 焦点在文本框里（重命名框 / 地址栏 / 搜索框）= 在打字 —— 空格归文本和输入法，绝不碰。
+            if (TextInputFocused(fg)) return false;
+
+            spaceDown = true;
+            return true;
+        }
+
+        /// <summary>
+        /// 焦点是不是落在「会吃掉空格的文本输入」上：内嵌资源管理器的**重命名框**、地址栏、搜索框，
+        /// 以及任何挂在里面的输入框。
+        ///
+        /// ⚠ **必须判这个**：中文输入法**上屏就是按空格** —— 我们一吞，用户连字都打不进去
+        /// （用户实测报过：改文件名时按空格，直接给他弹了预览）。英文场景也一样，空格是正经字符。
+        ///
+        /// 怎么判：前台窗是**别人的进程**，`GetFocus()`（只对本线程有效）拿不到，所以用
+        /// `EmbedApi.FocusedWindowOf(前台线程)`（内部就是 `GetGUIThreadInfo` 取 `hwndFocus`），
+        /// 再看那个控件的类名 —— 资源管理器这几个框都是 `Edit`（搜索框是 `Edit` 外面套一层
+        /// `SearchEditBoxWrapperClass`），所以「类名里含 edit」就是文本输入。
+        /// 判不出来时**一律放行**（宁可偶尔多预览一次，也不能因为查不到就整个功能失灵）。
+        /// </summary>
+        private static bool TextInputFocused(IntPtr fg)
+        {
+            try
+            {
+                uint tid = NativeMethods.GetWindowThreadProcessId(fg, IntPtr.Zero);
+                if (tid == 0) return false;
+
+                IntPtr h = EmbedApi.FocusedWindowOf(tid);
+                if (h == IntPtr.Zero) return false;
+
+                StringBuilder sb = new StringBuilder(64);
+                if (NativeMethods.GetClassName(h, sb, sb.Capacity) <= 0) return false;
+                string cls = sb.ToString();
+
+                if (cls.IndexOf("edit", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+                // 万一焦点跑到了输入法自己那扇窗上（组合期间可能发生）
+                return cls == "IME" || cls == "MSCTFIME UI" || cls == "Default IME";
+            }
+            catch { return false; }
         }
 
         /// <summary>

@@ -79,15 +79,30 @@ namespace TabbedExplorer
                 // ★ 总闸 + 分类闸都在这里判：全项目所有气泡都从这一个口出去，
                 //   一处开关就全管住；散在二十几个调用点各判一次，早晚会漏。
                 if (!Settings.NotifyOn(kind)) return;
-                if (current != null && !current.IsDisposed && current.InvokeRequired)
-                {
-                    Toast f = current;
-                    f.BeginInvoke((MethodInvoker)delegate { ShowOnUi(title, text); });
-                    return;
-                }
-                ShowOnUi(title, text);
+                Post(title, text);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// **不管任何开关**直接弹一条 —— 设置窗口「通知管理」页那个「试弹一条通知」按钮用它。
+        /// 那按钮的目的就是让人看样式和停留时间，被自己的开关拦住就没意义了。
+        /// </summary>
+        public static void Preview(string title, string text)
+        {
+            try { Post(title, text); } catch { }
+        }
+
+        /// <summary>真弹出去。不在 UI 线程时自己转过去。</summary>
+        private static void Post(string title, string text)
+        {
+            if (current != null && !current.IsDisposed && current.InvokeRequired)
+            {
+                Toast f = current;
+                f.BeginInvoke((MethodInvoker)delegate { ShowOnUi(title, text); });
+                return;
+            }
+            ShowOnUi(title, text);
         }
 
         private static void ShowOnUi(string title, string text)
@@ -110,7 +125,7 @@ namespace TabbedExplorer
             DoubleBuffered = true;
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            life.Interval = 4200;
+            life.Interval = 4200;        // 只是个初值，每次弹之前按 `Settings.NotifySec` 重设（见 SetText）
             life.Tick += delegate { life.Stop(); Close(); };
             Theme.Changed += delegate { if (!IsDisposed) { BackColor = Theme.MenuBack; Invalidate(); } };
         }
@@ -146,7 +161,10 @@ namespace TabbedExplorer
             Invalidate();
             if (!Visible) Show();
             BringToTopNoActivate();
+            // ★ 停留时间**每次现读**（设置里改了立刻生效，不用重启，已经在屏幕上的那条不变）：
+            //   1 秒是底线 —— 再短根本看不清；上限见 `Settings.NotifySecMax`。
             life.Stop();
+            life.Interval = Math.Max(1000, Settings.NotifySec * 1000);
             life.Start();
         }
 

@@ -182,27 +182,8 @@ namespace TabbedExplorer
                       Settings.SleepDelaySecMin, Settings.SleepDelaySecMax, 1,
                       delegate { return Settings.SleepDelaySec; },
                       delegate(int s) { hub.SetSleepDelay(s); }));
-            // ③⁶ 右下角通知（默认开，用户要的）：操作反馈那种气泡（已复制 / 留一个 / 还在后台…）。
-            //     总闸在 `Toast.Show` 头上 ⇒ 关掉是**一处生效、全部不弹**，功能一件不少。
-            n.Add(WinOnly(Leaf("右下角通知（操作提示气泡）",
-                       () => Settings.Notify,
-                       () => hub.SetNotify(!Settings.Notify))));
-            // ③⁷ 通知分类（用户：「右下角通知提供更多可选项，还有 Debug 模式默认开启全部，
-            //     非 Debug 模式只默认开启重要的部分」）。四类各一个开关，**全 WinOnly** ——
-            //     托盘那棵子树本来就挤，这四项是「进设置窗口才调」的东西。
-            //     默认值看 Debug 模式，见 `Settings.DefNotify`；总闸关着时这四项照旧记着各自的值。
-            n.Add(WinOnly(Leaf("　└ 出错与失败（打不开 / 复制不了 / 加入失败）",
-                       () => Settings.NotifyErr,
-                       () => hub.SetNotifyPart(ToastKind.Err, !Settings.NotifyErr))));
-            n.Add(WinOnly(Leaf("　└ 启动与后台状态（「程序还在后台运行」这类）",
-                       () => Settings.NotifySys,
-                       () => hub.SetNotifyPart(ToastKind.Sys, !Settings.NotifySys))));
-            n.Add(WinOnly(Leaf("　└ 操作结果（已复制 / 已加入书签 / 换了书签栏）",
-                       () => Settings.NotifyOk,
-                       () => hub.SetNotifyPart(ToastKind.Ok, !Settings.NotifyOk))));
-            n.Add(WinOnly(Leaf("　└ 轻提示（已经在了 / 至少留一个 / 这个文件夹没书签）",
-                       () => Settings.NotifyHint,
-                       () => hub.SetNotifyPart(ToastKind.Hint, !Settings.NotifyHint))));
+            // （通知相关的项**不在这里** —— 它们整体挪到「通知管理」那一个 tab 了，
+            //   规格见 `SpecNotify`。用户：「把通知相关的摘出来单做一个 tab」。）
             n.Add(Sep());
 
             // ③′ 窗口尺寸记忆（用户：做成常规选项、默认启用；托盘菜单里再加一条「恢复默认」）。
@@ -307,6 +288,60 @@ namespace TabbedExplorer
             // 用户问「自带资源管理器左上角的功能不能一起捕获吗」—— 答案是不能。
             // 他后来又说「抓不回来就放弃，程序中不用写相关文字，文档里提一下就行」：
             // 这里**不再写这行说明**，要了解去 README/CHANGELOG 看（那条记在 README 的已知限制里）。
+            return n;
+        }
+
+        /// <summary>
+        /// 「通知管理」页的规格 —— 用户：「把通知相关的摘出来单做一个 tab「通知管理」，
+        /// 放更新日志左边，里面包含所有通知明细的设置」。
+        ///
+        /// 全页都是 `WinOnly`：托盘那棵「设置」子树本来就挤，通知这些是「进设置窗口才调」的东西。
+        /// 「所有通知明细」= 总开关 + 四类 + 停留时间 + 试弹一条。
+        /// ⚠ 加一项要跟 `Settings.cs` 哪几处同步，见 `MEMORY-internals.md` 的 36.1。
+        /// </summary>
+        internal static List<Node> SpecNotify(DesktopHub hub)
+        {
+            List<Node> n = new List<Node>();
+
+            // ① 总开关（关掉 = 下面四类一个都不弹，功能一件不少）
+            n.Add(WinOnly(Leaf("右下角通知（总开关，关掉下面几类一个都不弹）",
+                       () => Settings.Notify,
+                       () => hub.SetNotify(!Settings.Notify))));
+            n.Add(Sep());
+
+            // ② 四类明细。默认值看 Debug 模式，见 `Settings.DefNotify`；
+            //    总闸关着时这四项照旧记着各自的值（下次开总闸就按各自的值来）。
+            n.Add(WinOnly(Leaf("出错与失败（打不开 / 复制不了 / 加入失败 / 重启失败）",
+                       () => Settings.NotifyErr,
+                       () => hub.SetNotifyPart(ToastKind.Err, !Settings.NotifyErr))));
+            n.Add(WinOnly(Leaf("启动与后台状态（「程序还在后台运行」这类）",
+                       () => Settings.NotifySys,
+                       () => hub.SetNotifyPart(ToastKind.Sys, !Settings.NotifySys))));
+            n.Add(WinOnly(Leaf("操作结果（已复制 / 已加入书签 / 换了书签栏）",
+                       () => Settings.NotifyOk,
+                       () => hub.SetNotifyPart(ToastKind.Ok, !Settings.NotifyOk))));
+            n.Add(WinOnly(Leaf("轻提示（已经在了 / 至少留一个 / 这个文件夹没书签）",
+                       () => Settings.NotifyHint,
+                       () => hub.SetNotifyPart(ToastKind.Hint, !Settings.NotifyHint))));
+            n.Add(Info("上面四类的默认值：Debug 模式全开；平时只开「出错与失败」和「启动与后台状态」。"));
+            n.Add(Sep());
+
+            // ③ 停留时间（原本写死 4200ms，现在可调）
+            n.Add(Num("一条气泡停留多少秒（" + Settings.NotifySecMin + " ~ " + Settings.NotifySecMax + "，到点自己收）",
+                      Settings.NotifySecMin, Settings.NotifySecMax, 1,
+                      delegate { return Settings.NotifySec; },
+                      delegate(int s) { hub.SetNotifySec(s); }));
+            n.Add(Info("气泡点一下就收；它**不抢焦点**，不会把你正在打字的窗口顶掉。"));
+            n.Add(Sep());
+
+            // ④ 试弹一条（纯动作）—— 改了类别或停留时间，点它当场看效果。
+            n.Add(Act("试弹一条通知", delegate
+                      {
+                          Toast.Preview("这是一条测试通知",
+                                        "点一下就收，到点也会自己消失。它不受上面任何开关影响。");
+                      },
+                      "测试通知已弹出。"));
+
             return n;
         }
 

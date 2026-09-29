@@ -63,7 +63,8 @@ namespace TabbedExplorer
     /// 独立的设置窗口（用户要的）—— 齿轮按钮、标签条空白右键、托盘「更多选项…」开的都是它。
     /// 托盘图标右键那份菜单**保持原样**（用户明确要求）。
     ///
-    /// 窗口内容**不另写一份**：设置项全部由 `SettingsMenu.Spec(hub)` 生成 —— 托盘那份菜单用的也是同一份规格，
+    /// 窗口内容**不另写一份**：设置项全部由 `SettingsMenu.Spec(hub)` / `SpecNotify(hub)` 生成 ——
+    /// 托盘那份菜单用的也是同一份规格，
     /// 所以以后加设置项不会漏一边（当初「托盘右键没有设置选项」就是两边各写一遍漏出来的）。
     /// 这里只是换一种渲染方式：
     ///   · 同 `Group` 的相邻叶子 → 一组单选按钮（捕获方式 / 颜色模式）
@@ -378,7 +379,7 @@ namespace TabbedExplorer
             Controls.Add(blurb);
             y += blurb.Height + Px(10);
 
-            // ---- 两个 Tab ----
+            // ---- 四个 Tab（常规 / 快捷键 / 通知管理 / 更新日志）----
             // 自绘：系统画的 Tab 头是浅色的，深色模式下跟外壳两套皮（跟菜单/标题栏一个道理）。
             int pageW = w - pad * 2 - Px(8);
 
@@ -386,6 +387,9 @@ namespace TabbedExplorer
             int hGeneral = BuildGeneral(general, pageW);
             TabPage keys = NewPage("快捷键");
             int hKeys = BuildHotkeys(keys, pageW);
+            // 「通知管理」—— 用户指定的顺序：**排在「更新日志」左边**
+            TabPage notify = NewPage("通知管理");
+            int hNotify = BuildNotify(notify, pageW);
             TabPage log = NewPage("更新日志");
             int hLog = BuildLog(log, pageW);
 
@@ -401,6 +405,7 @@ namespace TabbedExplorer
             tabs.DrawItem += OnDrawTab;
             tabs.Controls.Add(general);
             tabs.Controls.Add(keys);
+            tabs.Controls.Add(notify);
             tabs.Controls.Add(log);
             // 「更新日志」页**切到它才读文件、才渲染**。
             // 用户报「打开设置窗口也挺慢的，是因为更新日志吗」—— 就是这儿：整份 700 多行逐段上样式
@@ -421,12 +426,13 @@ namespace TabbedExplorer
             // 屏幕比这个上限还矮的时候，才轮到屏幕说话。
             int capClient = Math.Min(Px(700), maxClient);
             int maxTabsH = Math.Max(Px(150), capClient - y - footerH);
-            int wantTabsH = Math.Max(Math.Max(hGeneral, hKeys), hLog) + Px(14);
+            int wantTabsH = Math.Max(Math.Max(Math.Max(hGeneral, hKeys), hNotify), hLog) + Px(14);
             int tabsH = Math.Min(wantTabsH, maxTabsH);
-            // 两页**一律**允许滚动 —— 装得下时 WinForms 自己不会画出滚动条，不必再拿一个开关去赌
+            // 几页**一律**允许滚动 —— 装得下时 WinForms 自己不会画出滚动条，不必再拿一个开关去赌
             // （用户那次就是「没加可滚动」）。
             general.AutoScroll = true;
             keys.AutoScroll = true;
+            notify.AutoScroll = true;
             // 日志页自己那个只读框负责滚动（见 BuildLog）—— 别再叠一层页内滚动，两层会打架。
             log.AutoScroll = false;
             tabs.SetBounds(pad, y, w - pad * 2, tabsH);
@@ -437,6 +443,7 @@ namespace TabbedExplorer
             // 唯一能让它跟着我们颜色模式走的地方是 uxtheme 的子应用名，见 `Theme.StyleScrollBar`。
             StylePageNative(general);
             StylePageNative(keys);
+            StylePageNative(notify);
             StylePageNative(log);      // 递归进只读框，把它那条滚动条也刷成深色
             FitLogBox(log);            // 页面积定下来了，把只读框铺满
 
@@ -724,16 +731,29 @@ namespace TabbedExplorer
         }
 
         // ==================================================================
-        // 「常规」页：设置项（唯一来源：SettingsMenu.Spec）
+        // 「常规」/「通知管理」页：设置项（唯一来源：SettingsMenu 里那两份规格）
+        //
+        // ⚠ 渲染**只写一份** —— 这两页唯一的区别就是喂进来的 spec 不同
+        //   （`Spec` / `SpecNotify`）。谁加页就再加一个一行转发，别把下面那两百行抄一遍。
         // ==================================================================
         private int BuildGeneral(TabPage page, int w)
+        {
+            return RenderSpec(page, SettingsMenu.Spec(hub), w);
+        }
+
+        /// <summary>「通知管理」页 —— 规格来自 `SettingsMenu.SpecNotify`。</summary>
+        private int BuildNotify(TabPage page, int w)
+        {
+            return RenderSpec(page, SettingsMenu.SpecNotify(hub), w);
+        }
+
+        private int RenderSpec(TabPage page, List<SettingsMenu.Node> spec, int w)
         {
             int pad = Px(10);
             int y = Px(8);
             int rowH = Px(26);
             int inner = w - pad * 2;
 
-            List<SettingsMenu.Node> spec = SettingsMenu.Spec(hub);
             string curGroup = null;
             Panel groupBox = null;
 

@@ -1524,6 +1524,18 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 「一条气泡停留多少秒」（设置窗口「通知管理」页那个数字框，见 `Settings.NotifySec`）。
+        /// **立刻生效** —— 每次弹之前现读；已经在屏幕上的那一条不变。
+        /// </summary>
+        public void SetNotifySec(int sec)
+        {
+            int v = Settings.ClampNotifySec(sec);
+            if (Settings.NotifySec == v) return;
+            Settings.SetNotifySec(v);
+            Diag.Step("Hub: 通知停留时间 -> " + Settings.NotifySec + " 秒");
+        }
+
+        /// <summary>
         /// 通知分类开关（设置窗口里那四项，见 `Settings.NotifyPartOn`）。
         /// **立刻生效** —— 每次弹之前现读，没有缓存；这几项是 `WinOnly`，托盘菜单里不排。
         /// </summary>
@@ -1804,6 +1816,7 @@ namespace TabbedExplorer
             SetNotifyPart(ToastKind.Sys, s.NotifySys);
             SetNotifyPart(ToastKind.Ok, s.NotifyOk);
             SetNotifyPart(ToastKind.Hint, s.NotifyHint);
+            SetNotifySec(s.NotifySec);
             SetTabWidth(s.TabWidth);
             SetTabAutoWiden(s.TabAutoWiden);
             SetTabAutoFit(s.TabAutoFit);

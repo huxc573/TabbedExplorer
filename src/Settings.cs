@@ -172,6 +172,19 @@ namespace TabbedExplorer
         /// 用户把这一个拆成了两项（原来只有这个「自适应宽度」）。
         /// </summary>
         public static bool TabAutoFit = true;
+        /// <summary>
+        /// 新建标签开在**当前标签旁边**（默认**关** = 跟在最末尾，也就是一直以来的行为）。
+        ///
+        /// 用户：「新建标签出现在现标签页旁边，还是最后面」。
+        /// 开 = 插到当前标签右边（`EmbedForm.NextTabIndex` → `activeIndex + 1`），连着开一串
+        /// 就会挤在同一个地方长大；关 = 一律追加到末尾。
+        ///
+        /// 只影响**新建**的标签。两条不受它管：
+        ///   ① 「恢复关闭的标签页」永远回**它原来那个下标**（见 `EmbedForm.ReopenClosedTab`）；
+        ///   ② 还原记忆标签按记忆里的顺序摆（追加），跟这个开关无关。
+        /// 实时生效：`NextTabIndex` 每次新建时现读。
+        /// </summary>
+        public static bool NewTabBeside = false;
         /// <summary>书签栏是否显示（Ctrl+Shift+B）。</summary>
         public static bool FavBar = false;
         /// <summary>
@@ -314,6 +327,7 @@ namespace TabbedExplorer
                     AutoSleep    = Json.GetBool(json, "autosleep", true);
                     SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
                     QLPreview    = Json.GetBool(json, "qlpreview", true);
+                    NewTabBeside = Json.GetBool(json, "newtabbeside", false);
                     // ⚠ Debug 得**先**读 —— 下面通知那四类的默认值要看它（用户：「Debug 模式默认
                     //   开启全部，非 Debug 模式只默认开启重要的部分」），不能等到底下那一行。
                     bool dbg = Json.GetBool(json, "debug", false);
@@ -409,6 +423,7 @@ namespace TabbedExplorer
                     case "autosleep":   AutoSleep = ParseBool(v, true); break;
                     case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
                     case "qlpreview":   QLPreview = ParseBool(v, true); break;
+                    case "newtabbeside": NewTabBeside = ParseBool(v, false); break;
                     case "notify":      Notify = ParseBool(v, true); break;
                     case "notifyover":  LoadNotifyOver(v); break;
                     case "notifysec":   NotifySec = ClampNotifySec(ParseInt(v, NotifySec)); break;
@@ -455,7 +470,7 @@ namespace TabbedExplorer
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
-                        AutoPreload, AutoSleep, Notify, QLPreview;
+                        AutoPreload, AutoSleep, Notify, QLPreview, NewTabBeside;
             public int TabWidth, VPaneAlpha, SleepDelaySec, NotifySec;
             /// <summary>逐条覆盖表的一份拷贝（`Snap` 抄一份出来、`ApplySnapshot` 抄回去）。</summary>
             public readonly Dictionary<string, bool> NotifyOver =
@@ -475,7 +490,7 @@ namespace TabbedExplorer
             s.Notify = Notify;
             s.NotifySec = NotifySec;
             foreach (KeyValuePair<string, bool> kv in NotifyOver) s.NotifyOver[kv.Key] = kv.Value;
-            s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit;
+            s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit; s.NewTabBeside = NewTabBeside;
             s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
             s.Debug = Debug; s.TabWidth = TabWidth; s.VPaneAlpha = VPaneAlpha;
@@ -502,7 +517,7 @@ namespace TabbedExplorer
             NotifySec = s.NotifySec;
             NotifyOver.Clear();
             foreach (KeyValuePair<string, bool> kv in s.NotifyOver) NotifyOver[kv.Key] = kv.Value;
-            TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit;
+            TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit; NewTabBeside = s.NewTabBeside;
             FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
             Debug = s.Debug; TabWidth = s.TabWidth; VPaneAlpha = s.VPaneAlpha;
@@ -536,6 +551,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_autosleep\": \"true = 切走的标签停留够久就把它那个 explorer 进程的驻留内存收一收、切回来重新读回；false = 一个都不收（常驻内存更高，切标签最快）\",\r\n");
                 sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
                 sb.Append("  \"_qlpreview\": \"true = 在标签里按空格调 QuickLook 预览选中的文件（需已安装并常驻 QuickLook）；false = 空格照旧落在文件列表上。Ctrl/Alt/Shift+空格 一律不管\",\r\n");
+                sb.Append("  \"_newtabbeside\": \"true = 新建的标签开在**当前标签旁边**（插到它右边）；false = 一律开在最末尾（默认）。只管新开的，「恢复关闭的标签页」永远回它原来的位置\",\r\n");
                 sb.Append("  \"_notify\": \"true = 操作反馈弹一条右下角气泡（已复制 / 留一个 / 还在后台 这类）；false = 一个都不弹（功能一件不少）\",\r\n");
                 sb.Append("  \"_notifyover\": \"逐条通知开关的覆盖表，格式 id=1 / id=0 用逗号隔开；**只写用户改过的那些**，没写到的 = 跟随默认（debug 全开，平时只开「出错与失败」和「启动与后台状态」里那几条）。条目 id 见设置窗口「通知管理」页或代码里的 NotifyItems\",\r\n");
                 sb.Append("  \"_notifysec\": \"一条气泡停留多少秒后自己收（默认 4，1 ~ 30）。调大 = 看得更清楚，调小 = 少挡视线\",\r\n");
@@ -560,6 +576,7 @@ namespace TabbedExplorer
                 sb.Append("  \"tabwidth\": ").Append(TabWidth).Append(",\r\n");
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"newtabbeside\": ").Append(NewTabBeside ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureshell\": ").Append(CaptureShell ? "true" : "false").Append(",\r\n");
@@ -612,12 +629,12 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20} notifyover={21} notifysec={22} qlpreview={23}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20} notifyover={21} notifysec={22} qlpreview={23} newtabbeside={24}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0,
-                NotifyOver.Count, NotifySec, QLPreview ? 1 : 0);
+                NotifyOver.Count, NotifySec, QLPreview ? 1 : 0, NewTabBeside ? 1 : 0);
         }
 
         // ==================================================================
@@ -839,6 +856,8 @@ namespace TabbedExplorer
         public static void SetNotifyKind(ToastKind k, bool on) { NotifyKindApply(k, on); Save(); }
         public static void SetTabWidth(int w) { TabWidth = ClampWidth(w); Save(); }
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
+        /// <summary>新建标签开在当前标签旁边（`true`）/ 开在最末尾（`false`，默认）。新建时现读，无需刷新。</summary>
+        public static void SetNewTabBeside(bool on) { NewTabBeside = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }

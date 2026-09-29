@@ -1642,6 +1642,19 @@ namespace TabbedExplorer
             RetabAll();
         }
 
+        /// <summary>
+        /// 新标签开在**当前标签旁边**（`true`）还是**最末尾**（`false`，默认）。
+        /// 没有副作用要补 —— `EmbedForm.NextTabIndex` 每次新建标签时现读这个值，所以改了立刻生效；
+        /// 已经在的那排标签一个都不动（只管往后新开的）。
+        /// </summary>
+        public void SetNewTabBeside(bool on)
+        {
+            if (Settings.NewTabBeside == on) return;
+            Settings.SetNewTabBeside(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 新标签位置 -> " + (on ? "当前标签旁边" : "最末尾"));
+        }
+
         private void RetabAll()
         {
             foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
@@ -1833,6 +1846,11 @@ namespace TabbedExplorer
             SetAutoPreload(s.AutoPreload);
             SetAutoSleep(s.AutoSleep);
             SetSleepDelay(s.SleepDelaySec);
+            // ⚠ 这两个以前漏在这儿了（空格键预览是加进来时忘了补）—— 它们没有副作用要补，
+            //   紧随其后的 `Settings.ApplySnapshot` 也能把值抄回去，但日志里缺一行就分不清
+            //   「没恢复」和「恢复了但没打印」，索性一起补上。
+            SetQLPreview(s.QLPreview);
+            SetNewTabBeside(s.NewTabBeside);
             SetNotify(s.Notify);
             // ⚠ 通知的**逐条开关表**在这儿**不用**管（以前这里有四行 `SetNotifyPart`）：
             //   它是纯数据、没有副作用（不像捕获方式会搬记忆、休眠要重排定时器），

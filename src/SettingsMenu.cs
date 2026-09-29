@@ -309,6 +309,12 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("自适应宽度：挤不下时自动缩窄",
                        () => Settings.TabAutoFit,
                        () => hub.SetTabAutoFit(!Settings.TabAutoFit))));
+            // ⑤′ 新标签开在哪儿（用户：「新建标签出现在现标签页旁边，还是最后面」）。
+            //     默认关 = 一律追加到末尾（老行为，不动习惯）；开了就插到当前标签右边。
+            //     ⚠ 「恢复关闭的标签页」**不跟这个开关**走 —— 它永远回自己原来的位置。
+            n.Add(WinOnly(Leaf("新标签开在当前标签旁边（关 = 开在最末尾）",
+                       () => Settings.NewTabBeside,
+                       () => hub.SetNewTabBeside(!Settings.NewTabBeside))));
             n.Add(Sep());
 
             // ⑥ 书签栏（Ctrl+Shift+B）

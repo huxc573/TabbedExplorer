@@ -82,8 +82,20 @@ namespace TabbedExplorer
         /// <summary>这个窗口真给用户看过（决定要不要把它的位置大小记进记忆 —— 没见过的窗口不许覆盖旧值）。</summary>
         private bool windowShown;
 
-        /// <summary>刚关掉的标签路径（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
-        private readonly List<string> closedTabs = new List<string>();
+        /// <summary>
+        /// 一条「刚关掉的标签」的记录。**除了路径还得记它当时排第几** ——
+        /// 用户报「恢复关闭的标签页不是恢复在原位置」：光存路径，恢复时只能一律追加到末尾。
+        /// </summary>
+        private struct ClosedTab
+        {
+            /// <summary>关掉时它停在的那个文件夹（存过的全路径，见 `PathRules.Store`）。</summary>
+            public string Path;
+            /// <summary>关掉时它在 `hosts` / 标签条里排第几（恢复时按这个下标插回去）。</summary>
+            public int Index;
+        }
+
+        /// <summary>刚关掉的标签（后进先出）—— Ctrl+Shift+T / 恢复按钮从这儿往回取。</summary>
+        private readonly List<ClosedTab> closedTabs = new List<ClosedTab>();
         private const int ClosedKeep = 20;
 
         /// <summary>书签栏（Ctrl+Shift+B 开关）。</summary>
@@ -1744,6 +1756,12 @@ namespace TabbedExplorer
         /// </summary>
         private void NewTab(string path) { NewTab(path, PathRules.Friendly(PathRules.Store(path)), true); }
 
+        /// <summary>开新标签，位置按 `newtabbeside` 定（见 `NextTabIndex`）。</summary>
+        private ExplorerHost NewTab(string path, string initialTitle, bool activate)
+        {
+            return NewTab(path, initialTitle, activate, -1);
+        }
+
         /// <summary>
         /// 开一个新标签（内容由 `launchQueue` 在后台填）。
         ///
@@ -1753,13 +1771,18 @@ namespace TabbedExplorer
         /// null = 「打开中…」（用户当场开新标签，他看见的就是这一步在转）。
         ///
         /// <paramref name="activate"/> = false 时不切过去（还原时一次摆 N 个，只在最后切一次）。
+        ///
+        /// <paramref name="at"/> = 插到第几位；`-1` = 按 `newtabbeside` 自动定（见 `NextTabIndex`）。
+        /// **只有「恢复关闭的标签」会传一个明确的下标**（要回原位，见 `ReopenClosedTab`）。
         /// </summary>
-        private ExplorerHost NewTab(string path, string initialTitle, bool activate)
+        private ExplorerHost NewTab(string path, string initialTitle, bool activate, int at)
         {
-            // 有预热好的备用窗口就直接用（几乎瞬时），没有才现起一个
-            if (UseReserve(path, initialTitle)) return null;
+            if (at < 0) at = NextTabIndex();
 
-            ExplorerHost h = AddHost();
+            // 有预热好的备用窗口就直接用（几乎瞬时），没有才现起一个
+            if (UseReserve(path, initialTitle, at)) return null;
+
+            ExplorerHost h = AddHost(at);
             int i = hosts.IndexOf(h);
             if (!string.IsNullOrEmpty(initialTitle)) tabStrip.SetTitle(i, initialTitle);
             // 第二行先摆上要去的路径 —— explorer 要 3 秒才起得来，这 3 秒里也别让第二行空着
@@ -1823,6 +1846,8 @@ namespace TabbedExplorer
         /// </summary>
         private void AddDeferredTab(string path)
         {
+            // ⚠ 这里**一律追加**（不理会 `newtabbeside`）：它只在还原记忆标签时用，
+            //   那一批要按记忆里的顺序摆（见 `RestoreRememberedTabs`），插到中间就打乱顺序了。
             ExplorerHost h = AddHost();
             h.Deferred = true;
             h.PresetTarget(path);      // 排队/占位期间也得知道要去哪儿（否则中途保存记忆会把它丢掉）
@@ -2043,8 +2068,11 @@ namespace TabbedExplorer
         /// 实测嵌入之后 82ms、还是顶层时 105ms），省掉「起 explorer 进程 + 它自己建窗/导航/SHOW」
         /// 那一整段（实测 0.24~1.28 秒）—— 点书签觉得慢，慢的就是这一段。
         /// 虚拟位置（回收站 / 网络 / 此电脑）不吃这条：那些是 shell 别名，导航过去未必认，照老路现起。
+        ///
+        /// <paramref name="at"/> = 这个标签该插到第几位（`-1` / 越界一律夹到末尾）。走备用窗口
+        /// **不代表**就得排在最后 —— 位置跟现起一个标签是一样的算法（见 `NextTabIndex`）。
         /// </summary>
-        private bool UseReserve(string path, string initialTitle)
+        private bool UseReserve(string path, string initialTitle, int at)
         {
             if (!reserveReady || reserve == null) return false;
 
@@ -2081,11 +2109,15 @@ namespace TabbedExplorer
 
             reserve = null;
             reserveReady = false;
-            hosts.Add(h);
-            int i = hosts.Count - 1;
+            // ⚠ 备用窗口也按调用方给的下标插（`newtabbeside` / 恢复原位都从这儿过）——
+            //   它只是「已经预热好的窗口」，插哪儿跟现起一个是一回事。
+            if (at < 0 || at > hosts.Count) at = hosts.Count;
+            hosts.Insert(at, h);
+            if (activeIndex >= at) activeIndex++;   // 插在它前面，它往后挪一格（同 AddHost）
+            int i = at;
             // 标题用调用方给的那个（书签上的名字 / 路径现算的名字）：此刻窗口还停在旧目录上，
             // 问它要名字只会拿到「此电脑」。
-            tabStrip.AddTab(string.IsNullOrEmpty(initialTitle) ? h.CurrentDisplayName : initialTitle);
+            tabStrip.InsertTab(at, string.IsNullOrEmpty(initialTitle) ? h.CurrentDisplayName : initialTitle);
             tabStrip.SetIcon(i, h.TabIcon);
             string line = stored.Length > 0 ? stored : LivePath(h);
             tabStrip.SetPath(i, TabStrip.PathLine(line));
@@ -2190,7 +2222,8 @@ namespace TabbedExplorer
             {
                 if (e != null && e.CabWindow == cab) return false;   // 已经收过了
             }
-            ExplorerHost h = AddHost();
+            // 跟用户自己按 + 开一个是一回事 —— 位置也照 `newtabbeside` 来
+            ExplorerHost h = AddHost(NextTabIndex());
             int i = hosts.IndexOf(h);
             tabStrip.SetPath(i, "（收进来的窗口）");
             h.Adopt(cab, pid);
@@ -2235,12 +2268,36 @@ namespace TabbedExplorer
         /// 自己起一个（`NewTab` → `Start`）还是接管现成的（`NewAdoptedTab` → `Adopt`）。
         /// 两条路后面完全一样：等 explorer 加载完 → Ready → 嵌进来。
         /// </summary>
-        private ExplorerHost AddHost()
+        private ExplorerHost AddHost() { return AddHost(-1); }
+
+        /// <param name="at">
+        /// 插到第几位（`-1` = 追加到末尾）。要插中间的有两处：`newtabbeside` 开着时新标签跟在
+        /// 当前标签旁边、恢复关闭的标签要回它原来的下标。
+        /// ⚠ `hosts` 和标签条必须用**同一个下标**——两边一错位，点标签就会切到别人身上的文件夹
+        ///   （跟拖拽排序同一个坑，见 `MoveHostOnly`）。
+        /// </param>
+        private ExplorerHost AddHost(int at)
         {
             ExplorerHost h = CreateHost();
-            hosts.Add(h);
-            tabStrip.AddTab("打开中…");
+            if (at < 0 || at > hosts.Count) at = hosts.Count;
+            hosts.Insert(at, h);
+            // 插在当前标签**前面** ⇒ 当前那个往后挪一格，`activeIndex` 也得跟着挪
+            // （这是个纯下标，不会自己跟着 host 走 —— 漏了就会「显示的是别人、选中是它」）。
+            if (activeIndex >= at) activeIndex++;
+            tabStrip.InsertTab(at, "打开中…");
             return h;
+        }
+
+        /// <summary>
+        /// 新建标签该插在哪儿：`newtabbeside` 开着就**紧跟当前标签**（用户：「新建标签出现在现标签页旁边」），
+        /// 否则一律追加到末尾（默认，也是一直以来的行为）。
+        /// ⚠ 恢复关闭的标签**不走这儿**（它回自己记下的原下标）；还原记忆标签也不走（按记忆顺序追加）。
+        /// </summary>
+        private int NextTabIndex()
+        {
+            if (Settings.NewTabBeside && activeIndex >= 0 && activeIndex < hosts.Count)
+                return activeIndex + 1;
+            return hosts.Count;
         }
 
         private void OnHostReady(ExplorerHost h)
@@ -2512,13 +2569,18 @@ namespace TabbedExplorer
 
             // 记进「刚关掉的」栈 —— Ctrl+Shift+T 要按「后进先出」往回捞：
             // 点一下恢复最近关的那个、再点一下恢复上上个（用户的要求）。
+            // ⚠ 位置（`idx`）必须**在下面 `hosts.RemoveAt` 之前**读走 —— 一 RemoveAt 索引就全变了，
+            //   这是用户报的「恢复的标签不在原来的位置」的根因（原来只记了路径、位置当场丢掉）。
             string gone = LivePath(h);
             if (PathRules.Restorable(gone))
             {
-                closedTabs.RemoveAll(delegate(string s) { return PathRules.Same(s, gone); });
-                closedTabs.Add(gone);
+                ClosedTab rec;
+                rec.Path = gone;
+                rec.Index = idx;
+                closedTabs.RemoveAll(delegate(ClosedTab c) { return PathRules.Same(c.Path, gone); });
+                closedTabs.Add(rec);
                 while (closedTabs.Count > ClosedKeep) closedTabs.RemoveAt(0);
-                Diag.Step("EmbedForm: 记下关掉的标签「" + gone + "」（栈里 " + closedTabs.Count + " 个）");
+                Diag.Step("EmbedForm: 记下关掉的标签「" + gone + "」（原位置 " + idx + "，栈里 " + closedTabs.Count + " 个）");
             }
 
             hosts.RemoveAt(idx);
@@ -2670,7 +2732,14 @@ namespace TabbedExplorer
             PopMenu.Show(items, bar, at, what);
         }
 
-        /// <summary>Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出）。</summary>
+        /// <summary>
+        /// Ctrl+Shift+T / 恢复按钮：把最近关掉的那个标签开回来（后进先出），**放回它原来那个位置**。
+        ///
+        /// 用户报过「恢复关闭标签页，不是恢复在原位置」—— 原位置没丢，是关的时候压根没记
+        /// （见 `CloseTab`）。现在按记下的下标插回去；下标越界（原来位置后面那些标签也被关了）
+        /// 由 `AddHost` / `InsertTab` 夹到末尾。
+        /// ⚠ 这条**不跟** `newtabbeside` 走：不管那个开关怎么设，恢复一律回原位。
+        /// </summary>
         private void ReopenClosedTab()
         {
             if (closedTabs.Count == 0)
@@ -2679,13 +2748,14 @@ namespace TabbedExplorer
                 Toast.Show(NotifyItems.NoUndo, "没有可恢复的标签页", "这次运行里还没关过标签。");
                 return;
             }
-            string p = closedTabs[closedTabs.Count - 1];
+            ClosedTab c = closedTabs[closedTabs.Count - 1];
             closedTabs.RemoveAt(closedTabs.Count - 1);
-            Diag.Step("EmbedForm: 恢复关闭的标签「" + p + "」（栈里还剩 " + closedTabs.Count + "）");
+            Diag.Step("EmbedForm: 恢复关闭的标签「" + c.Path + "」（回原位置 " + c.Index + "，栈里还剩 "
+                + closedTabs.Count + "）");
             if (!Visible) Show();
-            int dup = IndexOfPath(p);
+            int dup = IndexOfPath(c.Path);
             if (dup >= 0) Activate(dup);   // 已经开着（历史/书签又开过）就切过去，别开两个一样的
-            else NewTab(p);
+            else NewTab(c.Path, PathRules.Friendly(PathRules.Store(c.Path)), true, c.Index);
         }
 
         /// <summary>

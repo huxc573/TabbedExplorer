@@ -372,9 +372,20 @@ namespace TabbedExplorer
 
         public IList<TabItem> Tabs { get { return tabs; } }
 
-        public void AddTab(string title)
+        public void AddTab(string title) { InsertTab(tabs.Count, title); }
+
+        /// <summary>
+        /// 把标签插到**指定下标**（不是一律追加）。两处要用：
+        ///   ① `newtabbeside` 开着时，新标签开在**当前标签旁边**（`EmbedForm.NextTabIndex`）；
+        ///   ② 恢复关掉的标签要回**它原来那个位置**（`EmbedForm.ReopenClosedTab`）。
+        /// ⚠ 调用方必须用**同一个下标**插 `hosts` —— 两边顺序一错位，点标签就会切到别人身上的文件夹
+        ///   （跟拖拽排序同一个坑，见 `EmbedForm.MoveHostOnly`）。
+        /// </summary>
+        public void InsertTab(int at, string title)
         {
-            tabs.Add(new TabItem { Title = title ?? "", TextW = MeasureTitle(title) });
+            if (at < 0) at = 0;
+            if (at > tabs.Count) at = tabs.Count;
+            tabs.Insert(at, new TabItem { Title = title ?? "", TextW = MeasureTitle(title) });
             sel.Clear(); selAnchor = -1;   // 下标全变了，选择作废（见 sel 那段说明）
             Redraw();
         }

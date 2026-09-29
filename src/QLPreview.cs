@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
+using System.Security.Principal;
+using System.Text;
 
 namespace TabbedExplorer
 {
@@ -17,17 +20,14 @@ namespace TabbedExplorer
     /// 它一律判 `Invalid` —— **整段逻辑（连取选中项）都不会走**。所以这跟「取不到选中项」无关，
     /// 是第一关就过不了。
     ///
+    /// ⚠ 「内嵌的那个 `CabinetWClass` 明明是原生的，为什么也不行」—— 因为 `SetParent` 之后它成了
+    ///   **子窗口**，而 Windows 里**子窗口永远不能成为前台窗口**：`GetForegroundWindow()` 只返回
+    ///   顶层窗口，也就是我们那个自绘宿主。探针实测：10 组 `CabinetWClass` /
+    ///   `ShellTabWindowClass` / `DUIViewWndClassName` 全是 `WS_CHILD=1`、顶层祖先都是宿主窗体。
+    ///
     /// 我们怎么接：`WinEHook` 那个全局键盘钩子（本来管 Win+E 和标签快捷键）加一条空格分支。
     /// 钩子里**不做 COM / IO**（见那儿的硬规矩），判定只做纯 Win32（见 `WantsSpace`），
     /// 真干活投回 UI 线程（`Do`）。`--classic` 那条老路（`AppContext`）不接这个功能。
-    ///
-    /// 我们怎么转发：`QuickLook.exe &lt;路径&gt;` 起第二个实例 —— 它自己会把 `Toggle|路径` 写进
-    /// 命名管道 `QuickLook.App.Pipe.&lt;用户SID&gt;`（本机 4.5 实测：管道在，`QuickLook.App.PipeMessages.*`
-    /// 这套名字都在 exe 里）。**关预览不用我们管**：预览窗是 QuickLook 自己的窗口，
-    /// 它认「前台属于自己的窗」（`IsForegroundWindowBelongToSelf`），再按一次空格它自己就关。
-    ///
-    /// ⚠ QuickLook **不吞**空格（`KeystrokeDispatcher` 从不设 `e.Handled`）—— 所以空格在原生
-    ///   资源管理器里还会顺手改一下选中项；我们这边**吞掉**，不留这个副作用。
     /// </summary>
     internal static class QLPreview
     {
@@ -37,7 +37,19 @@ namespace TabbedExplorer
         private const int VK_SPACE = 0x20;
         private const uint GA_ROOT = 2;
 
-        /// <summary>上次找到的那个 exe（找到才缓存，见 <see cref="FindExe"/>）。</summary>
+        /// <summary>QuickLook 的跨进程消息名（照抄它自己的 `PipeMessages` 常量）。</summary>
+        private const string MsgToggle = "QuickLook.App.PipeMessages.Toggle";
+
+        /// <summary>
+        /// 连管道的超时（毫秒）。**必须给** —— `NamedPipeClientStream.Connect()` 不传超时是
+        /// **无限等**，QuickLook 没在跑时会把 UI 线程挂死。
+        /// </summary>
+        private const int PipeConnectMs = 1200;
+
+        /// <summary>命名管道名（只算一次；SID 不会变）。</summary>
+        private static string pipeName;
+
+        /// <summary>上次找到的 exe（**只给回退路径用**，找到才缓存）。</summary>
         private static string cachedExe;
 
         /// <summary>
@@ -98,24 +110,98 @@ namespace TabbedExplorer
         /// <summary>
         /// 干活的地方（**UI 线程**，由 `DesktopHub.Post` 投过来）：把 `folder` 里现在选中的
         /// 第一个喂给 QuickLook。
-        /// ⚠ 找不到 QuickLook.exe / 没选中东西 / 停在虚拟位置 —— 一律什么都不做。
+        /// ⚠ 没选中东西 / 停在虚拟位置 —— 一律什么都不做。
         /// </summary>
         public static void Do(string folder)
         {
             if (string.IsNullOrEmpty(folder)) return;
 
-            string exe = FindExe();
-            if (exe == null) { Diag.Step("QLPreview: 找不到 QuickLook.exe"); return; }
-
             List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
             if (sel.Count == 0) return;
 
             Diag.Step("QLPreview: 预览 " + sel[0]);
-            Preview(exe, sel[0]);
+            Preview(sel[0]);
         }
 
         /// <summary>
-        /// QuickLook.exe 在哪。找不到返回 null —— 调用方据此**不吞**空格（让键照常走）。
+        /// 让那个常驻的 QuickLook 预览一个路径。
+        ///
+        /// ⚠ **不走** `QuickLook.exe &lt;路径&gt;`（起第二实例）那条路：那是 QuickLook 官方支持的外部
+        /// 入口，但代价是**每按一次空格创建一个进程** —— 实测就是它把「比在原生资源管理器里按」
+        /// 拖成了肉眼可见的慢（起进程几十到几百毫秒；管道 0.1~0.3ms）。
+        ///
+        /// 协议是从 QuickLook 自己的 `PipeServerManager.PostMessage` 抄的，就一行文本：
+        ///   管道名  `QuickLook.App.Pipe.&lt;用户 SID&gt;`
+        ///   内容    `QuickLook.App.PipeMessages.Toggle|&lt;路径&gt;|` + 换行（UTF-8 无 BOM）
+        /// 服务端是 `StreamReader.ReadLine()` —— 换行**必须有**，而且**绝不能发空行**
+        /// （它会拿 null 去 `Split`、把自己那条读线程搞崩）。
+        ///
+        /// 管道连不上（QuickLook 没在跑、或者哪天协议改了）就**回退**到起第二实例那条老路。
+        /// </summary>
+        public static void Preview(string path)
+        {
+            if (SendViaPipe(path)) return;
+
+            string exe = FindExe();
+            if (exe == null) { Diag.Step("QLPreview: 管道不通，也找不到 QuickLook.exe"); return; }
+            LegacyStart(exe, path);
+        }
+
+        /// <summary>往常驻实例的命名管道写一行消息。连上并写完返回 true。</summary>
+        private static bool SendViaPipe(string path)
+        {
+            string name = PipeNameOf();
+            if (string.IsNullOrEmpty(name)) return false;
+            try
+            {
+                using (NamedPipeClientStream c = new NamedPipeClientStream(".", name, PipeDirection.Out))
+                {
+                    c.Connect(PipeConnectMs);
+                    using (StreamWriter w = new StreamWriter(c, new UTF8Encoding(false)))
+                    {
+                        w.WriteLine(MsgToggle + "|" + path + "|");
+                        w.Flush();
+                    }
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Diag.Step("QLPreview: 管道没走通（" + ex.GetType().Name + "），改用第二实例");
+                return false;
+            }
+        }
+
+        /// <summary>回退路径：起一个短命的第二实例，它自己会把消息转发给常驻实例然后退出。</summary>
+        private static void LegacyStart(string exe, string path)
+        {
+            try
+            {
+                ProcessStartInfo si = new ProcessStartInfo(exe, "\"" + path + "\"");
+                si.UseShellExecute = false;
+                Process.Start(si);
+            }
+            catch (Exception ex) { Diag.Log("QLPreview: 起 QuickLook 失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 常驻那个 QuickLook 的命名管道名（`QuickLook.App.Pipe.&lt;用户 SID&gt;`）。
+        /// 拿不到 SID 返回 null（调用方回退）。
+        /// </summary>
+        private static string PipeNameOf()
+        {
+            if (pipeName != null) return pipeName;
+            try
+            {
+                string sid = WindowsIdentity.GetCurrent().User.Value;
+                if (!string.IsNullOrEmpty(sid)) pipeName = "QuickLook.App.Pipe." + sid;
+            }
+            catch (Exception ex) { Diag.Log("QLPreview: 取 SID 失败 " + ex.Message); }
+            return pipeName;
+        }
+
+        /// <summary>
+        /// QuickLook.exe 在哪（**只给回退路径用**）。找不到返回 null。
         ///
         /// 为什么不用注册表：本机（以及不少人）用的是便携版，装的时候没写卸载项、也没写 App Paths，
         /// 注册表里根本查不到。而 QuickLook 要能预览就**必须常驻**，所以「正在跑的那个 QuickLook
@@ -123,7 +209,7 @@ namespace TabbedExplorer
         /// ⚠ `MainModule` 对位数不同的进程会抛（QuickLook 主程序是 64 位，我们也是，正常可读）；
         ///   抛了换下一个候选，全都不行就返回 null。
         /// </summary>
-        public static string FindExe()
+        private static string FindExe()
         {
             if (!string.IsNullOrEmpty(cachedExe) && File.Exists(cachedExe)) return cachedExe;
 
@@ -150,24 +236,9 @@ namespace TabbedExplorer
             }
             catch { }
 
-            // 找到就缓存（省掉每按一次空格几毫秒的进程枚举）；没找到**不缓存** —— 用户可能等下才开 QuickLook
+            // 找到就缓存（省掉几毫秒的进程枚举）；没找到**不缓存** —— 用户可能等下才开 QuickLook
             if (found != null) cachedExe = found;
             return found;
-        }
-
-        /// <summary>
-        /// 让那个常驻的 QuickLook 预览一个路径：起一个短命的第二实例，它自己走命名管道转发给
-        /// 常驻的那个，然后自己退出。比手搓管道消息格式稳 —— 那是 QuickLook 自己的私有协议。
-        /// </summary>
-        public static void Preview(string exe, string path)
-        {
-            try
-            {
-                ProcessStartInfo si = new ProcessStartInfo(exe, "\"" + path + "\"");
-                si.UseShellExecute = false;
-                Process.Start(si);
-            }
-            catch (Exception ex) { Diag.Log("QLPreview: 起 QuickLook 失败 " + ex.Message); }
         }
     }
 }

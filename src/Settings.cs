@@ -724,6 +724,18 @@ namespace TabbedExplorer
             return on == list.Count ? 2 : 1;
         }
 
+        /// <summary>
+        /// 这个大类「已开 N/M」—— 设置页里节标题右边那行小字。
+        /// 明细默认是**收起**的，不摊开看不见里面谁开着，所以把数摆出来。
+        /// </summary>
+        public static string NotifyKindCountText(ToastKind k)
+        {
+            List<NotifyItem> list = NotifyItems.Of(k);
+            int on = 0;
+            for (int i = 0; i < list.Count; i++) if (NotifyItemBase(list[i])) on++;
+            return "已开 " + on + "/" + list.Count;
+        }
+
         /// <summary>把一大类**整批**设成开 / 关（设置页点节标题那个三态勾）。不落盘。</summary>
         private static void NotifyKindApply(ToastKind k, bool on)
         {

@@ -54,6 +54,19 @@ namespace TabbedExplorer
             /// </summary>
             public Func<int> TriState;
             /// <summary>
+            /// 这一行是个**可折叠的节标题**（「通知管理」页里那几个大类）：返回 true = 现在**收起**，
+            /// 它下面那一档缩进的明细整批不显示。null = 普通行。
+            /// ⚠ 折叠只是**画法**，跟「开没开」一点关系都没有 —— 收着的时候里面该弹的照弹。
+            /// </summary>
+            public Func<bool> Fold;
+            /// <summary>展开 / 收起（设置窗口点标题左边那个小三角时调）。</summary>
+            public Action<bool> FoldSet;
+            /// <summary>
+            /// 节标题右边那行小字（「已开 12/12」这种）。null = 不显示。
+            /// 明细收起来就看不见里面谁开着，得有个地方能一眼看出来。
+            /// </summary>
+            public Func<string> FoldInfo;
+            /// <summary>
             /// 数值项（设置窗口里画成数字输入框，可自己敲）。`NumMax &gt; 0` 表示「这是一条数值项」。
             /// 托盘菜单里一律不排（`WindowOnly` 会自动置上）。
             /// </summary>
@@ -126,12 +139,36 @@ namespace TabbedExplorer
             };
         }
 
+        /// <summary>
+        /// **可折叠的节**（「通知管理」页里那几个大类）：左边一个小三角管展开 / 收起（默认收起），
+        /// 中间那个三态勾管整批开 / 关，右边一行小字说「已开 N/M」。
+        /// </summary>
+        private static Node Sec(string text, Func<int> state, Action<bool> set,
+                                Func<bool> folded, Action<bool> foldSet, Func<string> info)
+        {
+            Node nd = Tri(text, state, set);
+            nd.Fold = folded;
+            nd.FoldSet = foldSet;
+            nd.FoldInfo = info;
+            return nd;
+        }
+
+        /// <summary>
+        /// 这一节收没收起。**没记过就是收起** —— 用户要的是「详情项默认不展开」，
+        /// 所以「第一次打开设置窗口」看到的应该是四行标题，而不是二十来行明细。
+        /// </summary>
+        private static bool FoldedOf(Dictionary<string, bool> folded, string key)
+        {
+            bool v;
+            if (folded != null && folded.TryGetValue(key, out v)) return v;
+            return true;
+        }
+
         /// <summary>缩进一档的叶子 —— 大节下面那些明细。</summary>
         private static Node Sub(string text, Func<bool> check, Action click)
         {
             return new Node { Text = text, Checked = check, Click = click, Indent = 1 };
         }
-
         /// <summary>缩进一档的小字说明（挂在大节标题下面）。</summary>
         private static Node Note(string text)
         {
@@ -331,17 +368,20 @@ namespace TabbedExplorer
         /// <summary>
         /// 「通知管理」页的规格。
         ///
-        /// 用户两次要求叠起来的结果：「把通知相关的摘出来单做一个 tab「通知管理」」+
-        /// 「不够细，比如「出错与失败」算一列，用一条线隔开，然后具体在里面的明细可以多选」。
+        /// 用户三次要求叠起来的结果：「把通知相关的摘出来单做一个 tab「通知管理」」+
+        /// 「不够细，比如「出错与失败」算一列，用一条线隔开，然后具体在里面的明细可以多选」+
+        /// 「详情项默认不展开」。
         ///
-        /// 结构：总开关 → 四个大节（节标题 = 三态勾选框，点一下整批开 / 关；底下一档缩进 = 逐条明细）
+        /// 结构：总开关 → 四个大节（节标题 = 左边小三角管**展开 / 收起**（默认收起）、
+        /// 中间三态勾管**整批开 / 关**、右边「已开 N/M」；底下一档缩进 = 逐条明细）
         /// → 停留秒数 → 试弹一条。节与节之间就是那条**横线**（`Sep()`）。
         ///
         /// ⚠ 有哪几条、各属哪类、默认开不开，全在 `NotifyItems` 里 ——
         ///   加一条通知只改那个文件 + 一个调用点，这一页自动跟着变。
         /// ⚠ 全页都是 `WinOnly`：托盘那棵「设置」子树本来就挤，通知这些是「进设置窗口才调」的东西。
+        /// ⚠ `folded` 由调用方（设置窗口）持有 —— 详见 `FoldedOf`。
         /// </summary>
-        internal static List<Node> SpecNotify(DesktopHub hub)
+        internal static List<Node> SpecNotify(DesktopHub hub, Dictionary<string, bool> folded)
         {
             List<Node> n = new List<Node>();
 
@@ -350,15 +390,23 @@ namespace TabbedExplorer
                        () => Settings.Notify,
                        () => hub.SetNotify(!Settings.Notify))));
 
-            // ② 四个大节：横线 + 节标题（三态）+ 小字说明 + 逐条明细
+            // ② 四个大节：横线 + 节标题（三态 + 可折叠）+ 小字说明 + 逐条明细。
+            //    ⚠ 明细**默认收起**（用户：「详情项默认不展开」）—— 一屏只看得到四行标题，
+            //      想看哪一节点它左边那个小三角。收起只管画，跟「开没开」半点关系没有。
+            //    ⚠ `folded` 是**设置窗口那一份**（窗口关掉就没了 ⇒ 下次打开又是全收起），
+            //      窗口里重建（切主题 / 点「试弹一条通知」）不丢。
             ToastKind[] order = NotifyItems.KindOrder;
             for (int k = 0; k < order.Length; k++)
             {
                 ToastKind kind = order[k];
+                int kk = k;
                 n.Add(Sep());
-                n.Add(WinOnly(Tri(NotifyItems.KindTitle(kind),
+                n.Add(WinOnly(Sec(NotifyItems.KindTitle(kind),
                           delegate { return Settings.NotifyKindState(kind); },
-                          delegate(bool on) { hub.SetNotifyKind(kind, on); })));
+                          delegate(bool on) { hub.SetNotifyKind(kind, on); },
+                          delegate { return FoldedOf(folded, NotifyItems.KindTitle(kind)); },
+                          delegate(bool f) { folded[NotifyItems.KindTitle(kind)] = f; },
+                          delegate { return Settings.NotifyKindCountText(kind); })));
                 n.Add(Note(NotifyItems.KindNote(kind)));
 
                 List<NotifyItem> items = NotifyItems.Of(kind);

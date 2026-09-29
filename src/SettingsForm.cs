@@ -63,7 +63,7 @@ namespace TabbedExplorer
     /// 独立的设置窗口（用户要的）—— 齿轮按钮、标签条空白右键、托盘「更多选项…」开的都是它。
     /// 托盘图标右键那份菜单**保持原样**（用户明确要求）。
     ///
-    /// 窗口内容**不另写一份**：设置项全部由 `SettingsMenu.Spec(hub)` / `SpecNotify(hub)` 生成 ——
+    /// 窗口内容**不另写一份**：设置项全部由 `SettingsMenu.Spec(hub)` / `SpecNotify(hub, notifyFolds)` 生成 ——
     /// 托盘那份菜单用的也是同一份规格，
     /// 所以以后加设置项不会漏一边（当初「托盘右键没有设置选项」就是两边各写一遍漏出来的）。
     /// 这里只是换一种渲染方式：
@@ -108,6 +108,13 @@ namespace TabbedExplorer
         private string pendingNotice;
         /// <summary>订阅 Theme.Changed 的那个处理器（关窗时要退订，否则静态事件会把窗口吊着不放）。</summary>
         private EventHandler themeHandler;
+        /// <summary>
+        /// 「通知管理」页四个大节收没收起（键 = 大类标题）。
+        /// ⚠ 这是**窗口级**状态：`SettingsForm` 每开一次都是新实例 ⇒ 下次打开又是全收起
+        ///   （用户要的「详情项默认不展开」）；但窗口里重建（切主题 / 点「试弹一条通知」）
+        ///   用的还是同一个实例，所以那会儿不会把用户刚展开的又收回去。
+        /// </summary>
+        private readonly Dictionary<string, bool> notifyFolds = new Dictionary<string, bool>();
 
         // ==================================================================
         // 「保存」这一套（用户：设置项用保存按钮，有变动在窗口标题提示，关窗时问一句）
@@ -744,30 +751,98 @@ namespace TabbedExplorer
         /// <summary>「通知管理」页 —— 规格来自 `SettingsMenu.SpecNotify`。</summary>
         private int BuildNotify(TabPage page, int w)
         {
-            return RenderSpec(page, SettingsMenu.SpecNotify(hub), w);
+            return RenderSpec(page, SettingsMenu.SpecNotify(hub, notifyFolds), w);
+        }
+
+        // ------------------------------------------------------------------
+        // 渲染一份设置规格。
+        //
+        // ⚠ 分两步走：先按顺序把控件建出来、每一行记进 `rows`，最后统一 `LayoutRows` 摆位置。
+        //   为什么要两步 —— 「通知管理」页那几个大节可以**收起**，收起时它下面那几行要
+        //   「不显示 + 不占位置」。控件是建的时候就 `SetBounds` 的，做不到「按可见性重排」，
+        //   所以得把「行」攒下来、让布局能重跑一遍（点小三角展开 / 收起时就要重跑）。
+        // ------------------------------------------------------------------
+        private sealed class RowItem { public Control C; public int X, Dy, W, H; }
+        private sealed class Row
+        {
+            public readonly List<RowItem> Items = new List<RowItem>();
+            public int H;
+            /// <summary>这一行现在露不露脸（null = 一直露）。收起的节下面那几行据此隐藏。</summary>
+            public Func<bool> Vis;
+        }
+
+        private static void Put(Row r, Control c, int x, int dy, int w, int h)
+        {
+            r.Items.Add(new RowItem { C = c, X = x, Dy = dy, W = w, H = h });
+        }
+
+        /// <summary>按 `rows` 的可见性把控件一路摆下来（隐藏的行既不显示、也不占高度）。</summary>
+        private static int LayoutRows(List<Row> rows, int top)
+        {
+            int y = top;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                Row r = rows[i];
+                bool vis = r.Vis == null || r.Vis();
+                for (int j = 0; j < r.Items.Count; j++)
+                {
+                    RowItem it = r.Items[j];
+                    it.C.Visible = vis;
+                    if (vis) it.C.SetBounds(it.X, y + it.Dy, it.W, it.H);
+                }
+                if (vis) y += r.H;
+            }
+            return y;
         }
 
         private int RenderSpec(TabPage page, List<SettingsMenu.Node> spec, int w)
         {
             int pad = Px(10);
-            int y = Px(8);
+            int top = Px(8);
             int rowH = Px(26);
             int inner = w - pad * 2;
 
+            List<Row> rows = new List<Row>();
+            Action relayout = null;       // 展开 / 收起后重排（建完才赋上；闭包按变量看得到）
+            Func<bool> secFold = null;    // 当前这一节收没收起；null = 不在节里
             string curGroup = null;
             Panel groupBox = null;
 
             for (int i = 0; i < spec.Count; i++)
             {
                 SettingsMenu.Node nd = spec[i];
-                if (nd.Text == null) { curGroup = null; groupBox = null; y = AddRule(page, y, w, pad); continue; }
 
-                // ---- 数值项（标签页宽度：可自己敲）----
+                // 横线（顺便给上一节收尾）
+                if (nd.Text == null)
+                {
+                    curGroup = null; groupBox = null; secFold = null;
+                    Row sr = new Row { H = Math.Max(1, Px(1)) + Px(8) };
+                    Panel sp = new Panel();
+                    sp.BackColor = Theme.Border;
+                    Put(sr, sp, pad, 0, w - pad * 2, Math.Max(1, Px(1)));
+                    rows.Add(sr);
+                    page.Controls.Add(sp);
+                    continue;
+                }
+
+                // 这一行挂在哪一节下面（节标题自己永远露脸；不在节里的行也永远露脸）
+                Func<bool> hidden = null;
+                if (nd.Fold != null) secFold = nd.Fold;
+                else if (nd.Indent >= 1 && secFold != null)
+                {
+                    Func<bool> f = secFold;   // ★ 每个 lambda 抓自己的副本 —— 直接抓 secFold 会被下一节改掉
+                    hidden = delegate { return f(); };
+                }
+                else secFold = null;
+
+                // ---- 数值项（「通知停留几秒」这种：可自己敲）----
                 if (nd.NumMax > 0)
                 {
                     curGroup = null; groupBox = null;
+                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+
                     Label lab = TextLabel(nd.Text, Px(12), false);
-                    lab.SetBounds(pad, y + Px(3), Px(300), Px(22));
+                    Put(r, lab, pad, Px(3), Px(300), Px(22));
                     page.Controls.Add(lab);
 
                     NumBox num = new NumBox();
@@ -779,7 +854,7 @@ namespace TabbedExplorer
                     num.ForeColor = Theme.Text;
                     num.BorderStyle = BorderStyle.FixedSingle;
                     int nw = Px(90);
-                    num.SetBounds(pad + Px(300) + Px(8), y, nw, Px(24));
+                    Put(r, num, pad + Px(300) + Px(8), 0, nw, Px(24));
                     int cur = nd.NumGet != null ? nd.NumGet() : nd.NumMin;
                     if (cur < nd.NumMin) cur = nd.NumMin;
                     if (cur > nd.NumMax) cur = nd.NumMax;
@@ -810,10 +885,11 @@ namespace TabbedExplorer
                     // 右边跟一句「范围」，省得他敲了没反应不知道为什么
                     Label hint = TextLabel("（" + nd.NumMin + " ~ " + nd.NumMax + "，可直接输入）", Px(11), false);
                     hint.ForeColor = Theme.TextDim;
-                    hint.SetBounds(pad + Px(300) + Px(8) + nw + Px(8), y + Px(3), inner - Px(300) - nw - Px(16), Px(20));
+                    Put(r, hint, pad + Px(300) + Px(8) + nw + Px(8), Px(3),
+                        inner - Px(300) - nw - Px(16), Px(20));
                     page.Controls.Add(hint);
 
-                    y += rowH + Px(4);
+                    rows.Add(r);
                     continue;
                 }
 
@@ -821,8 +897,10 @@ namespace TabbedExplorer
                 if (nd.Children != null && nd.Children.Count > 0)
                 {
                     curGroup = null; groupBox = null;
+                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+
                     Label lab = TextLabel(nd.Text, Px(12), false);
-                    lab.SetBounds(pad, y + Px(3), Px(110), Px(22));
+                    Put(r, lab, pad, Px(3), Px(110), Px(22));
                     page.Controls.Add(lab);
 
                     ComboBox cb = new ComboBox();
@@ -831,7 +909,7 @@ namespace TabbedExplorer
                     cb.BackColor = Theme.InputBack;
                     cb.ForeColor = Theme.Text;
                     cb.Font = Font;
-                    cb.SetBounds(pad + Px(116), y, w - pad * 2 - Px(116), Px(24));
+                    Put(r, cb, pad + Px(116), 0, w - pad * 2 - Px(116), Px(24));
                     for (int k = 0; k < nd.Children.Count; k++) cb.Items.Add(nd.Children[k].Text);
 
                     SettingsMenu.Node branch = nd;
@@ -850,7 +928,7 @@ namespace TabbedExplorer
                             { if (cb.SelectedIndex != k) cb.SelectedIndex = k; break; }
                         }
                     });
-                    y += rowH + Px(4);
+                    rows.Add(r);
                     continue;
                 }
 
@@ -864,9 +942,10 @@ namespace TabbedExplorer
                         for (int k = i; k < spec.Count && spec[k].Group == nd.Group; k++) cnt++;
                         groupBox = new Panel();
                         groupBox.BackColor = BackColor;
-                        groupBox.SetBounds(pad, y, inner, cnt * rowH);
+                        Row gr = new Row { H = cnt * rowH };
+                        Put(gr, groupBox, pad, 0, inner, cnt * rowH);
+                        rows.Add(gr);
                         page.Controls.Add(groupBox);
-                        y += cnt * rowH;
                     }
 
                     RadioButton rb = new RadioButton();
@@ -892,31 +971,72 @@ namespace TabbedExplorer
                 // 说明行（不打勾、也没动作）
                 if (nd.Checked == null && nd.Click == null)
                 {
+                    Row r = new Row { H = Px(22), Vis = hidden };
                     Label info = TextLabel(nd.Text, Px(11), false);
                     info.ForeColor = Theme.TextDim;
-                    info.SetBounds(pad + nd.Indent * Px(18), y, inner - nd.Indent * Px(18), Px(18));
+                    Put(r, info, pad + nd.Indent * Px(18), 0, inner - nd.Indent * Px(18), Px(18));
+                    rows.Add(r);
                     page.Controls.Add(info);
-                    y += Px(22);
                     continue;
                 }
 
                 // 纯动作（「记住当前标签」）
                 if (nd.Checked == null)
                 {
-                    Button b = FlatButton(nd.Text, pad, y, Px(320), Px(26));
+                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Button b = FlatButton(nd.Text, pad, 0, Px(320), Px(26));
                     SettingsMenu.Node node = nd;
                     b.Click += delegate { ApplyNode(node); };
+                    Put(r, b, pad, 0, Px(320), Px(26));
+                    rows.Add(r);
                     page.Controls.Add(b);
-                    y += rowH + Px(4);
                     continue;
                 }
 
-                // 三态勾选框（「通知管理」页里那几个大节标题）：点一下 = 这一类整批开 / 整批关。
+                // 三态勾选框（「通知管理」页那几个大节标题）：点一下 = 这一类整批开 / 整批关。
+                // 这一行还是**可折叠的节**（`Fold != null`）时，左边再放个小三角管展开 / 收起。
                 // ⚠ `AutoCheck = false` 是必须的 —— 三态自带的轮转是「不勾→部分→全勾」，
                 //   而我们要的是「不是全开就全开、已经全开就全关」，目标状态得自己算。
                 //   所以状态一律由 `TriState()` 说了算：点完走 `ApplyNode`（跑 `Click` → 整窗刷）。
                 if (nd.TriState != null)
                 {
+                    SettingsMenu.Node node = nd;
+                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+
+                    int caretW = Px(22);
+                    int infoW = Px(92);
+                    int cbX = pad + caretW + Px(2);
+                    int cbW = inner - caretW - Px(2) - (nd.FoldInfo != null ? infoW + Px(6) : 0);
+                    if (cbW < Px(80)) cbW = Px(80);
+
+                    if (nd.Fold != null)
+                    {
+                        // 点小三角只是**展开 / 收起**，一个字都不改设置 —— 改值归旁边那个三态勾。
+                        Button caret = new Button();
+                        caret.FlatStyle = FlatStyle.Flat;
+                        caret.FlatAppearance.BorderSize = 0;
+                        caret.BackColor = BackColor;
+                        caret.ForeColor = Theme.TextDim;
+                        caret.Font = new Font("Segoe UI", Px(10), FontStyle.Regular, GraphicsUnit.Pixel);
+                        caret.TextAlign = ContentAlignment.MiddleCenter;
+                        caret.TabStop = false;
+                        caret.Text = node.Fold() ? "▶" : "▼";
+                        caret.Click += delegate
+                        {
+                            if (node.FoldSet == null) return;
+                            node.FoldSet(!node.Fold());
+                            caret.Text = node.Fold() ? "▶" : "▼";
+                            if (relayout != null) relayout();
+                        };
+                        Put(r, caret, pad, 0, caretW, rowH);
+                        page.Controls.Add(caret);
+                        syncers.Add(delegate
+                        {
+                            string t = node.Fold != null && node.Fold() ? "▶" : "▼";
+                            if (caret.Text != t) caret.Text = t;
+                        });
+                    }
+
                     CheckBox tk = new CheckBox();
                     tk.FlatStyle = FlatStyle.Standard;
                     tk.BackColor = BackColor;
@@ -925,8 +1045,8 @@ namespace TabbedExplorer
                     tk.ThreeState = true;
                     tk.AutoCheck = false;
                     tk.Text = nd.Text;
-                    tk.SetBounds(Px(4), y, inner - Px(8), rowH);
-                    SettingsMenu.Node node = nd;
+                    Put(r, tk, nd.Fold != null ? cbX : Px(4), 0,
+                        nd.Fold != null ? cbW : inner - Px(8), rowH);
                     tk.Click += delegate { if (!syncing) ApplyNode(node); };
                     page.Controls.Add(tk);
                     syncers.Add(delegate
@@ -936,35 +1056,66 @@ namespace TabbedExplorer
                                       : (st == 1 ? CheckState.Indeterminate : CheckState.Unchecked);
                         if (tk.CheckState != cs) tk.CheckState = cs;
                     });
-                    y += rowH + Px(4);
+
+                    // 右边「已开 N/M」—— 明细收着的时候，就靠它知道里面开了几条
+                    if (nd.FoldInfo != null)
+                    {
+                        Label cnt = TextLabel("", Px(11), false);
+                        cnt.ForeColor = Theme.TextDim;
+                        cnt.TextAlign = ContentAlignment.MiddleRight;
+                        Put(r, cnt, pad + inner - infoW, 0, infoW, rowH);
+                        page.Controls.Add(cnt);
+                        syncers.Add(delegate
+                        {
+                            string s = node.FoldInfo != null ? node.FoldInfo() : "";
+                            if (cnt.Text != s) cnt.Text = s;
+                        });
+                    }
+
+                    rows.Add(r);
                     continue;
                 }
 
                 // 普通勾选框
-                CheckBox ck = new CheckBox();
-                ck.FlatStyle = FlatStyle.Standard;
-                ck.BackColor = BackColor;
-                ck.ForeColor = ForeColor;
-                ck.Font = Font;
-                ck.Text = nd.Text;
-                ck.SetBounds(Px(4) + nd.Indent * Px(18), y, inner - Px(8) - nd.Indent * Px(18), rowH);
-                SettingsMenu.Node n2 = nd;
-                ck.CheckedChanged += delegate
                 {
-                    if (syncing) return;
-                    if (n2.Checked == null) return;
-                    if (ck.Checked != n2.Checked()) ApplyNode(n2);   // 只在跟真值不一致时才算「点了一下」
-                };
-                page.Controls.Add(ck);
-                syncers.Add(delegate
-                {
-                    bool v = n2.Checked != null && n2.Checked();
-                    if (ck.Checked != v) ck.Checked = v;
-                });
-                y += rowH + Px(4);
+                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    CheckBox ck = new CheckBox();
+                    ck.FlatStyle = FlatStyle.Standard;
+                    ck.BackColor = BackColor;
+                    ck.ForeColor = ForeColor;
+                    ck.Font = Font;
+                    ck.Text = nd.Text;
+                    Put(r, ck, Px(4) + nd.Indent * Px(18), 0,
+                        inner - Px(8) - nd.Indent * Px(18), rowH);
+                    SettingsMenu.Node n2 = nd;
+                    ck.CheckedChanged += delegate
+                    {
+                        if (syncing) return;
+                        if (n2.Checked == null) return;
+                        if (ck.Checked != n2.Checked()) ApplyNode(n2);   // 只在跟真值不一致时才算「点了一下」
+                    };
+                    page.Controls.Add(ck);
+                    syncers.Add(delegate
+                    {
+                        bool v = n2.Checked != null && n2.Checked();
+                        if (ck.Checked != v) ck.Checked = v;
+                    });
+                    rows.Add(r);
+                    continue;
+                }
             }
 
-            return y + Px(6);
+            // 展开 / 收起之后：重排 + 把这一页（含刚长出来的那条滚动条）刷成深色。
+            // ⚠ 系统那条滚动条是**按需创建**的 —— 收起时内容不够高，它压根还没生出来，
+            //   所以 `Build` 那一次 `StylePageNative` 刷不到它。展开时才现身 ⇒ 得再刷一遍；
+            //   而它是在布局里创建的，这一跳未必已经建好，所以再推后一轮补一次。
+            relayout = delegate
+            {
+                LayoutRows(rows, top);
+                StylePageNative(page);
+                try { BeginInvoke(new Action(delegate { StylePageNative(page); })); } catch { }
+            };
+            return LayoutRows(rows, top) + Px(6);
         }
 
         // ==================================================================

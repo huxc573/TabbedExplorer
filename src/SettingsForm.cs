@@ -825,13 +825,15 @@ namespace TabbedExplorer
                     continue;
                 }
 
-                // 这一行挂在哪一节下面（节标题自己永远露脸；不在节里的行也永远露脸）
-                Func<bool> hidden = null;
+                // 这一行露不露脸（null = 一直露脸；节下面的明细看这一节收没收起）
+                // ⚠ `Node.Fold` 返回的是「**收起了**」，露脸是它的反面 —— 一开始就是这里写反了，
+                //   结果是「默认收起」变成了「明细全摊开」。
+                Func<bool> vis = null;
                 if (nd.Fold != null) secFold = nd.Fold;
                 else if (nd.Indent >= 1 && secFold != null)
                 {
                     Func<bool> f = secFold;   // ★ 每个 lambda 抓自己的副本 —— 直接抓 secFold 会被下一节改掉
-                    hidden = delegate { return f(); };
+                    vis = delegate { return !f(); };
                 }
                 else secFold = null;
 
@@ -839,7 +841,7 @@ namespace TabbedExplorer
                 if (nd.NumMax > 0)
                 {
                     curGroup = null; groupBox = null;
-                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Row r = new Row { H = rowH + Px(4), Vis = vis };
 
                     Label lab = TextLabel(nd.Text, Px(12), false);
                     Put(r, lab, pad, Px(3), Px(300), Px(22));
@@ -897,7 +899,7 @@ namespace TabbedExplorer
                 if (nd.Children != null && nd.Children.Count > 0)
                 {
                     curGroup = null; groupBox = null;
-                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Row r = new Row { H = rowH + Px(4), Vis = vis };
 
                     Label lab = TextLabel(nd.Text, Px(12), false);
                     Put(r, lab, pad, Px(3), Px(110), Px(22));
@@ -971,7 +973,7 @@ namespace TabbedExplorer
                 // 说明行（不打勾、也没动作）
                 if (nd.Checked == null && nd.Click == null)
                 {
-                    Row r = new Row { H = Px(22), Vis = hidden };
+                    Row r = new Row { H = Px(22), Vis = vis };
                     Label info = TextLabel(nd.Text, Px(11), false);
                     info.ForeColor = Theme.TextDim;
                     Put(r, info, pad + nd.Indent * Px(18), 0, inner - nd.Indent * Px(18), Px(18));
@@ -983,7 +985,7 @@ namespace TabbedExplorer
                 // 纯动作（「记住当前标签」）
                 if (nd.Checked == null)
                 {
-                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Row r = new Row { H = rowH + Px(4), Vis = vis };
                     Button b = FlatButton(nd.Text, pad, 0, Px(320), Px(26));
                     SettingsMenu.Node node = nd;
                     b.Click += delegate { ApplyNode(node); };
@@ -1001,7 +1003,7 @@ namespace TabbedExplorer
                 if (nd.TriState != null)
                 {
                     SettingsMenu.Node node = nd;
-                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Row r = new Row { H = rowH + Px(4), Vis = vis };
 
                     int caretW = Px(22);
                     int infoW = Px(92);
@@ -1078,7 +1080,7 @@ namespace TabbedExplorer
 
                 // 普通勾选框
                 {
-                    Row r = new Row { H = rowH + Px(4), Vis = hidden };
+                    Row r = new Row { H = rowH + Px(4), Vis = vis };
                     CheckBox ck = new CheckBox();
                     ck.FlatStyle = FlatStyle.Standard;
                     ck.BackColor = BackColor;

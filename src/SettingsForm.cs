@@ -1014,7 +1014,11 @@ namespace TabbedExplorer
                     if (nd.Fold != null)
                     {
                         // 点小三角只是**展开 / 收起**，一个字都不改设置 —— 改值归旁边那个三态勾。
-                        Button caret = new Button();
+                        // ⚠ 必须用不抢焦点的按钮（`NoFocusButton`）：普通 `Button` 一点就把焦点抢过去，
+                        //   `ScrollableControl` 会把**拿到焦点的控件滚进可视区** ⇒ 表现就是
+                        //   「点一下展开，页面跳回最上面」，而且它在上方时还能把滚动量顶到负值，
+                        //   收起来之后就留出一片空白。
+                        Button caret = new NoFocusButton();
                         caret.FlatStyle = FlatStyle.Flat;
                         caret.FlatAppearance.BorderSize = 0;
                         caret.BackColor = BackColor;
@@ -1107,13 +1111,20 @@ namespace TabbedExplorer
                 }
             }
 
-            // 展开 / 收起之后：重排 + 把这一页（含刚长出来的那条滚动条）刷成深色。
+            // 展开 / 收起之后：重排 + 收一下滚动位置 + 把这一页（含刚长出来的那条滚动条）刷成深色。
             // ⚠ 系统那条滚动条是**按需创建**的 —— 收起时内容不够高，它压根还没生出来，
             //   所以 `Build` 那一次 `StylePageNative` 刷不到它。展开时才现身 ⇒ 得再刷一遍；
             //   而它是在布局里创建的，这一跳未必已经建好，所以再推后一轮补一次。
+            // ⚠ 滚动位置也得管：收起之后内容变矮，旧滚动量还留着就会在前面空出一片（系统不会次次帮你收敛）。
+            //   只在「内容已经不用滚了」时归零 —— 归零是唯一不用猜 getter / setter 正负号的写法；
+            //   还需要滚的场合就**不动**它，免得每点一次都跳回最上面。
             relayout = delegate
             {
-                LayoutRows(rows, top);
+                int contentH = LayoutRows(rows, top);
+                if (contentH <= page.ClientSize.Height)
+                {
+                    try { page.AutoScrollPosition = new Point(0, 0); } catch { }
+                }
                 StylePageNative(page);
                 try { BeginInvoke(new Action(delegate { StylePageNative(page); })); } catch { }
             };
@@ -1425,6 +1436,19 @@ namespace TabbedExplorer
     internal sealed class KeyBox : Button
     {
         protected override bool IsInputKey(Keys keyData) { return true; }
+    }
+
+    /// <summary>
+    /// **点了不抢焦点**的按钮（「通知管理」节标题左边那个小三角）。
+    ///
+    /// ⚠ 抢焦点会连带出事：`ScrollableControl` 会把**拿到焦点的控件滚进可视区** ⇒
+    ///   表现就是「点一下展开，页面跳回最上面」；而那个控件在可视区**上方**时，
+    ///   这次滚动还能把 display-rect 顶到负值，收起来之后就留出一片空白。
+    ///   所以这类「只是切个显示」的按钮一律不给焦点（`Selectable = false`）。
+    /// </summary>
+    internal sealed class NoFocusButton : Button
+    {
+        public NoFocusButton() { SetStyle(ControlStyles.Selectable, false); }
     }
 
     /// <summary>

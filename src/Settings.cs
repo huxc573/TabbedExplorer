@@ -103,6 +103,20 @@ namespace TabbedExplorer
         public const int SleepDelaySecMin = 1;
         public const int SleepDelaySecMax = 300;
         /// <summary>
+        /// 空格键预览（默认**开**）：把「在标签里按空格调 QuickLook 预览选中项」接过来。
+        ///
+        /// 为什么得由我们自己接：QuickLook 的判据**只有一条** —— 读**前台窗口的类名**
+        /// （`CabinetWClass` / `ExploreWClass` / `ShellTabWindowClass` / `dopus.lister` /
+        /// `EVERYTHING` / `DUIViewWndClassName` / `WorkerW` / `Progman` / `#32770`）。
+        /// 原生资源管理器是 `CabinetWClass`，它认；我们的宿主是自绘窗体，它一律判 `Invalid`、
+        /// 整段逻辑根本不触发 —— 用户「我在原生资源管理器明明是没问题的」就是这个原因。
+        ///
+        /// 怎么接、怎么转发见 `QLPreview` 的类注释。关掉 = 空格照常落到内嵌的列表上。
+        /// ⚠ 只在「前台是我们自己的窗口」且「真选中了东西」且「找得到 QuickLook.exe」时才动作；
+        ///   Ctrl / Alt / Shift + 空格 一律不碰（Ctrl+空格 是输入法切换）。
+        /// </summary>
+        public static bool QLPreview = true;
+        /// <summary>
         /// 「右下角通知」（默认**开**）：操作反馈那种气泡弹不弹（「已复制完整路径」「留一个」
         /// 「TabbedExplorer 还在后台」…… 就是屏幕右下角冒一下的那一条）。
         ///
@@ -299,6 +313,7 @@ namespace TabbedExplorer
                     AutoPreload  = Json.GetBool(json, "autopreload", true);
                     AutoSleep    = Json.GetBool(json, "autosleep", true);
                     SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
+                    QLPreview    = Json.GetBool(json, "qlpreview", true);
                     // ⚠ Debug 得**先**读 —— 下面通知那四类的默认值要看它（用户：「Debug 模式默认
                     //   开启全部，非 Debug 模式只默认开启重要的部分」），不能等到底下那一行。
                     bool dbg = Json.GetBool(json, "debug", false);
@@ -393,6 +408,7 @@ namespace TabbedExplorer
                     case "autopreload": AutoPreload = ParseBool(v, true); break;
                     case "autosleep":   AutoSleep = ParseBool(v, true); break;
                     case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
+                    case "qlpreview":   QLPreview = ParseBool(v, true); break;
                     case "notify":      Notify = ParseBool(v, true); break;
                     case "notifyover":  LoadNotifyOver(v); break;
                     case "notifysec":   NotifySec = ClampNotifySec(ParseInt(v, NotifySec)); break;
@@ -439,7 +455,7 @@ namespace TabbedExplorer
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
-                        AutoPreload, AutoSleep, Notify;
+                        AutoPreload, AutoSleep, Notify, QLPreview;
             public int TabWidth, VPaneAlpha, SleepDelaySec, NotifySec;
             /// <summary>逐条覆盖表的一份拷贝（`Snap` 抄一份出来、`ApplySnapshot` 抄回去）。</summary>
             public readonly Dictionary<string, bool> NotifyOver =
@@ -455,6 +471,7 @@ namespace TabbedExplorer
             s.Capture = Capture; s.Color = Color;
             s.KeepTabs = KeepTabs; s.LazyTabs = LazyTabs; s.ParallelLaunch = ParallelLaunch;
             s.AutoPreload = AutoPreload; s.AutoSleep = AutoSleep; s.SleepDelaySec = SleepDelaySec;
+            s.QLPreview = QLPreview;
             s.Notify = Notify;
             s.NotifySec = NotifySec;
             foreach (KeyValuePair<string, bool> kv in NotifyOver) s.NotifyOver[kv.Key] = kv.Value;
@@ -480,6 +497,7 @@ namespace TabbedExplorer
             Capture = s.Capture; Color = s.Color;
             KeepTabs = s.KeepTabs; LazyTabs = s.LazyTabs; ParallelLaunch = s.ParallelLaunch;
             AutoPreload = s.AutoPreload; AutoSleep = s.AutoSleep; SleepDelaySec = s.SleepDelaySec;
+            QLPreview = s.QLPreview;
             Notify = s.Notify;
             NotifySec = s.NotifySec;
             NotifyOver.Clear();
@@ -517,6 +535,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_autopreload\": \"true = 程序起来后就算还没打开窗口，也先在后台把本桌面记着的标签起出来（第一次 Win+E 就是热的）；false = 等按 Win+E 再还原\",\r\n");
                 sb.Append("  \"_autosleep\": \"true = 切走的标签停留够久就把它那个 explorer 进程的驻留内存收一收、切回来重新读回；false = 一个都不收（常驻内存更高，切标签最快）\",\r\n");
                 sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
+                sb.Append("  \"_qlpreview\": \"true = 在标签里按空格调 QuickLook 预览选中的文件（需已安装并常驻 QuickLook）；false = 空格照旧落在文件列表上。Ctrl/Alt/Shift+空格 一律不管\",\r\n");
                 sb.Append("  \"_notify\": \"true = 操作反馈弹一条右下角气泡（已复制 / 留一个 / 还在后台 这类）；false = 一个都不弹（功能一件不少）\",\r\n");
                 sb.Append("  \"_notifyover\": \"逐条通知开关的覆盖表，格式 id=1 / id=0 用逗号隔开；**只写用户改过的那些**，没写到的 = 跟随默认（debug 全开，平时只开「出错与失败」和「启动与后台状态」里那几条）。条目 id 见设置窗口「通知管理」页或代码里的 NotifyItems\",\r\n");
                 sb.Append("  \"_notifysec\": \"一条气泡停留多少秒后自己收（默认 4，1 ~ 30）。调大 = 看得更清楚，调小 = 少挡视线\",\r\n");
@@ -533,6 +552,7 @@ namespace TabbedExplorer
                 sb.Append("  \"autopreload\": ").Append(AutoPreload ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"autosleep\": ").Append(AutoSleep ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"sleepdelay\": ").Append(SleepDelaySec).Append(",\r\n");
+                sb.Append("  \"qlpreview\": ").Append(QLPreview ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"notify\": ").Append(Notify ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"notifyover\": \"").Append(NotifyOverText()).Append("\",\r\n");
                 sb.Append("  \"notifysec\": ").Append(NotifySec).Append(",\r\n");
@@ -592,12 +612,12 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20} notifyover={21} notifysec={22}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} debug={15} hotkeys={16} autopreload={17} autosleep={18} sleepdelay={19} notify={20} notifyover={21} notifysec={22} qlpreview={23}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0,
-                NotifyOver.Count, NotifySec);
+                NotifyOver.Count, NotifySec, QLPreview ? 1 : 0);
         }
 
         // ==================================================================
@@ -808,6 +828,8 @@ namespace TabbedExplorer
         public static void SetAutoPreload(bool on) { AutoPreload = on; Save(); }
         public static void SetAutoSleep(bool on) { AutoSleep = on; Save(); }
         public static void SetSleepDelay(int sec) { SleepDelaySec = ClampSleepSec(sec); Save(); }
+        /// <summary>空格键预览（QuickLook）总开关。改完立刻生效 —— 钩子每次现读这个闸。</summary>
+        public static void SetQLPreview(bool on) { QLPreview = on; Save(); }
         public static void SetNotify(bool on) { Notify = on; Save(); }
         /// <summary>「一条气泡停留多少秒」（设置窗口「通知管理」页那个数字框）。</summary>
         public static void SetNotifySec(int sec) { NotifySec = ClampNotifySec(sec); Save(); }

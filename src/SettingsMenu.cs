@@ -256,6 +256,13 @@ namespace TabbedExplorer
                       Settings.SleepDelaySecMin, Settings.SleepDelaySecMax, 1,
                       delegate { return Settings.SleepDelaySec; },
                       delegate(int s) { hub.SetSleepDelay(s); }));
+            // ③⁶ 空格键预览（默认开，用户：「适配 QuicLook 的空格键预览」）：在标签里按空格调
+            //     QuickLook 预览选中的文件。原生资源管理器本来就行（QuickLook 认 `CabinetWClass`），
+            //     我们的宿主是自绘窗体、它认不出来 —— 所以这一条由我们自己接、自己转发（见 QLPreview）。
+            //     ⚠ 它**不**接管 Ctrl/Alt/Shift+空格（Ctrl+空格 是输入法切换），也不管「没选中东西」。
+            n.Add(WinOnly(Leaf("空格键预览（按空格调 QuickLook 预览选中的文件，需已装 QuickLook）",
+                       () => Settings.QLPreview,
+                       () => hub.SetQLPreview(!Settings.QLPreview))));
             // （通知相关的项**不在这里** —— 它们整体挪到「通知管理」那一个 tab 了，
             //   规格见 `SpecNotify`。用户：「把通知相关的摘出来单做一个 tab」。）
             n.Add(Sep());

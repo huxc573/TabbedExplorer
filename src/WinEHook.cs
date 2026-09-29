@@ -35,9 +35,12 @@ namespace TabbedExplorer
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_KEYUP = 0x0101;
+        private const int WM_SYSKEYUP = 0x0105;
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
+        private const int VK_SPACE = 0x20;
         private const int VK_LMENU = 0xA4;     // 低级钩子报的是左右分开的那个
         private const int VK_RMENU = 0xA5;
         private const int VK_F10 = 0x79;
@@ -69,6 +72,12 @@ namespace TabbedExplorer
 
         /// <summary>吞到 Ctrl+1..9（跳到第 N 个标签）。**这一条不参与自定义**（没法绑「一串」键）。参数是 0 基下标。</summary>
         public event Action<int> GotoTabKey;
+
+        /// <summary>
+        /// 吞到空格了（「空格键预览」，见 `QLPreview`）。**在钩子线程上触发**，订阅者自己往 UI 线程转。
+        /// 只在「前台是我们某个宿主窗体 + 没按修饰键」时才发 —— 别的程序里按空格原样放行。
+        /// </summary>
+        public event Action SpacePreview;
 
         /// <summary>
         /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管快捷键** ——
@@ -118,15 +127,27 @@ namespace TabbedExplorer
                 if (nCode >= 0)
                 {
                     int msg = wParam.ToInt32();
-                    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                    bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                    bool up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                    if (down || up)
                     {
                         KBDLLHOOKSTRUCT st = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(
                             lParam, typeof(KBDLLHOOKSTRUCT));
 
-                        // 只吞「真人按的键」：注入的键放行，免得挡住自己的 SendCommand / 远程工具
+                        // 只处理「真人按的键」：注入的键放行，免得挡住自己的 SendCommand / 远程工具
                         // （KBDLLHOOKSTRUCT 的字段都是 uint，GetAsyncKeyState 要 int —— 这里统一成 int）
-                        if ((st.flags & LLKHF_INJECTED) == 0 && Handle((int)st.vkCode))
-                            return (IntPtr)1;
+                        if ((st.flags & LLKHF_INJECTED) == 0)
+                        {
+                            if (up)
+                            {
+                                // 松开只清标志（空格预览「这次已经处理过了」那个），**绝不吞键**
+                                QLPreview.NoteKeyUp((int)st.vkCode);
+                            }
+                            else if (Handle((int)st.vkCode))
+                            {
+                                return (IntPtr)1;
+                            }
+                        }
                     }
                 }
             }
@@ -160,6 +181,18 @@ namespace TabbedExplorer
             if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU || vk == VK_F10)
             {
                 if (OursIsForeground()) EmbedApi.LetGoMenuBar(EmbedApi.MenuLetGoMs);
+                return false;
+            }
+
+            // 空格 = 调 QuickLook 预览（见 `QLPreview`）。只在「前台是我们某个宿主窗体 + 没按修饰键」
+            // 时才归我们 —— 吞掉是为了不让它再去改内嵌列表的选中项（QuickLook 自己是不吞的）。
+            if (vk == VK_SPACE)
+            {
+                if (QLPreview.WantsSpace())
+                {
+                    Raise(SpacePreview);
+                    return true;
+                }
                 return false;
             }
 

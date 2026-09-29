@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -292,6 +293,93 @@ namespace TabbedExplorer
                 Marshal.FreeCoTaskMem(inner);
                 Marshal.FreeCoTaskMem(outer);
             }
+        }
+
+        /// <summary>
+        /// 某个文件夹窗口**现在选中了哪些项**（完整路径）。给「空格预览」（`QLPreview`）用。
+        ///
+        /// 怎么对上号：收编之后清单里每一项报回来的 `HWND` **全是同一个宿主窗体**（见类注释），
+        /// 按句柄分不出谁是谁 —— 但 `LocationURL` 一直是准的（实测），所以拿它跟
+        /// 「当前激活标签现在停在的文件夹」比。⚠ 同一个目录开了两个标签时会撞：
+        /// 小概率取到另一个标签的选中项，先接受（预览出来的还是这个目录里的东西）。
+        ///
+        /// 优先「选中项」（`Document.SelectedItems`），一个都没有再退回「焦点项」（`FocusedItem`）
+        /// —— 键盘上下移动时只有焦点没有选中，那会儿按空格也该预览得到。
+        ///
+        /// ⚠ 只认 `file:///` 的真目录（虚拟位置 / 别的协议返回空表）—— 调用方拿不到东西就不动作。
+        /// ⚠ 会被 UI 线程调（必须在 STA 上，`Application.OleRequired` 就是为这个）；一次全量枚举
+        ///   实测 16~41ms，按空格是人的动作、这个量级无所谓，所以不做节流。
+        /// </summary>
+        internal static List<string> SelectedPathsIn(string folderPath)
+        {
+            List<string> res = new List<string>();
+            if (string.IsNullOrEmpty(folderPath)) return res;
+            try
+            {
+                Application.OleRequired();
+                Type t = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (t == null) return res;
+                IDispatch root = Activator.CreateInstance(t) as IDispatch;
+                if (root == null) return res;
+
+                string want = folderPath.TrimEnd('\\');
+                int total = ReadInt(root, "Count");
+                for (int i = 0; i < total; i++)
+                {
+                    IDispatch item = ReadItem(root, i);
+                    if (item == null) continue;
+                    string p = FileUrlToPath(ReadString(item, "LocationURL"));
+                    if (p == null) continue;
+                    if (!string.Equals(p.TrimEnd('\\'), want, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    IDispatch doc = ReadObject(item, "Document");
+                    if (doc == null) return res;
+
+                    IDispatch items = InvokeGet(doc, "SelectedItems");
+                    int n = items == null ? 0 : ReadInt(items, "Count");
+                    for (int j = 0; j < n; j++)
+                    {
+                        IDispatch fi = ReadItem(items, j);
+                        string sp = fi == null ? null : ReadString(fi, "Path");
+                        if (!string.IsNullOrEmpty(sp)) res.Add(sp);
+                    }
+                    if (res.Count == 0)
+                    {
+                        IDispatch foc = ReadObject(doc, "FocusedItem");
+                        string fp = foc == null ? null : ReadString(foc, "Path");
+                        if (!string.IsNullOrEmpty(fp)) res.Add(fp);
+                    }
+                    return res;         // 找到那一项了，不管有没有选中都收工
+                }
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 读选中项失败 " + ex.Message); }
+            return res;
+        }
+
+        /// <summary>读一个**对象**属性（`Document` / `FocusedItem`）：拿到的 RCW 按 QI 转成 `IDispatch`。</summary>
+        private static IDispatch ReadObject(IDispatch d, string name)
+        {
+            IntPtr v = Marshal.AllocCoTaskMem(VarSize);
+            try
+            {
+                Zero(v, VarSize);
+                object o = Invoke(d, name, DISPATCH_PROPERTYGET, v, IntPtr.Zero, 0);
+                return o as IDispatch;
+            }
+            finally { Marshal.FreeCoTaskMem(v); }
+        }
+
+        /// <summary>调一个**无参方法**（`SelectedItems()`），返回值同样当对象看。</summary>
+        private static IDispatch InvokeGet(IDispatch d, string name)
+        {
+            IntPtr v = Marshal.AllocCoTaskMem(VarSize);
+            try
+            {
+                Zero(v, VarSize);
+                object o = Invoke(d, name, DISPATCH_METHOD, v, IntPtr.Zero, 0);
+                return o as IDispatch;
+            }
+            finally { Marshal.FreeCoTaskMem(v); }
         }
 
         /// <summary>

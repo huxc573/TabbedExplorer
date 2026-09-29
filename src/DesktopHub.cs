@@ -236,6 +236,9 @@ namespace TabbedExplorer
                 int n = i;
                 Post(delegate { Hotkey("goto:" + n); });
             };
+            // 空格（「空格键预览」）：钩子线程只判「前台是不是我们某个宿主窗体」，
+            // 真干活（问 shell 要选中项 + 起 QuickLook）投回 UI 线程，见 `OnSpacePreview`。
+            hook.SpacePreview += delegate { Post(OnSpacePreview); };
             hook.Start();
 
             // 第二个实例被启动（双击 exe）时只会 set 一下这个事件，由我们现身。            // 事件挂在字段上、不能 using 掉 —— 注册等待之后句柄要一直活着。
@@ -1344,6 +1347,7 @@ namespace TabbedExplorer
             forms[key] = nf;
             nf.FormClosed += delegate { OnFormGone(nf); };
             hook.MainWindow = nf.Handle;      // OursIsForeground 的兜底分支要用
+            SyncHosts();                      // 上面那行已经把句柄逼出来了，正好同步给空格钩子
             nf.SetFavBarOn(Settings.FavBar);  // 新窗口要跟上当前的书签栏开关（设置存在文件里，窗口自己不知道）
             return nf;
         }
@@ -1492,6 +1496,17 @@ namespace TabbedExplorer
             Settings.SetAutoSleep(on);
             RefreshTrayMenu();
             Diag.Step("Hub: 非激活标签自动休眠 -> " + (on ? "开" : "关"));
+        }
+
+        /// <summary>
+        /// 空格键预览（QuickLook）总开关。**立刻生效** —— `AppContext` 那个键盘钩子每次现读这个闸。
+        /// </summary>
+        public void SetQLPreview(bool on)
+        {
+            if (Settings.QLPreview == on) return;
+            Settings.SetQLPreview(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 空格键预览 -> " + (on ? "开" : "关"));
         }
 
         /// <summary>
@@ -1885,6 +1900,34 @@ namespace TabbedExplorer
             return null;
         }
 
+        /// <summary>
+        /// 空格预览（QuickLook，见 `QLPreview` 的类注释）：拿**前台那个窗口**当前激活标签停在的
+        /// 文件夹，向 shell 问它现在选中了什么，把第一个喂给 QuickLook。
+        /// 在 UI 线程上跑（钩子线程通过 `Post` 投过来）。
+        /// </summary>
+        private void OnSpacePreview()
+        {
+            EmbedForm f = ForegroundForm();
+            if (f == null) return;
+            QLPreview.Do(f.ActiveTabPath);
+        }
+
+        /// <summary>
+        /// 把「宿主窗体句柄」同步给 `QLPreview`。空格钩子拿它判「前台是不是我们自己的窗口」——
+        /// 光判进程不够：设置窗口 / 通知气泡也是我们的窗口，而**在那些地方空格是正常操作**
+        /// （勾复选框）。只在 UI 线程调，`forms` 一变就调一次。
+        /// </summary>
+        private void SyncHosts()
+        {
+            List<IntPtr> hs = new List<IntPtr>();
+            foreach (EmbedForm f in forms.Values)
+            {
+                if (f == null || f.IsDisposed || !f.IsHandleCreated) continue;
+                hs.Add(f.Handle);
+            }
+            QLPreview.SetHosts(hs);
+        }
+
         // ==================================================================
         // 记忆
         // ==================================================================
@@ -1969,6 +2012,7 @@ namespace TabbedExplorer
             {
                 if (forms[k] == f) forms.Remove(k);
             }
+            SyncHosts();
             Diag.Step("Hub: 窗口没了，还剩 " + forms.Count + " 个");
             MarkDirty();
         }

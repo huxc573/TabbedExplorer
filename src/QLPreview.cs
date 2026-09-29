@@ -119,8 +119,10 @@ namespace TabbedExplorer
             List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
             if (sel.Count == 0) return;
 
-            Diag.Step("QLPreview: 预览 " + sel[0]);
             Preview(sel[0]);
+            Diag.Step("QLPreview: 预览 " + sel[0]);   // ⚠ 记账放在预览**之后**：这条落盘是
+                                                     // 每行一次 `AppendAllText`（开→写→关），
+                                                     // Debug 开着时别让它挡在预览前面。
         }
 
         /// <summary>

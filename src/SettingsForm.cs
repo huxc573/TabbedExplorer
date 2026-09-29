@@ -803,10 +803,12 @@ namespace TabbedExplorer
             int inner = w - pad * 2;
             int caretW = Px(22);                 // 节标题左边小三角的宽
             int infoW = Px(92);                  // 节标题右边「已开 N/M」的宽
-            // ⚠ 「缩进一档」的起点 = 节标题那个三态勾的 x（= pad + 小三角宽 + 2px 间隙）。
-            //   别拿 `pad + 18` 那种算法 —— 那样算出来的位置比节标题**还靠左**，
-            //   一眼看去像「明细挂在节标题外面」（第一版就是这么错的，用户截图圈的就是这儿）。
+            // ⚠ 「缩进一档」的起点有两档，别自己按 `pad + n*18` 拍：
+            //   `treeX` = 节标题那个三态勾的 x（= pad + 小三角宽 + 2px 间隙），节标题用；
+            //   `subX`  = 再往里让出**一个勾选框**的宽 —— 明细用这一档。
+            //   只用 `treeX` 那会儿明细跟节标题勾选框齐平，用户说「不好区分总设置项和详情设置」。
             int treeX = pad + caretW + Px(2);
+            int subX = treeX + Px(22);
 
             List<Row> rows = new List<Row>();
             Action relayout = null;       // 展开 / 收起后重排（建完才赋上；闭包按变量看得到）
@@ -982,7 +984,7 @@ namespace TabbedExplorer
                     Row r = new Row { H = Px(22), Vis = vis };
                     Label info = TextLabel(nd.Text, Px(11), false);
                     info.ForeColor = Theme.TextDim;
-                    int ix = nd.Indent >= 1 ? treeX : pad;
+                    int ix = nd.Indent >= 1 ? subX : pad;
                     Put(r, info, ix, 0, pad + inner - ix, Px(18));
                     rows.Add(r);
                     page.Controls.Add(info);
@@ -1096,7 +1098,7 @@ namespace TabbedExplorer
                     ck.ForeColor = ForeColor;
                     ck.Font = Font;
                     ck.Text = nd.Text;
-                    int cx = nd.Indent >= 1 ? treeX : Px(4);
+                    int cx = nd.Indent >= 1 ? subX : Px(4);
                     Put(r, ck, cx, 0, nd.Indent >= 1 ? pad + inner - cx : inner - Px(8), rowH);
                     SettingsMenu.Node n2 = nd;
                     ck.CheckedChanged += delegate

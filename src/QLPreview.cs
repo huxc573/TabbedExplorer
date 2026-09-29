@@ -28,13 +28,33 @@ namespace TabbedExplorer
     /// 我们怎么接：`WinEHook` 那个全局键盘钩子（本来管 Win+E 和标签快捷键）加一条空格分支。
     /// 钩子里**不做 COM / IO**（见那儿的硬规矩），判定只做纯 Win32（见 `WantsSpace`），
     /// 真干活投回 UI 线程（`Do`）。`--classic` 那条老路（`AppContext`）不接这个功能。
+    ///
+    /// ⚠ **绝不能抢改键工具的功能键**：MyKeymap / AutoHotkey 这类工具拿 CapsLock 当功能键，
+    /// 靠它自己的键盘钩子收「CapsLock+X」。而低级键盘钩子是**后装的先拿到事件** —— 我们比它装得晚，
+    /// 所以我们一旦在按住 CapsLock 时吞掉空格，**后面那个钩子就再也收不到这一下**
+    /// （返回 1 的事件不会再往后传，也不会进目标窗口），用户的 CapsLock+空格 直接哑掉。
+    /// 所以 `WantsSpace` 把 CapsLock / Win 也当成「按着就别管」。
     /// </summary>
     internal static class QLPreview
     {
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
+        private const int VK_CAPITAL = 0x14;   // CapsLock
+        private const int VK_LWIN = 0x5B;
+        private const int VK_RWIN = 0x5C;
         private const int VK_SPACE = 0x20;
+
+        /// <summary>
+        /// 「这些键按着的时候，空格不是我们的」。**CapsLock 和 Win 必须在里面**：
+        /// Ctrl+空格 是输入法切换、Win+空格 是系统输入法/表情面板、CapsLock+空格 是 MyKeymap
+        /// 这类改键工具的组合键（见类注释）。用 `GetAsyncKeyState`（**不是** `GetKeyState`）：
+        /// 低级钩子里只有它已经反映「刚刚这一下」。
+        /// </summary>
+        private static readonly int[] HeldModifiers = new int[]
+        {
+            VK_CONTROL, VK_MENU, VK_SHIFT, VK_CAPITAL, VK_LWIN, VK_RWIN
+        };
         private const uint GA_ROOT = 2;
 
         /// <summary>QuickLook 的跨进程消息名（照抄它自己的 `PipeMessages` 常量）。</summary>
@@ -79,16 +99,17 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 这次空格该不该归我们管（**钩子线程**：只读字段 + 纯 Win32，不做 COM / IO）。
-        /// 四条：开关开着、没按 Ctrl / Alt / Shift（Ctrl+空格 是输入法切换，绝不能抢）、
-        /// 这一次按下还没处理过、前台是我们某个宿主窗体。
+        /// 四条：开关开着、**没按着别的键**（见 `HeldModifiers` —— Ctrl+空格、Win+空格、
+        /// CapsLock+空格 一个都不能抢）、这一次按下还没处理过、前台是我们某个宿主窗体。
         /// </summary>
         public static bool WantsSpace()
         {
             if (!Settings.QLPreview) return false;
             if (spaceDown) return false;
-            if ((NativeMethods.GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) return false;
-            if ((NativeMethods.GetAsyncKeyState(VK_MENU) & 0x8000) != 0) return false;
-            if ((NativeMethods.GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) return false;
+            for (int i = 0; i < HeldModifiers.Length; i++)
+            {
+                if ((NativeMethods.GetAsyncKeyState(HeldModifiers[i]) & 0x8000) != 0) return false;
+            }
 
             IntPtr fg = NativeMethods.GetForegroundWindow();
             if (fg == IntPtr.Zero) return false;

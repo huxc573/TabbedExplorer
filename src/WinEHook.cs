@@ -186,6 +186,8 @@ namespace TabbedExplorer
 
             // 空格 = 调 QuickLook 预览（见 `QLPreview`）。只在「前台是我们某个宿主窗体 + 没按修饰键」
             // 时才归我们 —— 吞掉是为了不让它再去改内嵌列表的选中项（QuickLook 自己是不吞的）。
+            // ⚠ 「修饰键」里含 CapsLock / Win：按住 CapsLock 再按空格是 MyKeymap 这类改键工具的组合键，
+            //    我们比它装得晚 ⇒ 吞了它就再也收不到（详见 `QLPreview.WantsSpace`）。
             if (vk == VK_SPACE)
             {
                 if (QLPreview.WantsSpace())

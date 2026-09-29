@@ -801,6 +801,12 @@ namespace TabbedExplorer
             int top = Px(8);
             int rowH = Px(26);
             int inner = w - pad * 2;
+            int caretW = Px(22);                 // 节标题左边小三角的宽
+            int infoW = Px(92);                  // 节标题右边「已开 N/M」的宽
+            // ⚠ 「缩进一档」的起点 = 节标题那个三态勾的 x（= pad + 小三角宽 + 2px 间隙）。
+            //   别拿 `pad + 18` 那种算法 —— 那样算出来的位置比节标题**还靠左**，
+            //   一眼看去像「明细挂在节标题外面」（第一版就是这么错的，用户截图圈的就是这儿）。
+            int treeX = pad + caretW + Px(2);
 
             List<Row> rows = new List<Row>();
             Action relayout = null;       // 展开 / 收起后重排（建完才赋上；闭包按变量看得到）
@@ -976,7 +982,8 @@ namespace TabbedExplorer
                     Row r = new Row { H = Px(22), Vis = vis };
                     Label info = TextLabel(nd.Text, Px(11), false);
                     info.ForeColor = Theme.TextDim;
-                    Put(r, info, pad + nd.Indent * Px(18), 0, inner - nd.Indent * Px(18), Px(18));
+                    int ix = nd.Indent >= 1 ? treeX : pad;
+                    Put(r, info, ix, 0, pad + inner - ix, Px(18));
                     rows.Add(r);
                     page.Controls.Add(info);
                     continue;
@@ -1005,9 +1012,7 @@ namespace TabbedExplorer
                     SettingsMenu.Node node = nd;
                     Row r = new Row { H = rowH + Px(4), Vis = vis };
 
-                    int caretW = Px(22);
-                    int infoW = Px(92);
-                    int cbX = pad + caretW + Px(2);
+                    int cbX = treeX;
                     int cbW = inner - caretW - Px(2) - (nd.FoldInfo != null ? infoW + Px(6) : 0);
                     if (cbW < Px(80)) cbW = Px(80);
 
@@ -1091,8 +1096,8 @@ namespace TabbedExplorer
                     ck.ForeColor = ForeColor;
                     ck.Font = Font;
                     ck.Text = nd.Text;
-                    Put(r, ck, Px(4) + nd.Indent * Px(18), 0,
-                        inner - Px(8) - nd.Indent * Px(18), rowH);
+                    int cx = nd.Indent >= 1 ? treeX : Px(4);
+                    Put(r, ck, cx, 0, nd.Indent >= 1 ? pad + inner - cx : inner - Px(8), rowH);
                     SettingsMenu.Node n2 = nd;
                     ck.CheckedChanged += delegate
                     {

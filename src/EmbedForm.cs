@@ -1318,6 +1318,23 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 屏幕点离**本窗口标签条**有多远（落在标签条上 = 0）。
+        /// 用来区分「拖出去开新窗」和「手一抖从标签条上滑下来一点点」—— 后者不该开窗。
+        /// </summary>
+        internal int DistanceFromTabBar(Point screen)
+        {
+            TabStrip bar = TabBar;
+            if (bar == null || bar.IsDisposed) return int.MaxValue;
+            Rectangle r = bar.RectangleToScreen(bar.ClientRectangle);
+            int dx = 0, dy = 0;
+            if (screen.X < r.Left) dx = r.Left - screen.X;
+            else if (screen.X > r.Right) dx = screen.X - r.Right;
+            if (screen.Y < r.Top) dy = r.Top - screen.Y;
+            else if (screen.Y > r.Bottom) dy = screen.Y - r.Bottom;
+            return (int)Math.Sqrt((double)(dx * dx + dy * dy));
+        }
+
+        /// <summary>
         /// 把一个标签从本窗口**摘下来**（不进恢复栈、不销毁它的 explorer）—— 跨窗口拖拽的中转。
         /// ⚠ 只管「列表」这一侧：控件那一侧的换爹由目标窗口调 `ExplorerHost.ReparentTo` 完成。
         /// </summary>

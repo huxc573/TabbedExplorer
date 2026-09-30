@@ -1481,7 +1481,12 @@ namespace TabbedExplorer
                 foreach (EmbedForm f in AllForms())
                 {
                     if (f == null || f.IsDisposed) continue;
-                    if (f.Handle == root) return f;
+                    if (f.Handle != root) continue;
+                    // 保险：认出来的这扇窗**必须真的盖住这个点**。
+                    // 万一 `WindowFromPoint` 给回来的根句柄是别人的（拖拽期间系统/别的进程插进来的
+                    // 临时窗、贴边预览之类），按句柄认亲会认错窗口 —— 那就把标签并进一扇不该进去的窗。
+                    if (!f.Bounds.Contains(screen)) continue;
+                    return f;
                 }
             }
             catch (Exception ex) { Diag.Log("Hub: 落点判定失败 " + ex.Message); }
@@ -1513,10 +1518,15 @@ namespace TabbedExplorer
         }
 
         /// <summary>
-        /// 在标签条之外松手。三条路（跟浏览器一致）：
+        /// 在标签条之外松手。两条路（跟浏览器一致）：
         ///   ① 松在**另一个**我们的窗口上 → 并进去（落在标签条上就插到那一条缝，落在内容区就追加到末尾）；
-        ///   ② 松在桌面 / 别的程序窗口上 → 在松手的位置**另开一扇窗口**，标签搬过去；
-        ///   ③ 松在自己窗口上（理论上到不了这儿，见 `TabStrip.DragOutEnded`）→ 什么都不做。
+        ///   ② 别的任何地方 —— 桌面、别的程序、**以及自己窗口的内容区** —— 都在松手的位置
+        ///      **另开一扇窗口**把标签搬过去。
+        ///
+        /// ⚠ 为什么「自己窗口的内容区」也算 ②：`TabStrip` 那边的出界判定是「离开标签条」，
+        ///   所以往下一拖（进了自己的内容区）就已经算拖出去了。窗口一最大化，屏幕上一块空地都没有，
+        ///   只认「落在窗口之外」等于这个功能永远够不着 —— 用户报的「拖不出新窗口」就是这一条。
+        ///   落回**标签条**上根本走不到这儿（`TrackDragOut` 会先把 `dragOut` 清掉，那条路是条内排序）。
         /// </summary>
         internal void EndTabDrag(EmbedForm src, int idx, Point screen)
         {
@@ -1535,15 +1545,42 @@ namespace TabbedExplorer
                 if (!t.IsDisposed && t.Visible) t.ActivateToFront();
                 return;
             }
-            if (t != null) return;      // ③ 自家窗口：交给条内重排，不走这儿
 
-            // ② 拖到窗口之外 —— 在鼠标位置另开一扇
+            // 手一抖、只是从标签条上滑下来一点点（还在自己窗口里、离标签条很近）：当取消，别开窗。
+            int away = src.DistanceFromTabBar(screen);
+            if (t == src && away < TypeSlop)
+            {
+                Diag.Step("Hub: 拖拽落点离标签条只有 " + away + "px，当取消（不开新窗口）");
+                return;
+            }
+
+            // ② 在鼠标位置另开一扇，把标签搬过去
+            Diag.Step("Hub: 标签拖出标签条（落点 " + screen.X + "," + screen.Y
+                + "，离标签条 " + away + "px）-> 另开一扇");
             Rectangle b = DetachedBounds(src, screen);
-            Diag.Step("Hub: 标签拖出窗口 -> 在 " + b.Left + "," + b.Top + " 另开一扇");
-            EmbedForm nf = CreateExtraWindow(b);
-            src.MoveTabTo(nf, idx, -1);
-            nf.ShowExtra(null);
+            EmbedForm nf;
+            try
+            {
+                nf = CreateExtraWindow(b);
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("Hub: 新建窗口失败 " + ex.GetType().Name + ": " + ex.Message);
+                return;
+            }
+            try
+            {
+                src.MoveTabTo(nf, idx, -1);
+                nf.ShowExtra(null);
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("Hub: 把标签搬进新窗口失败 " + ex.GetType().Name + ": " + ex.Message);
+            }
         }
+
+        /// <summary>离标签条多近算「手一抖」—— 在这个距离以内松手当取消，别开新窗口。</summary>
+        private const int TypeSlop = 24;
 
         /// <summary>
         /// 拖出去的窗口开在哪儿：**鼠标松手点当标题栏**（跟浏览器一样，窗口正好在指针下方），

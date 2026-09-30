@@ -827,8 +827,15 @@ namespace TabbedExplorer
         private const int VRowHeightL = 32;
         /// <summary>垂直模式顶部工具行的下沿（两种状态共用 —— 摊开时标签列表不上下跳）。</summary>
         private const int VToolRowL = 34;
-        /// <summary>垂直模式底部窗口按钮那一块的上沿（两种状态共用）。</summary>
-        private const int VWinRowL = 34;
+        /// <summary>
+        /// 垂直模式**窗口按钮那一块**的高度 —— 折叠态是**三颗竖着叠起来**（关闭 / 最大化 / 最小化），
+        /// 所以要按三颗算。展开态横排一行虽然只占一颗高，但**两种状态必须留同样高**：
+        /// 不然鼠标一进一出，标签区的下边界会跟着跳一下，整列标签图标跟着上下平移
+        /// （用户对这种位移很敏感，见本方法上面那条「两种状态共用同一套边界」）。
+        /// </summary>
+        private int VWinBlockH { get { return VCell * 3 + VGap * 2; } }
+        /// <summary>底部那一块留的边距（逻辑像素）。</summary>
+        private int VWinPad { get { return Px(4); } }
         /// <summary>垂直模式里一个图标格子的大小 —— 工具按钮 / 图钉 / 窗口按钮都用它。</summary>
         private const int VCellL = 26;
 
@@ -842,12 +849,13 @@ namespace TabbedExplorer
         /// <summary>
         /// 垂直排法。整条左栏从上往下：工具行 → 标签行 → 书签段 → 窗口按钮。
         ///
-        /// **折叠态（默认）整条只留两颗**：顶上一个「＋」、底下一颗「×」，中间那段全给标签图标；
-        /// 鼠标移进来窗格摊开（`EmbedForm.PaneShowWidth` 把宽度放大）才排其余工具、显示标题和书签段。
+        /// **折叠态（默认）整条只留顶上「＋」和底下三颗窗口按钮**（关闭 / 最大化 / 最小化**竖着叠**），
+        /// 中间那段全给标签图标；鼠标移进来窗格摊开（`EmbedForm.PaneShowWidth` 把宽度放大）
+        /// 才排其余工具、显示标题和书签段。
         /// 两条**不许破的**几何约束：
         /// ① 上下 —— 两种状态共用同一套边界（`tabsTopV` / `winTopV`）；
         /// ② 左右 —— 两种状态共用同一个图标列 x（`iconX`，按**折叠态宽度**算，不看当前 Width）。
-        /// 摊开时 ＋ / × 原地不动，只是中间「多出来」东西、旁边多出几颗按钮。
+        /// 摊开时 ＋ / 关闭原地不动，只是中间「多出来」东西、旁边多出几颗按钮。
         ///
         /// ⚠ 书签段那一块**不是我们画的** —— 上层把书签控件摆进来，这里只留空位
         /// （`BookmarkBand`）并把标签区裁到它上面为止；`favBandH` 是**实际**留出来的高度。
@@ -866,7 +874,8 @@ namespace TabbedExplorer
             //   这肯定不行的，就算修改收缩时宽度，也要达到在同一位置的要求」）。
             int iconX = Math.Max(0, (Px(EmbedForm.PaneCollapsedL) - cell) / 2);
             int iconY = Px(4);
-            int winY = Height - Px(VWinRowL) + Px(4);
+            // 窗口按钮那一块：**最下面那颗的下沿**钉在底边距上，往上排。
+            int wbBottom = Height - VWinPad;
 
             // ⚠ 每轮先把矩形**全部清空**再排：折叠态只有 ＋ 和 × 两颗，
             //   留着上一轮的矩形就会画在（也能点到）本该不存在的地方。
@@ -880,7 +889,14 @@ namespace TabbedExplorer
             if (collapsed)
             {
                 newRect = new Rectangle(iconX, iconY, cell, cell);
-                wbtnRects[(int)WBtn.Close] = new Rectangle(iconX, winY, cell, cell);
+                // 折叠态那 30 像素的窄缝里横排摆不下三颗 —— **竖着叠**，从下往上：
+                // 关闭 → 最大化 → 最小化（用户指定的顺序）。
+                // 它们的落点跟展开态的最后一颗（关闭）对得上，展开前后关闭那颗一动不动。
+                wbtnRects[(int)WBtn.Close] = new Rectangle(iconX, wbBottom - cell, cell, cell);
+                wbtnRects[(int)WBtn.Maximize] =
+                    new Rectangle(iconX, wbBottom - cell * 2 - gap, cell, cell);
+                wbtnRects[(int)WBtn.Minimize] =
+                    new Rectangle(iconX, wbBottom - cell * 3 - gap * 2, cell, cell);
             }
             else
             {
@@ -900,11 +916,12 @@ namespace TabbedExplorer
 
                 // ---- 底部窗口按钮：**左对齐**、也从同一个图标列起排 ----
                 // 用户：「展开时这排窗口按钮要挪到左下」，顺序按「关闭 / 放大 / 缩小」。
-                // 这样折叠态那颗 × 的落点，正好就是展开态这颗关闭按钮的落点，展开前后不位移。
+                // ⚠ 竖坐标贴在最下面那颗的高度上（= 折叠态关闭那颗）—— 这样展开前后关闭不动。
                 int wx = iconX;
-                wbtnRects[(int)WBtn.Close] = new Rectangle(wx, winY, cell, cell); wx += cell + gap;
-                wbtnRects[(int)WBtn.Maximize] = new Rectangle(wx, winY, cell, cell); wx += cell + gap;
-                wbtnRects[(int)WBtn.Minimize] = new Rectangle(wx, winY, cell, cell);
+                int wrowY = wbBottom - cell;
+                wbtnRects[(int)WBtn.Close] = new Rectangle(wx, wrowY, cell, cell); wx += cell + gap;
+                wbtnRects[(int)WBtn.Maximize] = new Rectangle(wx, wrowY, cell, cell); wx += cell + gap;
+                wbtnRects[(int)WBtn.Minimize] = new Rectangle(wx, wrowY, cell, cell);
             }
 
             // 这几样在竖排里没有意义。**必须清掉** —— 菜单锚点 / 命中判定都会读它们，
@@ -912,9 +929,11 @@ namespace TabbedExplorer
             toolsLeft = 0;              // 滚轮那边靠它判「是不是在按钮区」：竖排一律当标签区
             tabsClipRight = Width;
 
-            // ---- 上下边界：折叠态和展开态取**同一套值**（摊开时 ＋ / × 不动）----
+            // ---- 上下边界：折叠态和展开态取**同一套值**（摊开时 ＋ / 窗口按钮都不动）----
             tabsTopV = Px(VToolRowL);
-            winTopV = Height - Px(VWinRowL);
+            // ⚠ 这里按**三颗竖着叠**那一份高度留（`VWinBlockH`），不是按展开态那一行 —— 两种状态同一个值，
+            //   标签区的下边界才不会在鼠标进出时跳。展开态那行按钮贴底，上方多出来的一条是空白。
+            winTopV = Height - VWinPad - VWinBlockH;
             // 书签段最多只准吃到「工具行以下」的一半、且必须给标签区留两行 ——
             // 不然窗口一矮，标签就全被书签挤没了（宁可书签段少显示几行，它自己能滚）。
             // 折叠态那条窄缝连标题都放不下，直接不给。
@@ -1400,6 +1419,21 @@ namespace TabbedExplorer
             Graphics g = e.Graphics;
             Color bar = BarBack;
             GlassPaint.Backdrop(g, this, Glass, bar);
+
+            // ---- 按钮区**不跟着半透明走** ----
+            // 摊开盖在内容上时整条是半透明的（底图 + 带 alpha 的底色），顶部工具行 / 底部窗口按钮
+            // 那两块要是也跟着透，底下的文件列表就透上来跟图标混成一片 —— 用户：
+            // 「垂直侧边栏的按钮就不要透明了，不然看不到，影响使用」。
+            // 所以这两块重新刷一遍**实心**底色；中间标签区照旧半透明（那里透一点不影响用，
+            // 而且本来就是要看见底下的内容）。
+            if (Glass != null && Glass.On)
+            {
+                using (SolidBrush b = new SolidBrush(bar))
+                {
+                    g.FillRectangle(b, 0, 0, Width, tabsTopV);                    // 顶部工具行
+                    g.FillRectangle(b, 0, winTopV, Width, Height - winTopV);      // 底部窗口按钮
+                }
+            }
             float stroke = Math.Max(1f, DpiScale);
             int isz = IconSize;
 

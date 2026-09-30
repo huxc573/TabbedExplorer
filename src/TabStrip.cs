@@ -1413,18 +1413,23 @@ namespace TabbedExplorer
             Color bar = BarBack;
             GlassPaint.Backdrop(g, this, Glass, bar);
 
-            // ---- 按钮区**不跟着半透明走** ----
-            // 摊开盖在内容上时整条是半透明的（底图 + 带 alpha 的底色），顶部工具行 / 底部窗口按钮
-            // 那两块要是也跟着透，底下的文件列表就透上来跟图标混成一片 —— 用户：
-            // 「垂直侧边栏的按钮就不要透明了，不然看不到，影响使用」。
-            // 所以这两块重新刷一遍**实心**底色；中间标签区照旧半透明（那里透一点不影响用，
-            // 而且本来就是要看见底下的内容）。
+            // ---- 按钮那一小块**不跟着半透明走** ----
+            // 摊开盖在内容上时整条是半透明的（底图 + 带 alpha 的底色），按钮要也跟着透，
+            // 底下的文件列表就透上来跟图标混成一片（用户：「按钮就不要透明了，不然看不到」）。
+            // ⚠ **只刷按钮自己那几块小矩形**，别刷整条带 —— 用户：「我只要按钮不透明，
+            //   你怎么下面整个面板都变不够明了」：整条刷实心等于把窗格里那块空白也糊死，
+            //   盖在内容上时看着像被截掉一大块。中间标签区照旧半透明（本来就该看见底下）。
             if (Glass != null && Glass.On)
             {
                 using (SolidBrush b = new SolidBrush(bar))
                 {
-                    g.FillRectangle(b, 0, 0, Width, tabsTopV);                    // 顶部工具行
-                    g.FillRectangle(b, 0, winTopV, Width, Height - winTopV);      // 底部窗口按钮
+                    if (newRect.Width > 0) g.FillRectangle(b, newRect);
+                    for (int i = 0; i < toolRects.Length; i++)
+                        if (toolRects[i].Width > 0) g.FillRectangle(b, toolRects[i]);
+                    if (settingsRect.Width > 0) g.FillRectangle(b, settingsRect);
+                    if (pinRect.Width > 0) g.FillRectangle(b, pinRect);
+                    for (int i = 0; i < wbtnRects.Length; i++)
+                        if (wbtnRects[i].Width > 0) g.FillRectangle(b, wbtnRects[i]);
                 }
             }
             float stroke = Math.Max(1f, DpiScale);

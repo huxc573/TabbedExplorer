@@ -30,6 +30,38 @@ namespace TabbedExplorer
         private readonly Dictionary<string, EmbedForm> forms =
             new Dictionary<string, EmbedForm>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// **额外窗口**（用户要的多窗口：把标签拖出标签条 = 再开一个窗口，像浏览器那样）。
+        ///
+        /// 为什么不塞进 `forms`：那张表是「一张虚拟桌面 → 一个窗口」，三件事同时靠它 ——
+        /// Win+E 找落点、记忆按键分桶、`VirtualDesktop.WindowDesktopId` 自愈认领。
+        /// 一张桌面塞两个进去，这三件事一起坏（最后一个写入的会把前一个的标签覆盖掉）。
+        /// 所以主窗口照旧，额外窗口在这儿另排一队：
+        ///   · Win+E **永远只给主窗口**（额外窗口不参与）——「主窗口是这张桌面的正门」；
+        ///   · 记忆：额外窗口的标签**合并**写进它那张桌面的桶里（见 `SaveNow`），标签一个不丢；
+        ///   · 设置广播 / 前台判定 / 空格预览白名单：两边一起算（见 `AllForms`）。
+        /// </summary>
+        private readonly List<EmbedForm> extras = new List<EmbedForm>();
+
+        /// <summary>
+        /// **所有**活着的窗口：主窗口（`forms`）在前、额外窗口在后。
+        /// 顺序有意义 —— `SaveNow` 要先把主窗口的标签当正本写进去，再把额外窗口的追加在后面。
+        /// </summary>
+        private List<EmbedForm> AllForms()
+        {
+            List<EmbedForm> r = new List<EmbedForm>();
+            foreach (EmbedForm f in forms.Values)
+                if (f != null && !f.IsDisposed) r.Add(f);
+            for (int i = 0; i < extras.Count; i++)
+            {
+                EmbedForm f = extras[i];
+                if (f == null || f.IsDisposed) continue;
+                if (r.Contains(f)) continue;
+                r.Add(f);
+            }
+            return r;
+        }
+
         private readonly DesktopMemory memory = new DesktopMemory();
 
         /// <summary>托盘右键菜单里那棵「设置」子树（设置变了只刷文字，不重建菜单）。</summary>
@@ -190,6 +222,9 @@ namespace TabbedExplorer
             tray.Visible = true;
 
             MenuItem miShow = new MenuItem("打开窗口（Win+E）", delegate { OnWinE(); });
+            // 多窗口（用户：体验跟浏览器一样）：再开一个窗口，标签可以拖过来拖过去。
+            // 「打开窗口」给的是**主窗口**（Win+E 的落点），这一条是额外的那个。
+            MenuItem miNewWin = new MenuItem("新建窗口", delegate { OpenExtraWindow(null); });
             // 用户：托盘里那条「记住当前标签」去掉，换成两个管理器 ——
             // 手动存标签本来就用不上（改动攒 800ms 自己落盘 + 退出前再存一次，见 RememberNow），
             // 而两个管理器以前只在窗口内够得着（书签栏左端 / 标签条右键），放托盘里更好摸。
@@ -208,7 +243,7 @@ namespace TabbedExplorer
 
             trayMenu = new ContextMenu(new MenuItem[]
             {
-                miShow, miFav, miHist, traySettings.Root, new MenuItem("-"), miRestart, miQuit
+                miShow, miNewWin, miFav, miHist, traySettings.Root, new MenuItem("-"), miRestart, miQuit
             });
             // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（用户报的「没和其它选项一样居左对齐」）
             MenuFx.Hook(trayMenu);
@@ -1352,6 +1387,184 @@ namespace TabbedExplorer
             return nf;
         }
 
+        // ==================================================================
+        // 多窗口（用户：标签页也能拖到另一个程序窗口，体验跟浏览器一样）
+        // ==================================================================
+
+        /// <summary>
+        /// 只建窗口 + 登记，**先不 Show** —— 拖出来的那个标签要先挂进去再露面
+        /// （不然 `ShowExtra` 会先兜一个「此电脑」，白起一个 explorer）。
+        /// 落在**当前这张虚拟桌面**上，登记在 `extras`（不参与 Win+E，见那张表的说明）。
+        /// </summary>
+        /// <param name="bounds">拖出来的窗口就开在鼠标松手那儿；null = 默认尺寸、居中。</param>
+        internal EmbedForm CreateExtraWindow(Rectangle? bounds)
+        {
+            Guid d = VirtualDesktop.CurrentDesktopId();
+            EmbedForm nf = new EmbedForm(this, KeyOf(d));
+            nf.IsExtra = true;
+            if (bounds.HasValue)
+            {
+                // ⚠ 窗体默认 `StartPosition = CenterScreen`，不改成 Manual 的话 Show 那一刻会**居中**
+                //   把这里摆好的位置整个盖掉（拖出来的窗口就跑不到鼠标那儿了）。
+                nf.StartPosition = FormStartPosition.Manual;
+                nf.Bounds = bounds.Value;
+            }
+            extras.Add(nf);
+            nf.FormClosed += delegate { OnFormGone(nf); };
+            IntPtr force = nf.Handle;         // 逼出句柄 —— 下面 `SyncHosts` 要靠它把新窗口加进空格预览白名单
+            SyncHosts();
+            nf.SetFavBarOn(Settings.FavBar);  // 新窗口跟上当前的书签栏开关
+            return nf;
+        }
+
+        /// <summary>托盘「新建窗口」/ Ctrl+N：开一个空窗口（没标签时 `ShowExtra` 会兜一个「此电脑」）。</summary>
+        public EmbedForm OpenExtraWindow(string path) { return OpenExtraWindow(path, null); }
+
+        public EmbedForm OpenExtraWindow(string path, Rectangle? bounds)
+        {
+            EmbedForm nf = CreateExtraWindow(bounds);
+            Diag.Step("Hub: 新建窗口（现有 " + extras.Count + " 个额外窗口）");
+            nf.ShowExtra(path);
+            return nf;
+        }
+
+        /// <summary>
+        /// 把一个额外窗口先从登记表摘掉（它要真关了）。
+        /// ⚠ 必须排在 `SaveNow` **之前**：它的标签马上要被关掉，先摘掉才不会在保存那一刻
+        ///   被合并进记忆里（那就成了「关掉了却还在」）。
+        /// </summary>
+        internal void DropExtra(EmbedForm f)
+        {
+            if (f == null) return;
+            if (extras.Remove(f))
+            {
+                SyncHosts();
+                Diag.Step("Hub: 摘掉额外窗口（还剩 " + extras.Count + " 个）");
+            }
+        }
+
+        /// <summary>
+        /// 把一批「刚关掉的标签」记到**这张桌面的主窗口**的恢复栈里。
+        /// 额外窗口整体关掉时用：它自己那个栈随窗口一起没了，标签得能从主窗口 Ctrl+Shift+T 捞回来
+        /// （用户选的口径：「一起关掉，需要的话可以从『恢复关闭的标签页』一条条捞回来」）。
+        /// 记的**不带下标**（-1 = 恢复时按 `newtabbeside` 落到末尾）：它们本来在另一个窗口里，
+        /// 原位置在这个窗口没有意义。
+        /// </summary>
+        internal void RememberClosedTabs(string desktopKey, List<string> paths)
+        {
+            if (paths == null || paths.Count == 0) return;
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f == null || f.IsDisposed) continue;
+                if (!string.Equals(f.DesktopKey, desktopKey, StringComparison.OrdinalIgnoreCase)) continue;
+                f.PushClosedTabs(paths);
+                return;
+            }
+            Diag.Step("Hub: 想把这批关掉的标签记进恢复栈，但这张桌面没有主窗口可记");
+        }
+
+        // ---- 跨窗口拖标签（浏览器那套：拖到别的窗口并进去 / 拖出去另开一个）----
+
+        /// <summary>
+        /// 屏幕点上是不是**我们自己**的某个窗口 —— 是就返回它，不是（桌面 / 别的程序）返回 null。
+        /// ⚠ 拿到的是子窗口句柄（可能正好指着嵌进来的 explorer），得先 `GetAncestor(…, GA_ROOT)`
+        ///   一路走到最顶层窗口，再拿 `Handle` 去认。
+        /// </summary>
+        internal EmbedForm FormAtScreen(Point screen)
+        {
+            try
+            {
+                IntPtr w = NativeMethods.WindowFromPoint(new POINT(screen.X, screen.Y));
+                if (w == IntPtr.Zero) return null;
+                IntPtr root = NativeMethods.GetAncestor(w, 2);   // GA_ROOT
+                if (root == IntPtr.Zero) return null;
+                foreach (EmbedForm f in AllForms())
+                {
+                    if (f == null || f.IsDisposed) continue;
+                    if (f.Handle == root) return f;
+                }
+            }
+            catch (Exception ex) { Diag.Log("Hub: 落点判定失败 " + ex.Message); }
+            return null;
+        }
+
+        /// <summary>标签被拖出标签条（跨窗口拖拽开始）。这里只记一笔，真正的高亮在 `UpdateTabDrag` 里画。</summary>
+        internal void BeginTabDrag(EmbedForm src)
+        {
+            Diag.Step("Hub: 标签拖出标签条 -> 开始跨窗口拖拽");
+        }
+
+        /// <summary>拖动中：跟着鼠标把「该插到哪个窗口的第几位」实时画出来。</summary>
+        internal void UpdateTabDrag(EmbedForm src, Point screen)
+        {
+            EmbedForm t = FormAtScreen(screen);
+            foreach (EmbedForm f in AllForms())
+            {
+                if (f == null || f.IsDisposed) continue;
+                f.SetDropHint(f != src && f == t ? f.DropIndexAt(screen) : -1);
+            }
+        }
+
+        /// <summary>拖到一半又拖回自家标签条上（在自己这条上松手 = 走正常的条内重排，跨窗口这条作废）。</summary>
+        internal void CancelTabDrag(EmbedForm src)
+        {
+            foreach (EmbedForm f in AllForms())
+                if (f != null && !f.IsDisposed) f.SetDropHint(-1);
+        }
+
+        /// <summary>
+        /// 在标签条之外松手。三条路（跟浏览器一致）：
+        ///   ① 松在**另一个**我们的窗口上 → 并进去（落在标签条上就插到那一条缝，落在内容区就追加到末尾）；
+        ///   ② 松在桌面 / 别的程序窗口上 → 在松手的位置**另开一扇窗口**，标签搬过去；
+        ///   ③ 松在自己窗口上（理论上到不了这儿，见 `TabStrip.DragOutEnded`）→ 什么都不做。
+        /// </summary>
+        internal void EndTabDrag(EmbedForm src, int idx, Point screen)
+        {
+            foreach (EmbedForm f in AllForms())
+                if (f != null && !f.IsDisposed) f.SetDropHint(-1);
+
+            if (src == null || src.IsDisposed || src.Disposing) return;
+            EmbedForm t = FormAtScreen(screen);
+
+            // ① 并进另一个窗口
+            if (t != null && t != src)
+            {
+                int to = t.DropIndexAt(screen);
+                Diag.Step("Hub: 标签并入另一个窗口 idx=" + idx + " -> 位置 " + to);
+                src.MoveTabTo(t, idx, to);
+                if (!t.IsDisposed && t.Visible) t.ActivateToFront();
+                return;
+            }
+            if (t != null) return;      // ③ 自家窗口：交给条内重排，不走这儿
+
+            // ② 拖到窗口之外 —— 在鼠标位置另开一扇
+            Rectangle b = DetachedBounds(src, screen);
+            Diag.Step("Hub: 标签拖出窗口 -> 在 " + b.Left + "," + b.Top + " 另开一扇");
+            EmbedForm nf = CreateExtraWindow(b);
+            src.MoveTabTo(nf, idx, -1);
+            nf.ShowExtra(null);
+        }
+
+        /// <summary>
+        /// 拖出去的窗口开在哪儿：**鼠标松手点当标题栏**（跟浏览器一样，窗口正好在指针下方），
+        /// 大小跟来源窗口一样，再夹进主屏工作区里别跑出去。
+        /// </summary>
+        private static Rectangle DetachedBounds(EmbedForm src, Point screen)
+        {
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            // 大小跟来源窗口一样；它最大化过的话取**还原态**尺寸（不然新窗口跟着铺满整屏）
+            Rectangle sb = (src != null && !src.IsDisposed) ? src.RestoreBounds : Rectangle.Empty;
+            int w = Math.Min(sb.Width > 200 ? sb.Width : 960, (int)(wa.Width * 0.9));
+            int h = Math.Min(sb.Height > 200 ? sb.Height : 620, (int)(wa.Height * 0.9));
+            int x = screen.X - Math.Min(160, w / 3);
+            int y = screen.Y - Math.Min(18, h / 8);
+            if (x + w > wa.Right) x = wa.Right - w;
+            if (y + h > wa.Bottom) y = wa.Bottom - h;
+            if (x < wa.Left) x = wa.Left;
+            if (y < wa.Top) y = wa.Top;
+            return new Rectangle(x, y, w, h);
+        }
+
         /// <summary>窗口被挪到别的桌面（或换了捕获模式）：登记改到新的键，**标签跟着窗口走**。</summary>
         private EmbedForm Adopt(EmbedForm f, string key)
         {
@@ -1398,14 +1611,16 @@ namespace TabbedExplorer
 
             if (m == Settings.CaptureMode.Migrate)
             {
-                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                // ⚠ 多窗口：迁移模式的定义就是「全进程只留一个窗口」⇒ 额外窗口也一并收掉
+                foreach (EmbedForm f in AllForms())
                 {
                     if (f == null || f.IsDisposed || f == keep) continue;
-                    Diag.Step("Hub: 迁移模式，收掉多余窗口 " + f.DesktopKey);
+                    Diag.Step("Hub: 迁移模式，收掉多余窗口 " + f.DesktopKey + (f.IsExtra ? "（额外窗口）" : ""));
                     try { f.Quitting = true; f.Close(); }
                     catch (Exception ex) { Diag.Log("Hub: 收窗口失败 " + ex.Message); }
                 }
                 forms.Clear();
+                extras.Clear();
 
                 if (keep != null && !keep.IsDisposed)
                 {
@@ -1518,7 +1733,7 @@ namespace TabbedExplorer
             int v = Settings.ClampSleepSec(sec);
             if (Settings.SleepDelaySec == v) return;
             Settings.SetSleepDelay(v);
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())
             {
                 if (f == null || f.IsDisposed) continue;
                 f.ApplySleepDelay();
@@ -1584,7 +1799,7 @@ namespace TabbedExplorer
             try
             {
                 bool visible = false;
-                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                foreach (EmbedForm f in AllForms())
                 {
                     if (f != null && !f.IsDisposed && f.Visible) { visible = true; break; }
                 }
@@ -1607,7 +1822,7 @@ namespace TabbedExplorer
         /// <summary>现在有标签正等着 explorer 起来吗（任何一张桌面）。见 DrainCapture 的那道闸。</summary>
         private bool AnyLaunchInFlight()
         {
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())
             {
                 if (f != null && !f.IsDisposed && f.LaunchInFlight) return true;
             }
@@ -1657,7 +1872,7 @@ namespace TabbedExplorer
 
         private void RetabAll()
         {
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())
             {
                 if (f == null || f.IsDisposed) continue;
                 f.RefreshTabs();
@@ -1678,7 +1893,7 @@ namespace TabbedExplorer
 
         private void FavBarAll(bool on)
         {
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())
             {
                 if (f == null || f.IsDisposed) continue;
                 f.SetFavBarOn(on);
@@ -1750,7 +1965,7 @@ namespace TabbedExplorer
 
         private void VerticalAll()
         {
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())
             {
                 if (f == null || f.IsDisposed) continue;
                 try { f.ApplyVertical(); }
@@ -1778,7 +1993,7 @@ namespace TabbedExplorer
             EmbedForm f = ForegroundForm();
             if (f == null)
             {
-                foreach (EmbedForm x in new List<EmbedForm>(forms.Values))
+                foreach (EmbedForm x in AllForms())
                 {
                     if (x != null && !x.IsDisposed && x.Visible) { f = x; break; }
                 }
@@ -1899,6 +2114,13 @@ namespace TabbedExplorer
         /// 参数是**命令标识**（`newtab` …）或 `goto:<0 基下标>`。</summary>
         private void Hotkey(string cmd)
         {
+            // 「新建窗口」不依赖「哪个窗口在前台」这个上下文 —— 直接在 Hub 这一层接掉。
+            // （其余命令都得知道是**哪个**窗口的标签，所以照旧派给前台那个。）
+            if (string.Equals(cmd, "newwin", StringComparison.OrdinalIgnoreCase))
+            {
+                OpenExtraWindow(null);
+                return;
+            }
             EmbedForm f = ForegroundForm();
             if (f == null) { Diag.Step("Hub: 热键 " + cmd + " 但没有我们的前台窗口，忽略"); return; }
             f.HandleHotkey(cmd);
@@ -1909,7 +2131,7 @@ namespace TabbedExplorer
             IntPtr fg = NativeMethods.GetForegroundWindow();
             if (fg == IntPtr.Zero) return null;
             IntPtr root = NativeMethods.GetAncestor(fg, 2);   // GA_ROOT
-            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            foreach (EmbedForm f in AllForms())     // 额外窗口也算（多窗口下前台可能是它）
             {
                 if (f == null || f.IsDisposed) continue;
                 IntPtr h = f.Handle;
@@ -1938,7 +2160,8 @@ namespace TabbedExplorer
         private void SyncHosts()
         {
             List<IntPtr> hs = new List<IntPtr>();
-            foreach (EmbedForm f in forms.Values)
+            // ⚠ 多窗口：**每个**窗口的句柄都要进白名单 —— 漏一个，在它里面按空格就不再预览
+            foreach (EmbedForm f in AllForms())
             {
                 if (f == null || f.IsDisposed || !f.IsHandleCreated) continue;
                 hs.Add(f.Handle);
@@ -1967,15 +2190,21 @@ namespace TabbedExplorer
         ///
         /// 只覆盖「有窗口在的桌面」—— 这一轮没碰过的那些桌面，读进来什么样就写回去什么样，不会被清空。
         /// 另外**不动已经关掉的窗口**的桶：那次会话最后长什么样就留着什么样的标签，下次还在。
+        ///
+        /// ⚠ 多窗口：**一张桌面只有一个桶**。主窗口那份是正本（`Clear` 再写），
+        ///   额外窗口的标签接在后面追加（去重）—— 重启回到一个窗口，但标签一个不丢。
         /// </summary>
         public void SaveNow(string why)
         {
             try
             {
                 int live = 0, tabs = 0;
-                foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+                List<EmbedForm> all = AllForms();
+
+                // ① 主窗口先写：它们的键就是桌面键，桶里这一份是「这张桌面的正本」（Clear 从这里来）
+                foreach (EmbedForm f in all)
                 {
-                    if (f == null || f.IsDisposed) continue;
+                    if (f == null || f.IsDisposed || f.IsExtra) continue;
                     DesktopMemory.Bucket b = memory.Ensure(f.DesktopKey);
                     b.Paths.Clear();
                     b.Active = null;
@@ -1991,10 +2220,29 @@ namespace TabbedExplorer
                     // 窗口位置和大小（用户：完全退出后下次照原样打开）。
                     // ⚠ 只有「真给用户看过」的窗口才有值（空 = 不动记忆里那份）——
                     //   否则启动时预建但一直没露面的窗口会用它构造时的默认尺寸把旧记忆洗掉。
+                    // ⚠ 只记**主窗口**的：多窗口下额外窗口是临时分组，不该把正门那块地挤掉。
                     if (Settings.WindowSize)
                     {
                         string bs = f.BoundsString;
                         if (!string.IsNullOrEmpty(bs)) b.Bounds = bs;
+                    }
+                    live++;
+                }
+
+                // ② 额外窗口把标签**追加**进同一个桶（用户选的口径：合并记一份）——
+                //    重启后回到一个窗口，但标签一个不丢。去重因为两个窗口可能都开着同一个文件夹。
+                foreach (EmbedForm f in all)
+                {
+                    if (f == null || f.IsDisposed || !f.IsExtra) continue;
+                    DesktopMemory.Bucket b = memory.Ensure(f.DesktopKey);
+                    string active = f.ActiveTabPath;
+                    foreach (string p in f.TabPaths())
+                    {
+                        if (string.IsNullOrEmpty(p)) continue;
+                        if (b.Paths.Exists(delegate(string s) { return PathRules.Same(s, p); })) continue;
+                        b.Paths.Add(p);
+                        if (PathRules.Same(p, active)) b.Active = p;
+                        tabs++;
                     }
                     live++;
                 }
@@ -2014,8 +2262,9 @@ namespace TabbedExplorer
             try { saveTimer.Stop(); } catch { }
             SaveNow("退出前");
 
-            List<EmbedForm> all = new List<EmbedForm>(forms.Values);
+            List<EmbedForm> all = AllForms();
             forms.Clear();
+            extras.Clear();
             foreach (EmbedForm f in all)
             {
                 try { f.Quitting = true; f.Close(); }
@@ -2030,8 +2279,9 @@ namespace TabbedExplorer
             {
                 if (forms[k] == f) forms.Remove(k);
             }
+            extras.Remove(f);     // 额外窗口（见 `extras` 那张表）也要从这队里摘掉
             SyncHosts();
-            Diag.Step("Hub: 窗口没了，还剩 " + forms.Count + " 个");
+            Diag.Step("Hub: 窗口没了，还剩 " + forms.Count + " 个主窗口 / " + extras.Count + " 个额外窗口");
             MarkDirty();
         }
 
@@ -2042,6 +2292,7 @@ namespace TabbedExplorer
                 EmbedForm f = forms[k];
                 if (f == null || f.IsDisposed) forms.Remove(k);
             }
+            extras.RemoveAll(delegate(EmbedForm f) { return f == null || f.IsDisposed; });
         }
 
         private static string KeyOf(Guid g)

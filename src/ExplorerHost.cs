@@ -944,6 +944,42 @@ namespace TabbedExplorer
             }
         }
 
+        /// <summary>
+        /// 把这个标签（连同它那扇跨进程的 cab 窗口）搬到**另一个窗口的容器**里 ——
+        /// 多窗口下「把标签拖到另一个窗口」就是这一步（同一个进程，只是重新挂一次父窗口）。
+        ///
+        /// 为什么不能只把 `Host` 面板 `Controls.Add` 过去：cab 的父句柄是**面板的 HWND**，
+        /// WinForms 换爹时那个句柄有可能重建 ⇒ 原来的父句柄作废、cab 就成了孤儿（表现为
+        /// 一块打不开的黑区 + 一个再也收不回来的 explorer 进程）。所以搬完必须
+        /// **显式再 SetParent 一次**，再按新容器尺寸摆一遍（`LayoutCab`）。
+        ///
+        /// 藏一下再挂：跨父窗口 SetParent 那一瞬间它会按新位置先画一帧旧内容，看着像闪。
+        /// </summary>
+        internal void ReparentTo(Panel newContainer)
+        {
+            if (newContainer == null || newContainer.IsDisposed) return;
+            try
+            {
+                Control old = Host.Parent;
+                if (old != null && old != newContainer) old.Controls.Remove(Host);
+                Host.Dock = DockStyle.Fill;
+                if (Host.Parent != newContainer) newContainer.Controls.Add(Host);
+                Host.CreateControl();
+
+                if (embedded && CabWindow != IntPtr.Zero && NativeMethods.IsWindow(CabWindow))
+                {
+                    EmbedApi.ShowWindow(CabWindow, SW_HIDE);
+                    EmbedApi.SetParent(CabWindow, Host.Handle);
+                    EmbedApi.ShowWindow(CabWindow, SW_SHOW);
+                    LayoutCab(true);
+                }
+                // 藏在里面的进度条/选中状态不用管：explorer 那边一直在跑，我们只是换了扇窗挂它。
+                Diag.Step(string.Format("Embed: 标签搬到另一个窗口 cab=0x{0:X} pid={1} 容器=0x{2:X}",
+                    CabWindow.ToInt64(), ExplorerPid, Host.Handle.ToInt64()));
+            }
+            catch (Exception ex) { Diag.Log("Embed: 搬标签到另一个窗口失败 " + ex.Message); }
+        }
+
         // ==================================================================
         public void Close(string why = "")
         {

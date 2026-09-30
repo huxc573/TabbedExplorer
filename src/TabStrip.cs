@@ -105,6 +105,16 @@ namespace TabbedExplorer
         private string tipKey;
         private int dragFromIndex = -1;
         private int dragOverIndex = -1;
+        /// <summary>
+        /// 拖动中鼠标**跑出了标签条**（跨窗口拖拽，见 `DragOutStarted`）。
+        /// 一出界就把 `Capture` 拿住，这样跑到别的窗口上我们照样收得到 MouseMove / MouseUp。
+        /// </summary>
+        private bool dragOut;
+        /// <summary>
+        /// **别的窗口**拖过来的落点（`-1` = 没有）。由上层（`DesktopHub`）写，本类只负责画那条插入线。
+        /// 跟 `dragOverIndex` 分开：那个是「本条的拖动」，这个是「别人要插到我这儿的第几位」。
+        /// </summary>
+        private int dropHint = -1;
         /// <summary>在空白处按下左键后，鼠标有没有真的移动过（决定松手时是「拖窗口」还是「什么都没干」）。</summary>
         private bool blankDrag;
         /// <summary>空白处按下的位置（拖窗口前要比一下走了多远）。</summary>
@@ -319,6 +329,95 @@ namespace TabbedExplorer
             peer = source;
             if (source != null) source.peer = this;
             Redraw();
+        }
+
+        /// <summary>
+        /// 别的窗口拖过来时该插到第几位（`-1` = 没有落点，`0..Tabs.Count` = 插在哪条缝）。
+        /// 上层写、本类画 —— 竖排那份是镜像实例，setter 会顺手同步过去（不然只有一条画得出提示）。
+        /// </summary>
+        public int DropHint
+        {
+            get { return dropHint; }
+            set
+            {
+                if (dropHint == value) return;
+                dropHint = value;
+                TabStrip p = peer;
+                if (p != null && !p.IsDisposed) p.dropHint = value;
+                Redraw();
+            }
+        }
+
+        /// <summary>
+        /// 屏幕坐标对应的**插入下标**（`0..Tabs.Count`）。落在某标签的左/右半决定插它前面还是后面；
+        /// 落在标签之外（空白 / 内容区）一律 = 追加到末尾。
+        /// </summary>
+        internal int DropIndexAt(Point screen)
+        {
+            EnsureLayout();
+            Point p = PointToClient(screen);
+            int idx = Vertical ? VHitTest(p) : HitTest(p);
+            if (idx < 0 || idx >= bounds.Count) return tabs.Count;
+            Rectangle b = bounds[idx];
+            bool after = Vertical ? (p.Y > b.Top + b.Height / 2) : (p.X > b.Left + b.Width / 2);
+            return after ? idx + 1 : idx;
+        }
+
+        /// <summary>
+        /// 跨窗口拖拽：标签被拖出标签条（参数 = 被拖的标签下标）。
+        /// 跟条内重排是两条路 —— 这个只在上层要「并进别的窗口 / 另开一个」时才发。
+        /// </summary>
+        internal event Action<TabStrip, int> DragOutStarted;
+        /// <summary>拖着跑的时候每动一下发一次（参数 = 屏幕坐标）。上层拿它找落点、给目标窗口画提示。</summary>
+        internal event Action<TabStrip, int, Point> DragOutMoved;
+        /// <summary>在**标签条之外**松手（参数 = 屏幕坐标）。上层决定「并进别的窗口」还是「新开一个」。</summary>
+        internal event Action<TabStrip, int, Point> DragOutDropped;
+        /// <summary>拖出去了又拖回来（在自家标签条上松手 = 走正常的条内重排，跨窗口这条作废）。</summary>
+        internal event Action<TabStrip, int> DragOutEnded;
+
+        /// <summary>
+        /// 拖动中的一个统一收尾（出界检测 + 发事件）。横排 / 竖排共用 —— 两边的判定完全一样。
+        /// ⚠ 「左键还按着没」必须用 `Control.MouseButtons`：WinForms 在 MouseMove 的 `e.Button` 里
+        ///   经常给 `None`，拿它判会永远判成「没按」，跨窗口拖拽根本不触发。
+        /// </summary>
+        private void TrackDragOut(Point local, Point screen)
+        {
+            if (dragFromIndex < 0 || (Control.MouseButtons & MouseButtons.Left) == 0) return;
+
+            bool inside = ClientRectangle.Contains(local);
+            if (!inside && !dragOut)
+            {
+                dragOut = true;
+                dragOverIndex = -1;
+                Capture = true;               // 出了这一条仍然要收鼠标消息 —— 跨窗口拖拽的前提
+                if (DragOutStarted != null) DragOutStarted(this, dragFromIndex);
+                Redraw();
+            }
+            else if (inside && dragOut)
+            {
+                dragOut = false;
+                Capture = false;              // 拖回自家标签条了，鼠标捕获还回去（接着走正常的条内重排）
+                DropHint = -1;                // 拖回来了：目标窗口那条插入线撤掉
+                if (DragOutEnded != null) DragOutEnded(this, dragFromIndex);
+                Redraw();
+            }
+            if (dragOut && DragOutMoved != null) DragOutMoved(this, dragFromIndex, screen);
+        }
+
+        /// <summary>松手时若还拖在外面：清干净、把落点交给上层。返回 true = 这次松手已经消化掉了。</summary>
+        private bool FinishDragOut()
+        {
+            if (!dragOut) return false;
+            dragOut = false;
+            Capture = false;
+            int fi = dragFromIndex;
+            dragFromIndex = -1;
+            dragOverIndex = -1;
+            blankDrag = false;
+            DropHint = -1;
+            Redraw();
+            if (DragOutDropped != null) DragOutDropped(this, fi, Cursor.Position);
+            return true;
         }
 
         public delegate void IndexEventHandler(object sender, int index);
@@ -1161,6 +1260,18 @@ namespace TabbedExplorer
                 }
             }
 
+            // ---- **别的窗口**拖过来的落点：画一条插入线（自己的拖动走上面那条 `dragOverIndex`）----
+            // 画在标签条上「该插进去的那条缝」上，落点在末尾就画在最后一个标签的右沿。
+            if (dropHint >= 0 && tabs.Count > 0 && bounds.Count >= tabs.Count)
+            {
+                int hi = dropHint < bounds.Count ? dropHint : bounds.Count - 1;
+                Rectangle band = bounds[hi];
+                int hx = dropHint < bounds.Count ? band.Left : band.Right;
+                Pen hp = new Pen(Theme.Accent, stroke * 2);
+                g.DrawLine(hp, hx, band.Top, hx, band.Bottom);
+                hp.Dispose();
+            }
+
             // 底部与容器分隔
             g.Clip = oldClip;      // 右边那排按钮 / 加号不受上面那一刀的影响
 
@@ -1358,6 +1469,17 @@ namespace TabbedExplorer
                 g.DrawLine(dp, dr.Left, dragOverIndex < dragFromIndex ? dr.Top : dr.Bottom,
                                dr.Right, dragOverIndex < dragFromIndex ? dr.Top : dr.Bottom);
                 dp.Dispose();
+            }
+
+            // **别的窗口**拖过来的落点：竖排画在那一行的**上沿**（横排那套的竖版）
+            if (dropHint >= 0 && tabs.Count > 0 && bounds.Count >= tabs.Count)
+            {
+                int hi = dropHint < bounds.Count ? dropHint : bounds.Count - 1;
+                Rectangle band = bounds[hi];
+                int hy = dropHint < bounds.Count ? band.Top : band.Bottom;
+                Pen hp = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2));
+                g.DrawLine(hp, band.Left, hy, band.Right, hy);
+                hp.Dispose();
             }
             g.Clip = oldClip;
 
@@ -1676,6 +1798,10 @@ namespace TabbedExplorer
                 dragOverIndex = idx;
                 Redraw();
             }
+
+            // 出界 = 跨窗口拖拽（见 TrackDragOut）。⚠ 必须排在上面那条之后：
+            //   还在条内的时候 `dragOverIndex` 那条仍要照画插入线，两边互不干扰。
+            TrackDragOut(e.Location, Cursor.Position);
         }
 
         /// <summary>鼠标进标签条 —— 溢出的话滚动条从这儿开始显示（平时是隐的）。</summary>
@@ -1778,6 +1904,9 @@ namespace TabbedExplorer
                 dragOverIndex = idx;
                 Redraw();
             }
+
+            // 出界 = 跨窗口拖拽（竖排跟横排共用同一套判定）
+            TrackDragOut(e.Location, Cursor.Position);
         }
 
         private void VMouseDown(MouseEventArgs e)
@@ -1787,6 +1916,7 @@ namespace TabbedExplorer
             if (e.Button != MouseButtons.Left) return;
             ShowTip(null, null, Rectangle.Empty);
             dragFromIndex = -1;
+            dragOut = false;                 // 新一次按下：跨窗口拖拽状态清零
 
             // 顺序跟横排一致：窗口按钮 → 工具按钮 → 加号 → 图钉 → 标签 → 空白
             int w = WBtnAt(e.Location);
@@ -1837,6 +1967,9 @@ namespace TabbedExplorer
                 return;
             }
             if (e.Button != MouseButtons.Left) return;
+
+            // 拖出去了、松手时还在外面 ⇒ 跨窗口落点，交上层（并进别的窗口 / 另开一个）
+            if (FinishDragOut()) return;
 
             // 功能按钮：松手时鼠标还在同一颗上才算一次点击（跟横排同一套）
             if (pendingTool >= 0)
@@ -1889,6 +2022,7 @@ namespace TabbedExplorer
         {
             base.OnMouseDown(e);
             ShowTip(null, null, Rectangle.Empty);
+            dragOut = false;                 // 新一次按下：跨窗口拖拽状态清零
             if (Vertical) { VMouseDown(e); return; }
 
             // ---- 滚动条优先：它现在是贴顶那一整条，命中判定必须排在标签 / 按钮前面 ----
@@ -1992,6 +2126,9 @@ namespace TabbedExplorer
                 Redraw();
                 return;
             }
+
+            // 拖出去了、松手时还在外面 ⇒ 跨窗口落点，交上层（并进别的窗口 / 另开一个）
+            if (FinishDragOut()) return;
 
             // ---- 功能按钮：**松手才发**（松手时鼠标还在同一颗按钮上才算一次点击）----
             // ⚠ 用户报「点击历史记录图标，出菜单后闪一下就没了；按快捷键不会」。

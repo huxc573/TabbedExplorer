@@ -264,13 +264,13 @@ namespace TabbedExplorer
         /// <summary>可自定义的命令（顺序 = 设置窗口里显示的顺序）。</summary>
         public static readonly string[] HotkeyKeys = new string[]
         {
-            "newtab", "closetab", "nexttab", "prevtab", "history", "reopen", "favbar", "vtabs"
+            "newtab", "newwin", "closetab", "nexttab", "prevtab", "history", "reopen", "favbar", "vtabs"
         };
 
         /// <summary>各项的默认组合键（跟浏览器对齐那一套）。</summary>
         public static readonly string[] HotkeyDefaults = new string[]
         {
-            "Ctrl+T", "Ctrl+W", "Ctrl+Tab", "Ctrl+Shift+Tab", "Ctrl+H", "Ctrl+Shift+T", "Ctrl+Shift+B",
+            "Ctrl+T", "Ctrl+N", "Ctrl+W", "Ctrl+Tab", "Ctrl+Shift+Tab", "Ctrl+H", "Ctrl+Shift+T", "Ctrl+Shift+B",
             // 垂直侧边栏：跟 Edge 对齐 —— Ctrl+Shift+,（用户指定）
             "Ctrl+Shift+,"
         };

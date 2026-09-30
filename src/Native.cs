@@ -254,8 +254,24 @@ namespace TabbedExplorer
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
+        /// <summary>
+        /// 屏幕点上**最上层**的那扇窗（跨窗口拖标签的落点判定，见 `DesktopHub.FormAtScreen`）。
+        /// ⚠ 拿到的是子窗口句柄（可能是嵌进来的 explorer），要判归属得先 `GetAncestor(…, GA_ROOT)`。
+        /// </summary>
+        [DllImport("user32.dll")]
+        public static extern IntPtr WindowFromPoint(POINT pt);
+
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
+    }
+
+    /// <summary>屏幕坐标点（`WindowFromPoint` 用）。</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct POINT
+    {
+        public int X;
+        public int Y;
+        public POINT(int x, int y) { X = x; Y = y; }
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

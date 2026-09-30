@@ -281,6 +281,7 @@ namespace TabbedExplorer
             switch (cmd)
             {
                 case "newtab": return "新建标签页";
+                case "newwin": return "新建窗口";
                 case "closetab": return "关闭标签页";
                 case "nexttab": return "下一个标签页";
                 case "prevtab": return "上一个标签页";

@@ -255,6 +255,17 @@ namespace TabbedExplorer
         /// <summary>这个窗口算哪张虚拟桌面（Hub 的登记键）。窗口被挪到别的桌面时 Hub 会改掉它。</summary>
         internal string DesktopKey { get; set; }
 
+        /// <summary>
+        /// **额外窗口**（用户要的多窗口）：由「新建窗口」/ Ctrl+N / 把标签拖到窗口外面开出来的那一个。
+        /// 跟主窗口的区别只有三条：
+        ///   · Win+E **不给它**（Win+E 永远找 `Hub.forms` 里那张桌面的主窗口）；
+        ///   · 它**不从记忆里还原标签**（自己只有一个标签，拖过来的那个）；
+        ///   · 它的标签在保存时**合并**进这张桌面的桶里 —— 重启回到一个窗口，但标签一个不丢。
+        /// 还有一条行为差别：它的 X / 关到最后一个标签 = **真关这个窗口**（标签一起关、能捞回来），
+        /// 而主窗口那条路是「收进托盘」（它得一直接得住 Win+E）。
+        /// </summary>
+        internal bool IsExtra { get; set; }
+
         /// <summary>真退出中（托盘「退出」/`--quit`/系统关机），别再拦关闭。</summary>
         internal bool Quitting { get; set; }
 
@@ -332,6 +343,12 @@ namespace TabbedExplorer
             {
                 CycleTab(delta > 0 ? -1 : 1);
             };
+            // 跨窗口拖拽（用户要的多窗口）：拖出标签条 → 不是并进别的窗口，就是在鼠标位置另开一个。
+            // 落点判定全交给 Hub（它知道全进程有哪些窗口），本窗口只管把事件转过去。
+            tabStrip.DragOutStarted += delegate(TabStrip s, int i) { OnTabDragOutStart(i); };
+            tabStrip.DragOutMoved += delegate(TabStrip s, int i, Point p) { OnTabDragOutMove(p); };
+            tabStrip.DragOutDropped += delegate(TabStrip s, int i, Point p) { OnTabDragOutDrop(i, p); };
+            tabStrip.DragOutEnded += delegate(TabStrip s, int i) { OnTabDragOutEnd(); };
 
             favBar = new FavBar();
             favBar.ItemClicked += delegate(FavNode nd)
@@ -415,6 +432,11 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 垂直窗格图钉 -> 折叠窗格开关");
                 if (hub != null) hub.SetVTabCollapse(!Settings.VTabsCollapse);
             };
+            // 跨窗口拖拽：竖排窗格是**另一个实例**，事件得各接各的（跟标签条那套同名同义）
+            vPane.DragOutStarted += delegate(TabStrip s, int i) { OnTabDragOutStart(i); };
+            vPane.DragOutMoved += delegate(TabStrip s, int i, Point p) { OnTabDragOutMove(p); };
+            vPane.DragOutDropped += delegate(TabStrip s, int i, Point p) { OnTabDragOutDrop(i, p); };
+            vPane.DragOutEnded += delegate(TabStrip s, int i) { OnTabDragOutEnd(); };
             // 鼠标进出窗格 = 「临时展开成完整样式」的判据（Edge 那套折叠窗格）
             vPane.MouseEnter += delegate { PaneMouseMoved(true); };
             vPane.MouseLeave += delegate { PaneMouseMoved(false); };
@@ -1200,6 +1222,202 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 额外窗口露脸（用户要的多窗口，见 `IsExtra`）。跟 `ShowForUser` 有三处不同：
+        ///   · **不还原记忆标签** —— 拖过来的那个标签已经挂在里面了（挂完才 Show，见 Hub 那条路）；
+        ///     真一个都没有时才兜一个（`firstPath` 优先，否则「此电脑」）；
+        ///   · **不读记忆里的窗口位置** —— 拖出来的窗口就开在鼠标松手那儿（Hub 建窗体时已经摆好 bounds）；
+        ///   · **不判虚拟桌面** —— 它刚在当前桌面建出来，本来就在眼前。
+        /// ⚠ 不 `EnsureFirstTab`：那一条会去读记忆，额外窗口读记忆就成了「把主窗口那套又开一份」。
+        /// </summary>
+        internal void ShowExtra(string firstPath)
+        {
+            try
+            {
+                if (IsDisposed || Disposing) return;
+                if (!Visible) Show();
+                windowShown = true;
+                preloadBatch = false;
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                ActivateToFront();
+
+                if (hosts.Count == 0)
+                {
+                    if (!string.IsNullOrEmpty(firstPath) && IndexOfPath(firstPath) < 0) NewTab(firstPath);
+                    else NewTab(ExplorerView.ThisPcPath);
+                }
+                else if (activeIndex < 0) Activate(0);
+                else Activate(activeIndex);
+
+                MarkDirty();
+            }
+            catch (Exception ex) { Diag.Log("EmbedForm: ShowExtra 失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 把一批路径塞进「刚关掉的」栈（额外窗口整体关掉时，Hub 把它的标签转交给这张桌面的主窗口）。
+        /// 下标一律 -1 = 恢复时按 `newtabbeside` 落位 —— 它们本来在另一个窗口里，原位在这个窗口没意义。
+        /// </summary>
+        internal void PushClosedTabs(List<string> paths)
+        {
+            if (paths == null) return;
+            for (int i = 0; i < paths.Count; i++)
+            {
+                string p = paths[i];
+                if (!PathRules.Restorable(p)) continue;
+                ClosedTab rec;
+                rec.Path = p;
+                rec.Index = -1;
+                closedTabs.RemoveAll(delegate(ClosedTab c) { return PathRules.Same(c.Path, p); });
+                closedTabs.Add(rec);
+            }
+            while (closedTabs.Count > ClosedKeep) closedTabs.RemoveAt(0);
+            Diag.Step("EmbedForm: 收了 " + paths.Count + " 个别人关掉的标签进恢复栈（栈里 " + closedTabs.Count + " 个）");
+        }
+
+        // ==================================================================
+        // 跨窗口拖标签（用户要的多窗口 —— 体验照浏览器那套）
+        // ==================================================================
+
+        /// <summary>拖出标签条：清一遍落点提示（真正的高亮由 `OnTabDragOutMove` 一路画）。</summary>
+        private void OnTabDragOutStart(int idx)
+        {
+            Diag.Step("EmbedForm: 标签拖出标签条 idx=" + idx);
+            if (hub != null) hub.BeginTabDrag(this);
+        }
+
+        /// <summary>拖着跑：让 Hub 找落点，并给命中的那个窗口画插入线。</summary>
+        private void OnTabDragOutMove(Point screen)
+        {
+            if (hub != null) hub.UpdateTabDrag(this, screen);
+        }
+
+        /// <summary>在标签条之外松手：并进别的窗口，或者在鼠标位置另开一个。</summary>
+        private void OnTabDragOutDrop(int idx, Point screen)
+        {
+            if (hub != null) hub.EndTabDrag(this, idx, screen);
+        }
+
+        /// <summary>拖出去了又拖回来（在自己这条上松手）—— 落点提示撤掉，走正常的条内重排。</summary>
+        private void OnTabDragOutEnd()
+        {
+            if (hub != null) hub.CancelTabDrag(this);
+        }
+
+        /// <summary>Hub 用它给「被拖到本窗口上」的落点画那条插入线（`-1` = 撤掉）。</summary>
+        internal void SetDropHint(int at)
+        {
+            if (tabStrip != null && !tabStrip.IsDisposed) tabStrip.DropHint = at;
+        }
+
+        /// <summary>屏幕坐标对应的插入下标（`0..Tabs.Count`）—— 跨窗口拖拽的落点判定。</summary>
+        internal int DropIndexAt(Point screen)
+        {
+            TabStrip bar = TabBar;
+            if (bar == null || bar.IsDisposed) return -1;
+            return bar.DropIndexAt(screen);
+        }
+
+        /// <summary>
+        /// 把一个标签从本窗口**摘下来**（不进恢复栈、不销毁它的 explorer）—— 跨窗口拖拽的中转。
+        /// ⚠ 只管「列表」这一侧：控件那一侧的换爹由目标窗口调 `ExplorerHost.ReparentTo` 完成。
+        /// </summary>
+        private void DetachHost(int idx)
+        {
+            ExplorerHost h = hosts[idx];
+            h.Host.Visible = false;
+            hosts.RemoveAt(idx);
+            activeIndex = -1;                       // 索引全变了，重新算
+            if (revealPending == h) { revealPending = null; BeatReveal(false); }
+            tabStrip.RemoveTab(idx);
+        }
+
+        /// <summary>
+        /// 把一个**别人窗口里**的标签挂到本窗口的第 <paramref name="at"/> 位（`-1` = 末尾），
+        /// 并把它的内容区重新 `SetParent` 到本窗口（跨进程嵌窗换容器的**必做**一步，
+        /// 父句柄一换原来那个就作废了，漏了就是黑块 + explorer 进程收不回）。
+        /// </summary>
+        private void AttachHost(ExplorerHost h, int at)
+        {
+            if (h == null) return;
+            if (at < 0 || at > hosts.Count) at = hosts.Count;
+            h.Host.Visible = false;
+            hosts.Insert(at, h);
+            if (activeIndex >= at) activeIndex++;    // 同 AddHost：插在前面它往后挪一格
+            tabStrip.InsertTab(at, h.CurrentDisplayName);
+            tabStrip.SetIcon(at, h.TabIcon);
+            tabStrip.SetPath(at, TabStrip.PathLine(LivePath(h)));
+            h.ReparentTo(content);
+            Activate(at);
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// 把一个标签**搬到另一个窗口**（拖标签到别的窗口 / 拖出去开新窗）。
+        /// 真搬 = `hosts` 与控件一起走：**不重开 explorer**，目录、滚动位置、历史全都原样保留。
+        ///
+        /// 还没就绪的标签（正在起进程 / 懒加载占位）搬不了控件 —— 它的 `Ready` 等回调是建它时
+        /// 用闭包挂在**本窗口**上的，换爹之后本窗口收到 Ready 只会「hosts 里找不到它」直接跳过，
+        /// 目标窗口就永远等不到内容。这种退化成「在目标窗口重开一个」：语义上一样是「它过去了」。
+        /// </summary>
+        internal void MoveTabTo(EmbedForm target, int idx, int at)
+        {
+            if (target == null || target == this) return;
+            if (target.IsDisposed || target.Disposing || IsDisposed || Disposing) return;
+            if (idx < 0 || idx >= hosts.Count) return;
+            ExplorerHost h = hosts[idx];
+            if (h == null) return;
+
+            if (!h.Settled || h.CabWindow == IntPtr.Zero)
+            {
+                string p = LivePath(h);
+                string t = idx < tabStrip.Tabs.Count ? tabStrip.Tabs[idx].Title : null;
+                Diag.Step("EmbedForm: 标签还没就绪，改成在目标窗口重开「" + p + "」");
+                CloseTab(idx);
+                target.NewTab(PathRules.Restorable(p) ? p : ExplorerView.ThisPcPath, t, true, at);
+                return;
+            }
+
+            DetachHost(idx);
+            target.AttachHost(h, at);
+            Diag.Step("EmbedForm: 标签搬到另一个窗口 idx=" + idx + " -> " + (at < 0 ? "末尾" : at.ToString()));
+
+            MarkDirty();
+            target.MarkDirty();
+
+            // 本窗口被搬空了：额外窗口直接关掉、主窗口收进托盘
+            //（跟「关掉最后一个标签」同一个口径 —— 主窗口是 Win+E 的落点，得一直接得住）
+            if (hosts.Count == 0)
+            {
+                if (IsExtra) Close();
+                else HideToTray();
+            }
+        }
+
+        /// <summary>
+        /// 标签右键「移到新窗口」：在当前窗口右下错开一点的位置开一扇新窗，把标签搬过去。
+        /// 拖拽那条路的菜单版 —— 触控板 / 窗口挤在一起时鼠标不好拖。
+        /// </summary>
+        private void MoveTabToNewWindow(int idx)
+        {
+            if (hub == null || idx < 0 || idx >= hosts.Count) return;
+            // 最大化时用「还原态的尺寸/位置」，否则新窗口会跟主窗口一样铺满整屏（还错开到屏幕外）
+            Rectangle src = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (src.Width < Px(200) || src.Height < Px(150)) src = new Rectangle(Left, Top, Px(960), Px(620));
+            Rectangle b = src;
+            b.Offset(Px(32), Px(32));
+            Rectangle wa = Screen.FromRectangle(b).WorkingArea;
+            if (b.Right > wa.Right) b.X = Math.Max(wa.Left, wa.Right - b.Width);
+            if (b.Bottom > wa.Bottom) b.Y = Math.Max(wa.Top, wa.Bottom - b.Height);
+            if (b.Left < wa.Left) b.X = wa.Left;
+            if (b.Top < wa.Top) b.Y = wa.Top;
+
+            EmbedForm nf = hub.CreateExtraWindow(b);
+            MoveTabTo(nf, idx, -1);
+            nf.ShowExtra(null);
+            Diag.Step("EmbedForm: 右键「移到新窗口」idx=" + idx);
+        }
+
+        /// <summary>
         /// 「用户在外面开了一个文件夹，窗体现在在我们手里」—— 需要现身把它露出来。
         /// 两个入口：① 收编用户自己开出来的窗口（`AdoptWindow`）；② shell 的窗口「转生」
         /// 过来之后（`DesktopHub.TakeOverShellWindow`）—— 那一下同样是他刚在别的程序里点了
@@ -1244,6 +1462,10 @@ namespace TabbedExplorer
             // 而调用点下面那句「已经开着、切过去」的判重在它之后，拦不住（日志里先「用掉备用标签」
             // 再「已经开着 idx=3」就是这个顺序）。只在窗口真的空着时才需要兜底。
             if (hosts.Count > 0) return;
+
+            // ⚠ 额外窗口（见 `IsExtra`）**不读记忆** —— 它自己那个标签是拖过来的，
+            //   读记忆就成了「把主窗口那一套又原样开一份」。
+            if (IsExtra) { NewTab(ExplorerView.ThisPcPath); return; }
 
             if (RestoreRememberedTabs()) return;
             NewTab(ExplorerView.ThisPcPath);
@@ -1486,8 +1708,9 @@ namespace TabbedExplorer
         /// <summary>
         /// 把窗口提到前台。最小化时先还原 —— 光调 SetForegroundWindow 会被 Windows 的前台锁定
         /// 拒掉（表现就是只闪任务栏、窗口不上来）；借当前前台线程的输入队列一用才有资格。
+        /// `internal`：Hub 把标签并进另一个窗口之后要把那扇窗顶上来（见 `DesktopHub.EndTabDrag`）。
         /// </summary>
-        private void ActivateToFront()
+        internal void ActivateToFront()
         {
             IntPtr h = Handle;
             if (NativeMethods.IsIconic(h)) NativeMethods.ShowWindow(h, 9);   // SW_RESTORE
@@ -1557,6 +1780,12 @@ namespace TabbedExplorer
             switch (cmd)
             {
                 case "newtab": HotkeyNewTab(); return;
+                case "newwin":
+                    // 焦点在我们自己的控件（标签条 / 标题栏）上时走这条兜底路 ——
+                    // 主路（焦点在 explorer 里）由 WinEHook + Hub 直接拦掉，到不了这儿。
+                    Diag.Step("EmbedForm: 热键 " + Hotkeys.Combo(cmd) + " -> 新建窗口");
+                    if (hub != null) hub.OpenExtraWindow(null);
+                    return;
                 case "closetab": HotkeyCloseTab(); return;
                 case "nexttab": CycleTab(1); return;
                 case "prevtab": CycleTab(-1); return;
@@ -2606,7 +2835,16 @@ namespace TabbedExplorer
 
             if (hosts.Count == 0)
             {
-                // 最后一个标签被关 ⇒ 收进托盘（**不是退出**）。
+                // 额外窗口（多窗口）：最后一个标签被关 = 这个窗口没用了 ⇒ **真关掉它**
+                // （用户选的口径：「关闭窗口把窗口里所有标签一起关掉」；主窗口那条路不能这么走，
+                //   它是 Win+E 的落点，得一直接得住）。
+                if (IsExtra)
+                {
+                    Diag.Step("EmbedForm: 额外窗口的最后一个标签被关 -> 关掉这个窗口");
+                    Close();     // 走 OnFormClosing 里 IsExtra 那条路（摘登记 + 标签进主窗口的恢复栈）
+                    return;
+                }
+                // 主窗口：最后一个标签被关 ⇒ 收进托盘（**不是退出**）。
                 // 进程一退 Win+E 就没人接了，系统就会去开原生资源管理器 —— 正是用户報的那个问题。
                 Diag.Step("EmbedForm: 最后一个标签被关，收进托盘");
                 HideToTray();
@@ -2828,6 +3066,13 @@ namespace TabbedExplorer
                 }
                 string p = target;
                 Defer(delegate { NewTab(p); });
+            }));
+            // 多窗口：把这个标签**搬**到一扇新窗口里（不改内容、不重开 explorer）——
+            // 拖拽那条路的菜单版，鼠标不好拖的时候用（触控板 / 窗口挤在一起）。
+            m.Add(Mi("移到新窗口", delegate
+            {
+                int k = idx;
+                Defer(delegate { MoveTabToNewWindow(k); });
             }));
             // 交给系统开一扇**原生**窗口（不是我们的标签）：用户要拿它跟我们的嵌法做对照。
             // 关键是 Hub 那边要开一个短暂的让行期 —— 否则这扇窗会在零点几秒后被我们自己的
@@ -3217,10 +3462,21 @@ namespace TabbedExplorer
                                || e.CloseReason == CloseReason.TaskManagerClosing;
             if (!Quitting && !systemShutdown && e.CloseReason == CloseReason.UserClosing)
             {
-                Diag.Step("EmbedForm: 收到关闭请求 reason=" + e.CloseReason + " -> 只收进托盘，不退进程");
-                e.Cancel = true;
-                HideToTray();
-                return;
+                if (!IsExtra)
+                {
+                    Diag.Step("EmbedForm: 收到关闭请求 reason=" + e.CloseReason + " -> 只收进托盘，不退进程");
+                    e.Cancel = true;
+                    HideToTray();
+                    return;
+                }
+                // 额外窗口（多窗口）：X 就是**关掉这个窗口** —— 它的标签一起关
+                // （用户选的口径）。人就在等着它消失，所以不 Cancel、直接往下走。
+                Diag.Step("EmbedForm: 额外窗口收到关闭请求 -> 真关（标签一并关掉）");
+                // ⚠ 顺序要紧：① 先摘登记（不然下面 SaveNow 会把「正在关掉的标签」又写进记忆，
+                //   表现就是关掉了却还在）；② 再把它们转交给本桌面主窗口的恢复栈（Ctrl+Shift+T 能捞回来）。
+                if (hub != null) hub.DropExtra(this);
+                List<string> gone = TabPaths();
+                if (hub != null) hub.RememberClosedTabs(DesktopKey, gone);
             }
 
             Diag.Step(string.Format("EmbedForm: OnFormClosing reason={0}，还有 {1} 个标签",

@@ -3075,49 +3075,51 @@ namespace TabbedExplorer
         private static string SideWord(bool before)
         {
             if (Settings.VTabs) return before ? "上方" : "下方";
-            return before ? "左边" : "右边";
+            return before ? "左侧" : "右侧";
         }
 
-        /// <summary>标签上右键：复制 / 打开 / 加进书签 / 关（含「关闭其它 / 前 / 后」—— 用户新增）。</summary>
+        /// <summary>
+        /// 标签上右键。**分五组，组内按「先看的、后动的」排**（用户：「标签页右键菜单有点混乱了」）：
+        ///   ① 这个标签自己：置顶 / 复制 / 移到新窗口
+        ///   ② 收藏与交给外面：加书签栏 / 用原生资源管理器打开
+        ///   ③ 把这个位置带走：复制文件夹名 / 复制完整路径
+        ///   ④ 关闭（含「其它的 / 左侧 / 右侧 / 选中的一批 / 合并同路径」）
+        ///   ⑤ 全局：恢复关闭的标签页 / 设置窗口
+        ///
+        /// ⚠ ④ 组内部是**危险度递增**：越往下越是一次动掉好几个标签，手滑代价最大的那两条压在最下面。
+        /// ⚠ 「在新标签页打开」**已删** —— 它跟「复制标签页」原来**是同一份代码**（都是
+        ///    `NewTab(target)` 开在按设置定好的位置），两个名字一个动作，正是让人看着乱的原因之一。
+        ///    现在只留「复制标签页」，语义明确 = **在本标签右边开一份**（浏览器 Duplicate 那套，
+        ///    不看 `newtabbeside`：复制出来的东西就该贴在本体旁边）。
+        /// </summary>
         private void ShowTabMenu(int idx)
         {
             if (idx < 0 || idx >= hosts.Count || IsDisposed || Disposing) return;
             string title = tabStrip.Tabs[idx].Title;
             string live = LivePath(hosts[idx]);
             string target = PathRules.Restorable(live) ? live : hosts[idx].TargetPath;
+            bool canPath = PathRules.Restorable(target);
 
             List<PopItem> m = new List<PopItem>();
-            // 置顶（用户新增）：菜单文字随当前状态变，点一下就在两边切
+
+            // ---------------- ① 这个标签自己 ----------------
+            // 置顶：菜单文字随当前状态变，点一下就在两边切
             bool pinNow = hosts[idx].Pinned;
-            m.Add(Mi("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
-            m.Add(Mi("复制完整路径", delegate { CopyText(target, "完整路径"); }));
-            m.Add(SepItem());
             m.Add(Mi(pinNow ? "取消置顶标签页" : "置顶标签页", delegate
             {
                 int k = idx;
                 bool want = !pinNow;
                 Defer(delegate { SetTabPinned(k, want); });
             }));
-            m.Add(Mi("在新标签页打开", delegate
+            // 复制：在**本标签右边**开一份。⚠ 落点 `idx + 1` 要现在就定死 ——
+            // 交给 `Defer` 之后再算，中间万一有别的标签动过就插错地方了。
+            m.Add(Mi("复制标签页", canPath ? (Action)delegate
             {
-                if (!PathRules.Restorable(target))
-                {
-                    Toast.Show(NotifyItems.OpenNoPath, "开不了", "这个位置没有真实路径（库/虚拟文件夹）。");
-                    return;
-                }
                 string p = target;
-                Defer(delegate { NewTab(p); });
-            }));
-            m.Add(Mi("复制标签页", delegate
-            {
-                if (!PathRules.Restorable(target))
-                {
-                    Toast.Show(NotifyItems.CopyNoPath, "复制不了", "这个位置没有真实路径（库/虚拟文件夹）。");
-                    return;
-                }
-                string p = target;
-                Defer(delegate { NewTab(p); });
-            }));
+                int ins = idx + 1;
+                string t = string.IsNullOrEmpty(title) ? PathRules.Friendly(PathRules.Store(p)) : title;
+                Defer(delegate { NewTab(p, t, true, ins); });
+            } : null));
             // 多窗口：把这个标签**搬**到一扇新窗口里（不改内容、不重开 explorer）——
             // 拖拽那条路的菜单版，鼠标不好拖的时候用（触控板 / 窗口挤在一起）。
             m.Add(Mi("移到新窗口", delegate
@@ -3125,6 +3127,10 @@ namespace TabbedExplorer
                 int k = idx;
                 Defer(delegate { MoveTabToNewWindow(k); });
             }));
+
+            // ---------------- ② 收藏 / 交给外面开 ----------------
+            m.Add(SepItem());
+            m.Add(Mi("添加到书签栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
             // 交给系统开一扇**原生**窗口（不是我们的标签）：用户要拿它跟我们的嵌法做对照。
             // 关键是 Hub 那边要开一个短暂的让行期 —— 否则这扇窗会在零点几秒后被我们自己的
             // 捕获逻辑收编成标签，点一下就白点了（见 DesktopHub.OpenNative）。
@@ -3137,17 +3143,30 @@ namespace TabbedExplorer
                     string p = target;
                     Defer(delegate { if (hub != null) hub.OpenNative(p); });
                 }));
-            m.Add(Mi("添加到书签栏", delegate { Defer(delegate { AddToFavorites(target); }); }));
-            // 跟空白右键、工具行那一项用**同一个名字**：三处说的是同一件事，
-            // 名字不一致会让人以为是两个功能（用户报过）。
-            m.Add(Mi("恢复关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
-                delegate { Defer(ReopenClosedTab); }));
+
+            // ---------------- ③ 把这个位置带走（剪贴板）----------------
+            m.Add(SepItem());
+            m.Add(Mi("复制文件夹名", delegate { CopyText(title, "文件夹名"); }));
+            m.Add(Mi("复制完整路径", delegate { CopyText(target, "完整路径"); }));
+
+            // ---------------- ④ 关闭 ----------------
             m.Add(SepItem());
             m.Add(Mi("关闭标签页(" + Hotkeys.Combo("closetab") + ")", delegate { Defer(delegate { CloseTab(idx); }); }));
-            // ---- 合并同路径标签页（用户新增）----
-            // 同一个位置开了好几个标签（记忆文件里的重复行、连开两次、收编来的窗跟已有标签撞了路径）时，
-            // 给一条「把它们收成一页」的路 —— 关掉其余同路径的，**只留右键点的这一个**。
-            // ⚠ 没有重复就置灰（跟「关闭其它标签页」同一个规矩）：点了什么都不发生的项不如直接灰着。
+            // 只剩一个标签 / 当前就在最前（最后）时置灰 —— 点了什么也不发生的项还不如直接灰着
+            m.Add(Mi("关闭其它标签页", hosts.Count > 1
+                ? (Action)delegate { Defer(delegate { CloseOtherTabs(idx); }); } : null));
+            m.Add(Mi("关闭" + SideWord(true) + "标签页", idx > 0
+                ? (Action)delegate { Defer(delegate { CloseTabsBefore(idx); }); } : null));
+            m.Add(Mi("关闭" + SideWord(false) + "标签页", idx < hosts.Count - 1
+                ? (Action)delegate { Defer(delegate { CloseTabsAfter(idx); }); } : null));
+            // 多选了一批（Ctrl / Shift 点出来的）→ 给一条「一次关掉它们」。
+            // 只在「右键点的这一个也在选中里」时出现 —— 否则用户会以为关的是他点的那一个。
+            if (tabStrip.HasMultiSelection && tabStrip.IsSelected(idx))
+                m.Add(Mi("关闭选中的 " + tabStrip.SelectedCount + " 个标签页",
+                    delegate { Defer(CloseSelectedTabs); }));
+            // 合并同路径标签页：同一个位置开了好几个标签（记忆文件里的重复行、连开两次、
+            // 收编来的窗跟已有标签撞了路径）时，给一条「把它们收成一页」的路 ——
+            // 关掉其余同路径的，**只留右键点的这一个**。没有重复就置灰。
             string myKey = PathKeyOf(hosts[idx]);
             int samePath = 0;
             if (myKey.Length > 0)
@@ -3157,20 +3176,13 @@ namespace TabbedExplorer
             }
             m.Add(Mi(samePath > 0 ? "合并同路径标签页（关掉另外 " + samePath + " 个）" : "合并同路径标签页",
                 samePath > 0 ? (Action)delegate { Defer(delegate { MergeSamePathTabs(idx); }); } : null));
-            // ---- 多选了一批（Ctrl / Shift 点出来的）→ 给一条「一次关掉它们」----
-            // 只在「右键点的这一个也在选中里」时出现 —— 否则用户会以为关的是他点的那一个。
-            if (tabStrip.HasMultiSelection && tabStrip.IsSelected(idx))
-                m.Add(Mi("关闭选中的 " + tabStrip.SelectedCount + " 个标签页",
-                    delegate { Defer(CloseSelectedTabs); }));
-            // ---- 用户新增的三条（跟浏览器右键对表）----
-            // 只剩一个标签 / 当前就在最前（最后）时置灰 —— 点了什么也不发生的项还不如直接灰着
-            m.Add(Mi("关闭其它标签页", hosts.Count > 1
-                ? (Action)delegate { Defer(delegate { CloseOtherTabs(idx); }); } : null));
-            m.Add(Mi("关闭" + SideWord(true) + "标签页", idx > 0
-                ? (Action)delegate { Defer(delegate { CloseTabsBefore(idx); }); } : null));
-            m.Add(Mi("关闭" + SideWord(false) + "标签页", idx < hosts.Count - 1
-                ? (Action)delegate { Defer(delegate { CloseTabsAfter(idx); }); } : null));
+
+            // ---------------- ⑤ 全局 ----------------
+            // 跟空白右键、工具行那一项用**同一个名字**：三处说的是同一件事，
+            // 名字不一致会让人以为是两个功能（用户报过）。
             m.Add(SepItem());
+            m.Add(Mi("恢复关闭的标签页(" + Hotkeys.Combo("reopen") + ")",
+                delegate { Defer(ReopenClosedTab); }));
             m.Add(Mi("更多选项（设置窗口）", delegate { Defer(ShowSettingsWindow); }));
 
             Rectangle b = TabBar.TabBounds(idx);

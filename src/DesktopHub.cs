@@ -2009,6 +2009,19 @@ namespace TabbedExplorer
             Diag.Step("Hub: 侧边栏不透明度 -> " + Settings.VPaneAlpha + "%");
         }
 
+        /// <summary>
+        /// 垂直侧边栏里**书签段**的高度（逻辑像素，0 = 自动）—— 用户在标签区与书签段之间
+        /// 那根分割条上拖出来的，拖完记住。数值项，改完所有窗口一起重排。
+        /// 不进托盘菜单（它就靠拖，没有对应的菜单项），所以不用 `RefreshTrayMenu`。
+        /// </summary>
+        public void SetFavBandHeight(int h)
+        {
+            if (Settings.FavBandHeight == h) return;
+            Settings.SetFavBandHeight(h);
+            VerticalAll();
+            Diag.Step("Hub: 书签段高度 -> " + Settings.FavBandHeight + "（逻辑像素）");
+        }
+
         private void VerticalAll()
         {
             foreach (EmbedForm f in AllForms())
@@ -2127,6 +2140,7 @@ namespace TabbedExplorer
             SetVerticalTabs(s.VTabs);
             SetVTabCollapse(s.VTabsCollapse);
             SetVPaneAlpha(s.VPaneAlpha);
+            SetFavBandHeight(s.FavBandHeight);
             SetDebug(s.Debug);
         }
 

@@ -115,6 +115,12 @@ namespace TabbedExplorer
         private bool paneHover;
         /// <summary>竖排书签区已经读过一次数据了（书签一个都没有时也置位，免得每次排版都重读）。</summary>
         private bool favBandLoaded;
+        /// <summary>
+        /// 正在拖书签段顶上那根分割条时的高度（设备像素，0 = 没在拖）。
+        /// 拖动全程只改这个字段 + 重排（**不落盘**）—— 每次 MOVE 都写 settings.json 是不能接受的，
+        /// 松手时才走 `Hub.SetFavBandHeight` 存一次、广播给其余窗口（见 FavBar.BandResizeEnded）。
+        /// </summary>
+        private int favBandDragH;
 
         /// <summary>标签条空白处右键时鼠标在哪儿 —— 菜单要弹在那个点上。</summary>
         private Point blankAt;
@@ -385,6 +391,27 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 书签栏右键 -> 隐藏");
                 if (hub != null) hub.SetFavBar(false);
             };
+            // ---- 竖排：拖顶上那根分割条改书签段高度 ----
+            // 拖动中途只**就地重排**（每次 MOVE 都写 settings.json 是不能接受的）；松手才存一次、
+            // 并广播给其余窗口（它们各自也有一模一样的一段）。
+            favBar.BandResized += delegate(int h)
+            {
+                favBandDragH = h;
+                DoLayout();
+            };
+            favBar.BandResizeEnded += delegate
+            {
+                int px = favBandDragH;
+                favBandDragH = 0;
+                if (px > 0)
+                {
+                    int logical = (int)Math.Round(px / DpiScale);
+                    Diag.Step("EmbedForm: 书签段高度 -> " + logical + "（逻辑像素）");
+                    if (hub != null) hub.SetFavBandHeight(logical);
+                    else Settings.SetFavBandHeight(logical);
+                }
+                DoLayout();     // 兜一道：即使上面早退（值没变），本窗口也照当前值重排一次
+            };
             favBar.Visible = false;
 
             // ---- 垂直侧边栏的左侧窗格 ----
@@ -558,6 +585,22 @@ namespace TabbedExplorer
         // ==================================================================
 
         /// <summary>
+        /// 竖排书签段要多高（设备像素）。
+        /// 优先级：**正在拖的那一下**（`favBandDragH`）&gt; 用户拖过并记住的高度（`Settings.FavBandHeight`）
+        /// &gt; 自动（按书签条数算，最多占窗格高的三分之一）。
+        /// ⚠ 记住的值先夹到 `MinBandHeight`：矮到比「标题行 + 一行」还小的话这一段就整段没了，
+        ///   顶上那根分割条跟着消失，用户再也拖不回来（手改 settings.json 也能踩到，所以这儿兜一道）。
+        /// </summary>
+        private int FavBandHeight(int hostH)
+        {
+            int auto = favBar.PreferredVerticalHeight(Math.Max(0, hostH / 3));
+            int want = favBandDragH;
+            if (want <= 0 && Settings.FavBandHeight > 0) want = Px(Settings.FavBandHeight);
+            if (want <= 0) return auto;
+            return Math.Max(favBar.MinBandHeight, want);
+        }
+
+        /// <summary>
         /// 手动布局，两种模式各走一路：
         ///   横向（默认）：标签条 →（书签栏）→ 内容；
         ///   垂直（Ctrl+Shift+,）：左栏一整列（工具行 / 标签 / 书签区 / 窗口按钮都归窗格）+ 右侧内容，
@@ -609,11 +652,12 @@ namespace TabbedExplorer
                     {
                         favBar.Vertical = true;                       // 必须是「竖排」才能算高度
                         favBar.SectionOpen = favBarOn;
+                        // 只有摊开态才给拖顶上那根分割条（收起态只剩个标题行，拖它没意义）
+                        favBar.Resizable = favBarOn;
                         // 第一次摆进来时还没读过数据 —— 不先读一次就算不出它要多高。
                         // ⚠ 只读一次：书签一个都没有时 Count 恒为 0，不拿标记挡住就会每次排版都重读一遍。
                         if (!favBandLoaded) { favBandLoaded = true; favBar.Reload(); }
-                        band = favBarOn ? favBar.PreferredVerticalHeight(Math.Max(0, r.Height / 3))
-                                        : favBar.HeaderHeight;
+                        band = favBarOn ? FavBandHeight(r.Height) : favBar.HeaderHeight;
                     }
                     vPane.BookmarkBand = band;
                     vPane.SetBounds(r.Left, r.Top, show, r.Height);

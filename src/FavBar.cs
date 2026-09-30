@@ -33,6 +33,10 @@ namespace TabbedExplorer
         private const int VRowL = 26;
         /// <summary>竖排时顶上那一行（星标 + 「书签」）的高度。</summary>
         private const int VHeadL = 28;
+        /// <summary>竖排时右侧滚动条的宽度（逻辑像素）。</summary>
+        private const int VScrollWL = 7;
+        /// <summary>竖排时**顶上那几像素**算「可拖的分割条」（逻辑像素）。</summary>
+        private const int VResizeHotL = 5;
 
         private static readonly float DpiScale = ReadDpi();
 
@@ -65,6 +69,17 @@ namespace TabbedExplorer
         private int hoverIndex = -1;
         private bool hoverLead;
         private int scrollX;                 // 内容滚了多少（横排=左移，竖排=上移）
+
+        // ---- 竖排：顶上的可拖分割条 + 右侧的纵向滚动条 ----
+        private bool resizable;              // 现在允许拖分割条吗（只有书签段摊开着才允许）
+        private bool hoverResize;            // 鼠标压在那根线上
+        private bool resizeDrag;             // 正在拖那根线
+        // ⚠ 拖的那一下**控件自己在变高变矮**（顶边跟着鼠标走），拿控件坐标算必然自激
+        //   ⇒ 一律用屏幕坐标跟按下那一刻的高度算。
+        private int resizeY0;                // 按下时的屏幕 Y
+        private int resizeH0;                // 按下时本控件的高度（= 那一刻的书签段高）
+        private bool thumbDrag;              // 正在拖滚动条滑块
+        private int thumbY0, thumbScroll0, thumbSpan, thumbMax;
         private int contentWidth;
         private int contentHeight;
         private bool vertical;
@@ -97,6 +112,62 @@ namespace TabbedExplorer
         /// 上层拿它给书签段留位置（见 `EmbedForm.DoLayout`）。
         /// </summary>
         public int HeaderHeight { get { return VHeadH; } }
+
+        /// <summary>
+        /// 竖排书签段的**最小**高度（标题行 + 一行书签）。拖分割条时就卡在这 ——
+        /// 让它能拖到 0 的话，这一段整个消失，就再也没地方把那根线抓回来了。
+        /// </summary>
+        public int MinBandHeight { get { return VHeadH + VRowH; } }
+
+        /// <summary>
+        /// 现在允许拖顶上那根分割条吗（上层按「书签段摊开着」设，见 `EmbedForm.DoLayout`）。
+        /// 收起态那一截只剩个标题行，拖它没有意义；不给的话顶上那几像素照旧算标题行的命中。
+        /// </summary>
+        public bool Resizable
+        {
+            get { return resizable; }
+            set
+            {
+                if (resizable == value) return;
+                resizable = value;
+                if (!value) hoverResize = false;
+                Invalidate();
+            }
+        }
+
+        // ---- 竖排纵向滚动条：画 / 命中 / 拖滑块**共用这两份矩形**（各算一次迟早错位）----
+
+        private int VScrollW { get { return Px(VScrollWL); } }
+
+        /// <summary>整条轨道的矩形（装得下、或不是竖排 → Empty）。</summary>
+        private Rectangle VTrack()
+        {
+            if (!vertical) return Rectangle.Empty;
+            if (Height - VHeadH < Px(16)) return Rectangle.Empty;
+            if (contentHeight <= Height) return Rectangle.Empty;   // 装得下就别摆一根多余的条
+            return new Rectangle(Width - VScrollW - Px(1), VHeadH + Px(1),
+                                 VScrollW, Height - VHeadH - Px(2));
+        }
+
+        /// <summary>滑块的矩形（没轨道 → Empty）。</summary>
+        private Rectangle VThumb()
+        {
+            Rectangle t = VTrack();
+            if (t.IsEmpty) return Rectangle.Empty;
+            int maxScroll = Math.Max(1, contentHeight - Height);
+            int th = (int)((long)t.Height * Height / Math.Max(1, contentHeight));
+            if (th < Px(20)) th = Px(20);
+            if (th > t.Height) th = t.Height;
+            int ty = t.Top + (int)((long)(t.Height - th) * scrollX / maxScroll);
+            return new Rectangle(t.Left, ty, t.Width, th);
+        }
+
+        /// <summary>竖排里鼠标是不是压在那根**可拖的分割条**上（书签段顶边那几像素）。</summary>
+        private bool OnDividerHot(Point p)
+        {
+            if (!vertical || !resizable) return false;
+            return p.Y < Px(VResizeHotL);
+        }
 
         /// <summary>
         /// 竖排时书签段摊开着没。只影响**画**（箭头方向、提示文案）——
@@ -154,6 +225,13 @@ namespace TabbedExplorer
         public event EventHandler Reloaded;
         /// <summary>右键选了「隐藏书签栏」—— 真正隐藏由 Hub 做（它要同时刷托盘菜单和所有窗口）。</summary>
         public event EventHandler HideRequested;
+        /// <summary>
+        /// 竖排：用户在**标签区与书签段之间那根横条**上拖，报出**新的书签段高度**（设备像素）。
+        /// 拖动全程一路报（宿主拿它实时重排），松手才落盘 —— 见 `BandResizeEnded`。
+        /// </summary>
+        public event Action<int> BandResized;
+        /// <summary>那根横条拖完了 —— 宿主这时候才把高度写进设置、广播给其余窗口。</summary>
+        public event Action BandResizeEnded;
 
         public FavBar()
         {
@@ -254,7 +332,10 @@ namespace TabbedExplorer
         {
             if (vertical)
             {
-                int w = Math.Max(Px(16), Width - Px(8));
+                // 有滚动条时把书签行让到它左边 —— 画和命中**必须用同一个矩形**，
+                // 不然文字会被压在滚动条下面，或者点到看不见的地方去。
+                int sb = VTrack().IsEmpty ? 0 : VScrollW + Px(1);
+                int w = Math.Max(Px(16), Width - Px(8) - sb);
                 return new Rectangle(Px(4), VHeadH + i * VRowH - scrollX, w, VRowH);
             }
             int x = LeadWidth + Px(6) - scrollX;
@@ -421,6 +502,12 @@ namespace TabbedExplorer
             }
             g.DrawLine(new Pen(Theme.Border), 0, VHeadH - 1, Width, VHeadH - 1);
 
+            // ---- 顶上那根**可拖的分割条**：压上去或正在拖时点亮 ----
+            // 平时它就是那一条普通边框线（不额外画），鼠标压上来才泛蓝，告诉用户「这条能拖」。
+            if (resizable && (hoverResize || resizeDrag))
+                using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    g.FillRectangle(b, 0, 0, Math.Max(0, Width - 1), Math.Max(1, Px(2)));
+
             Region oldClip = g.Clip;
             g.SetClip(new Rectangle(0, VHeadH, Width, Math.Max(0, Height - VHeadH)));
 
@@ -486,6 +573,17 @@ namespace TabbedExplorer
             }
             g.Clip = oldClip;
 
+            // ---- 右侧那根纵向滚动条（书签装不下才有）----
+            // 滚轮一直能用，但没有条子用户不知道「下面还有」；装上条子才能一眼看出装了多少。
+            Rectangle track = VTrack();
+            if (!track.IsEmpty)
+            {
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(38, Theme.TextDim)))
+                    g.FillRectangle(b, track);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(130, Theme.TextDim)))
+                    g.FillRectangle(b, VThumb());
+            }
+
             // 右边一条竖线：跟内容区分开（上边那条分隔线归标签区画，这里不重复）
             g.DrawLine(new Pen(Theme.Border), Width - 1, 0, Width - 1, Height);
         }
@@ -520,6 +618,28 @@ namespace TabbedExplorer
         {
             base.OnMouseMove(e);
 
+            // ---- 正在拖滚动条滑块（竖排）----
+            // 拖动量一律拿**屏幕**坐标算：滑块自己会跟着滚，用控件坐标（相对本控件）会自激。
+            if (thumbDrag)
+            {
+                int dy = Control.MousePosition.Y - thumbY0;
+                scrollX = thumbSpan > 0 ? thumbScroll0 + dy * thumbMax / thumbSpan : thumbScroll0;
+                ClampScroll();
+                Invalidate();
+                return;
+            }
+
+            // ---- 正在拖顶上那根分割条（竖排）----
+            // 这时本控件正跟着变高变矮（顶边贴着鼠标走），同样只能看屏幕坐标；
+            // 新高度 = 按下时的高度 - 鼠标往下走了多少（往下拖 = 书签段变矮）。
+            if (resizeDrag)
+            {
+                int newH = resizeH0 - (Control.MousePosition.Y - resizeY0);
+                if (newH < MinBandHeight) newH = MinBandHeight;
+                if (BandResized != null) BandResized(newH);
+                return;
+            }
+
             // ---- 拖动：拖栏上的项调顺序；拖到某个文件夹项上 = **放进那个文件夹** ----
             // （用户：原来拖到书签栏文件夹上只会并排加一个同级项，不是加进文件夹。）
             // ⚠ 这里必须问 `Control.MouseButtons`（现读物理按键状态），**不能用 `e.Button`** ——
@@ -540,6 +660,26 @@ namespace TabbedExplorer
                     tipKey = null;
                     return;
                 }
+            }
+
+            // ---- 竖排：顶上那根分割条 / 右侧那根滚动条 —— 光标形状 + 悬停点亮 ----
+            // ⚠ 这一段必须排在 `HitTest` **前面**：分割条压在标题行上、滚动条压在书签行右边，
+            //   不先判它们的话鼠标形状和命中都会落到书签项上去。
+            EnsureLayout();
+            bool hot = OnDividerHot(e.Location);
+            Rectangle trk = VTrack();
+            Rectangle thb = trk.IsEmpty ? Rectangle.Empty : VThumb();
+            bool overBar = !trk.IsEmpty && (trk.Contains(e.Location) || thb.Contains(e.Location));
+            if (hot != hoverResize) { hoverResize = hot; Invalidate(); }
+            Cursor want = (hot || overBar) ? Cursors.SizeNS : Cursors.Default;
+            if (Cursor != want) Cursor = want;
+            if (hot || overBar)
+            {
+                hoverIndex = -1;
+                hoverLead = false;
+                tips.Hide(this);
+                tipKey = null;
+                return;
             }
 
             int i = HitTest(e.Location);
@@ -582,9 +722,13 @@ namespace TabbedExplorer
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
+            // 拖着呢（抓着鼠标捕获）—— 这时「离开控件」是假象，状态不能清
+            if (resizeDrag || thumbDrag) return;
             hoverIndex = -1;
             hoverLead = false;
             tipKey = null;
+            if (hoverResize) hoverResize = false;
+            Cursor = Cursors.Default;
             tips.Hide(this);
             Invalidate();
         }
@@ -687,6 +831,43 @@ namespace TabbedExplorer
             dropIndex = -1;
             dropInto = -1;
 
+            EnsureLayout();
+
+            // ---- 竖排顶上那根分割条：命中它就别去碰书签项了 ----
+            if (OnDividerHot(e.Location))
+            {
+                resizeDrag = true;
+                resizeY0 = Control.MousePosition.Y;
+                resizeH0 = Height;
+                Capture = true;             // 控件自己在动，必须抓住鼠标才能一路收到 MOVE
+                return;
+            }
+
+            // ---- 竖排右侧那根滚动条：滑块 = 拖着走，轨道 = 翻一页 ----
+            Rectangle trk = VTrack();
+            if (!trk.IsEmpty)
+            {
+                Rectangle thb = VThumb();
+                if (thb.Contains(e.Location))
+                {
+                    thumbDrag = true;
+                    thumbY0 = Control.MousePosition.Y;
+                    thumbScroll0 = scrollX;
+                    thumbMax = Math.Max(0, contentHeight - Height);
+                    thumbSpan = Math.Max(1, trk.Height - thb.Height);
+                    Capture = true;
+                    return;
+                }
+                if (trk.Contains(e.Location))
+                {
+                    // 点空白轨道 = 往那一侧翻差不多一屏（跟系统滚动条一个手感）
+                    scrollX += (e.Y < thb.Top ? -1 : 1) * Math.Max(Px(VRowL), Height * 9 / 10);
+                    ClampScroll();
+                    Invalidate();
+                    return;
+                }
+            }
+
             int i = HitTest(e.Location);
             if (i == -2)
             {
@@ -781,6 +962,21 @@ namespace TabbedExplorer
             // 左键：先把拖动收尾，没拖动才算「点击」
             if (e.Button == MouseButtons.Left)
             {
+                // 分割条 / 滚动条滑块 —— 收尾（这时才通知宿主存盘，拖动中途只实时重排）
+                if (resizeDrag)
+                {
+                    resizeDrag = false;
+                    Capture = false;
+                    if (BandResizeEnded != null) BandResizeEnded();
+                    return;
+                }
+                if (thumbDrag)
+                {
+                    thumbDrag = false;
+                    Capture = false;
+                    return;
+                }
+
                 int di = dragIndex;
                 bool wasDrag = dragging;
                 int into = dropInto, at = dropIndex;

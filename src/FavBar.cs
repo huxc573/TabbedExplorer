@@ -53,17 +53,45 @@ namespace TabbedExplorer
 
         private static int Px(int v) { return (int)Math.Round(v * DpiScale); }
 
-        private sealed class Item
+        /// <summary>
+        /// **一行** —— 竖排按展开状态摊平之后的一行；横排时就是顶层那一排（`Depth` 恒 0）。
+        /// ⚠ 画 / 命中 / 拖动落点**全按下标走这一份**。以前横排读 `items`、竖排另算一套，
+        ///   一旦加了树形展开就会出现「点这行开那行」。
+        /// </summary>
+        private sealed class Row
         {
-            public FavNode Node;     // 树里的真节点（改名字直接改它）
-            public Bitmap Icon;
-            /// <summary>这一项占多宽（EnsureLayout 算，鼠标命中测试要用）。</summary>
-            public int LayoutW;
-            public string Name { get { return FavStore.NameOf(Node); } }
+            public FavNode Node;
+            /// <summary>嵌套层级（0 = 书签栏的直接孩子）。</summary>
+            public int Depth;
+            /// <summary>
+            /// 这一行的**根祖先**在 `items` 里的下标。调顺序（拖动排序）要的是顶层下标，
+            /// 而命中给的是行下标 —— 展开之后就叉了，所以建行的时候顺手存上（靠 node 反查不出来）。
+            /// </summary>
+            public int TopIndex;
+            /// <summary>竖排：这个文件夹现在是不是原地摊开着。</summary>
+            public bool Expanded;
+            /// <summary>不是文件而是文件夹 —— 点它就是「摊开 / 收起」，右边要画一个三角。</summary>
             public bool IsFolder { get { return Node != null && Node.IsFolder; } }
+            public string Name { get { return Node == null ? "" : FavStore.NameOf(Node); } }
+            /// <summary>横排时这一行占多宽（竖排不看，一律铺满）。</summary>
+            public int W;
         }
 
-        private readonly List<Item> items = new List<Item>();
+        /// <summary>顶层那一排（= 书签栏文件夹的直接孩子）—— 拖进来 / 移出去 / 同层排序都用它。</summary>
+        private readonly List<FavNode> items = new List<FavNode>();
+        /// <summary>当前真正画出来的行（横排 = `items` 原样，竖排 = 按展开状态摊平的树）。</summary>
+        private readonly List<Row> rows = new List<Row>();
+        /// <summary>
+        /// 竖排：哪些文件夹是**原地摊开**的（用户点文件夹就是切它）。
+        /// 按**节点引用**记 —— `FavStore.roots` 在进程内不会重读，节点是稳定的，
+        /// 所以改名 / 拖动排序之后展开状态不会莫名其妙地全部弹回去。
+        /// </summary>
+        private readonly HashSet<FavNode> expanded = new HashSet<FavNode>();
+        /// <summary>
+        /// 图标缓存（按节点）。节点在进程内稳定，所以这份缓存一直有效；
+        /// `Reload` 会清掉它（**不 Dispose** —— `ShellIcon` 自己会复用位图，dispose 了会坑到别处）。
+        /// </summary>
+        private readonly Dictionary<FavNode, Bitmap> icons = new Dictionary<FavNode, Bitmap>();
         private readonly ToolTip tips = new ToolTip();
 
         private int hoverIndex = -1;
@@ -185,8 +213,9 @@ namespace TabbedExplorer
         private int dragIndex = -1;          // 按下时命中的那一项
         private Point dragStart;
         private bool dragging;
-        private int dropIndex = -1;          // 插到第几项之前（= items.Count 表示插到末尾）
-        private int dropInto = -1;           // 放进第几项（那一项必须是文件夹）
+        private int dropIndex = -1;          // 插到第几**行**之前（= rows.Count 表示插到末尾）
+        private bool dropAfter;              // `dropIndex` 那行的**下半 / 右半** = 插到它后面
+        private int dropInto = -1;           // 放进第几行（那一行必须是文件夹）
 
         private readonly Font font;
         private static Bitmap folderFallback;
@@ -250,6 +279,7 @@ namespace TabbedExplorer
                 BackColor = TheBack;
                 leadIcon = null;         // 蓝色星标按主题色画，换主题要重画
                 folderFallback = null;
+                icons.Clear();           // 图标也是按主题色画的（文件夹那枚金徽）
                 if (!IsDisposed) Invalidate();
             };
             // 数据一变（改名 / 增删 / 管理器里拖来拖去）这边就跟着重读
@@ -259,7 +289,7 @@ namespace TabbedExplorer
             };
         }
 
-        /// <summary>现在有几项。</summary>
+        /// <summary>现在顶层有几项。</summary>
         public int Count { get { return items.Count; } }
 
         /// <summary>最左边那枚图标占的宽度（固定，不参与滚动）。</summary>
@@ -275,18 +305,13 @@ namespace TabbedExplorer
         public void Reload()
         {
             items.Clear();
+            icons.Clear();
+            rows.Clear();
             hoverIndex = -1;
             scrollX = 0;
             try
             {
-                foreach (FavNode n in FavStore.BarItems)
-                {
-                    Item it = new Item();
-                    it.Node = n;
-                    // 书签自己的文件夹用我们那颗（蓝文件夹 + 金徽），别跟磁盘上的真文件夹撞脸
-                    it.Icon = n.IsFolder ? ShellIcon.FavFolderIcon(Px(18)) : ShellIcon.PathIcon(n.Path, Px(18));
-                    items.Add(it);
-                }
+                foreach (FavNode n in FavStore.BarItems) items.Add(n);
                 Diag.Step("书签栏: 载入 " + items.Count + " 项");
             }
             catch (Exception ex) { Diag.Log("书签栏: 载入失败 " + ex.Message); }
@@ -295,26 +320,56 @@ namespace TabbedExplorer
             if (Reloaded != null) Reloaded(this, EventArgs.Empty);
         }
 
+        /// <summary>节点的图标（缓存）。书签自己的文件夹用我们那颗（蓝文件夹 + 金徽），别跟磁盘上的真文件夹撞脸。</summary>
+        private Bitmap IconOf(FavNode n)
+        {
+            if (n == null) return null;
+            Bitmap b;
+            if (icons.TryGetValue(n, out b)) return b;
+            try { b = n.IsFolder ? ShellIcon.FavFolderIcon(Px(18)) : ShellIcon.PathIcon(n.Path, Px(18)); }
+            catch { b = null; }
+            icons[n] = b;
+            return b;
+        }
+
         // ------------------------------------------------------------------
 
         private void EnsureLayout()
         {
+            // 先把行摊平（横排 = 顶层那一排；竖排 = 按 `expanded` 展开的树）
+            rows.Clear();
+            for (int i = 0; i < items.Count; i++) AddRow(items[i], 0, i);
+
             if (vertical)
             {
                 // 竖排：不看宽度看高度 —— 一行一个书签，装不下靠纵向滚
-                contentHeight = VHeadH + items.Count * VRowH + Px(4);
+                contentHeight = VHeadH + rows.Count * VRowH + Px(4);
                 return;
             }
             contentWidth = Px(6);
-            for (int i = 0; i < items.Count; i++)
+            for (int i = 0; i < rows.Count; i++)
             {
-                Size t = TextRenderer.MeasureText(items[i].Name, font, new Size(Px(400), Px(20)),
+                Size t = TextRenderer.MeasureText(rows[i].Name, font, new Size(Px(400), Px(20)),
                     TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
                 int w = Px(6) + Px(18) + Px(5) + Math.Min(t.Width, Px(140)) + Px(8);
-                items[i].LayoutW = w;
+                rows[i].W = w;
                 contentWidth += w;
             }
             contentWidth += Px(6);
+        }
+
+        /// <summary>把一个节点按当前展开状态摊进 `rows`（摊开的文件夹递归往下）。</summary>
+        private void AddRow(FavNode n, int depth, int topIndex)
+        {
+            if (n == null) return;
+            Row r = new Row();
+            r.Node = n;
+            r.Depth = depth;
+            r.TopIndex = topIndex;
+            r.Expanded = n.IsFolder && expanded.Contains(n);
+            rows.Add(r);
+            if (r.Expanded)
+                for (int i = 0; i < n.Kids.Count; i++) AddRow(n.Kids[i], depth + 1, topIndex);
         }
 
         /// <summary>
@@ -323,24 +378,35 @@ namespace TabbedExplorer
         /// </summary>
         public int PreferredVerticalHeight(int maxH)
         {
-            int need = VHeadH + Math.Max(1, items.Count) * VRowH + Px(4);
+            EnsureLayout();     // 摊开状态会改行数，得先摊平再数
+            int need = VHeadH + Math.Max(1, rows.Count) * VRowH + Px(4);
             int cap = Math.Max(Px(24), maxH);
             return Math.Max(Px(24), Math.Min(need, cap));
         }
 
+        /// <summary>
+        /// 第 i **行**的矩形。
+        /// ⚠ `i` 是 `rows` 的下标（横排下 `rows` 和 `items` 一一对应，所以两边通用）。
+        /// 竖排还要让出三样：右侧滚动条、嵌套缩进（每层 `Px(12)`，最多 6 层 ——
+        /// 不封顶的话层数一深、窗格又窄，文字宽度就成了负数）。
+        /// </summary>
         private Rectangle BoundsOf(int i)
         {
+            if (i < 0 || i >= rows.Count) return Rectangle.Empty;
             if (vertical)
             {
                 // 有滚动条时把书签行让到它左边 —— 画和命中**必须用同一个矩形**，
                 // 不然文字会被压在滚动条下面，或者点到看不见的地方去。
                 int sb = VTrack().IsEmpty ? 0 : VScrollW + Px(1);
-                int w = Math.Max(Px(16), Width - Px(8) - sb);
-                return new Rectangle(Px(4), VHeadH + i * VRowH - scrollX, w, VRowH);
+                int ind = Math.Min(rows[i].Depth, 6) * Px(12);
+                int room = Math.Max(0, Width - Px(8) - sb - Px(48));
+                if (ind > room) ind = room;
+                int w = Math.Max(Px(16), Width - Px(8) - sb - ind);
+                return new Rectangle(Px(4) + ind, VHeadH + i * VRowH - scrollX, w, VRowH);
             }
             int x = LeadWidth + Px(6) - scrollX;
-            for (int k = 0; k < i; k++) x += items[k].LayoutW;
-            return new Rectangle(x, Px(4), items[i].LayoutW, Height - Px(8));
+            for (int k = 0; k < i; k++) x += rows[k].W;
+            return new Rectangle(x, Px(4), rows[i].W, Height - Px(8));
         }
 
         private Rectangle LeadBounds()
@@ -357,7 +423,7 @@ namespace TabbedExplorer
         {
             if (LeadBounds().Contains(p)) return -2;      // -2 = 左边那枚书签图标
             EnsureLayout();
-            for (int i = 0; i < items.Count; i++)
+            for (int i = 0; i < rows.Count; i++)
             {
                 if (BoundsOf(i).Contains(p)) return i;
             }
@@ -397,7 +463,7 @@ namespace TabbedExplorer
                 g.DrawLine(p, lead.Right + Px(3), Px(6), lead.Right + Px(3), Height - Px(7));
 
             // ---- 书签项 ----
-            if (items.Count == 0)
+            if (rows.Count == 0)
             {
                 TextRenderer.DrawText(g, "把文件夹或文件拖到这条栏上就能加进书签",
                     font, new Rectangle(LeadWidth + Px(10), 0, Math.Max(1, Width - LeadWidth - Px(20)), Height),
@@ -406,13 +472,13 @@ namespace TabbedExplorer
             }
             else
             {
-                for (int i = 0; i < items.Count; i++)
+                for (int i = 0; i < rows.Count; i++)
                 {
                     Rectangle r = BoundsOf(i);
                     if (r.Right < LeadWidth || r.Left > Width) continue;
                     if (i == hoverIndex) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), r);
 
-                    Bitmap ic = items[i].Icon;
+                    Bitmap ic = IconOf(rows[i].Node);
                     if (ic == null)
                     {
                         if (folderFallback == null) folderFallback = ShellIcon.FolderIcon(Px(18));
@@ -424,7 +490,7 @@ namespace TabbedExplorer
                     int tx = r.Left + Px(6) + Px(18) + Px(5);
                     int tw = r.Right - Px(8) - tx;
                     if (tw <= 0) continue;
-                    TextRenderer.DrawText(g, items[i].Name, font,
+                    TextRenderer.DrawText(g, rows[i].Name, font,
                         new Rectangle(tx, r.Top, tw, r.Height),
                         i == hoverIndex ? Theme.Text : Theme.TextDim,
                         TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
@@ -432,7 +498,7 @@ namespace TabbedExplorer
                 }
 
                 // 拖动中的落点提示：放进文件夹 = 整项罩一层蓝；调顺序 = 在缝上画一条蓝竖线
-                for (int i = 0; i < items.Count; i++)
+                for (int i = 0; i < rows.Count; i++)
                 {
                     Rectangle r = BoundsOf(i);
                     if (dropInto == i)
@@ -442,13 +508,15 @@ namespace TabbedExplorer
                     }
                     if (dropIndex == i)
                     {
+                        // `dropAfter` = 落在那行的**右半** ⇒ 竖线画在它右边
+                        int lx = dropAfter ? r.Right : r.Left;
                         using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
-                            g.DrawLine(p, r.Left, r.Top, r.Left, r.Bottom);
+                            g.DrawLine(p, lx, r.Top, lx, r.Bottom);
                     }
                 }
-                if (dropIndex >= items.Count && items.Count > 0)
+                if (dropIndex >= rows.Count && rows.Count > 0)
                 {
-                    Rectangle last = BoundsOf(items.Count - 1);
+                    Rectangle last = BoundsOf(rows.Count - 1);
                     using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
                         g.DrawLine(p, last.Right, last.Top, last.Right, last.Bottom);
                 }
@@ -511,7 +579,7 @@ namespace TabbedExplorer
             Region oldClip = g.Clip;
             g.SetClip(new Rectangle(0, VHeadH, Width, Math.Max(0, Height - VHeadH)));
 
-            if (items.Count == 0)
+            if (rows.Count == 0)
             {
                 TextRenderer.DrawText(g, "把文件夹或文件拖到这里就能加进书签", font,
                     new Rectangle(Px(6), VHeadH + Px(2), Math.Max(1, Width - Px(12)),
@@ -522,27 +590,41 @@ namespace TabbedExplorer
             else
             {
                 int ic = Px(16);
+                // 每行左边先留一列给「▸ / ▾」—— 文件夹画三角、文件留空。
+                // 留白是故意的：留了图标才能竖着对齐，不然树的每一层都错位。
+                int chev = Px(10);
                 bool narrow = Width < Px(120);   // 折叠窗格：一行只剩图标（跟标签行一个规矩）
-                for (int i = 0; i < items.Count; i++)
+                for (int i = 0; i < rows.Count; i++)
                 {
                     Rectangle r = BoundsOf(i);
                     if (r.Bottom <= VHeadH || r.Top >= Height) continue;
                     if (i == hoverIndex) g.FillRectangle(new SolidBrush(BG(Theme.Hover)), r);
 
-                    Bitmap bm = items[i].Icon;
+                    // ---- 文件夹的展开三角（▸ 收起 / ▾ 摊开）----
+                    if (rows[i].IsFolder)
+                    {
+                        int cx = r.Left + Px(5), cy = r.Top + r.Height / 2;
+                        int a = Px(2), b2 = Px(4);
+                        Point[] tri = rows[i].Expanded
+                            ? new Point[] { new Point(cx - b2, cy - a), new Point(cx + b2, cy - a), new Point(cx, cy + a) }
+                            : new Point[] { new Point(cx - a, cy - b2), new Point(cx + a, cy), new Point(cx - a, cy + b2) };
+                        using (SolidBrush sb = new SolidBrush(Theme.TextDim)) g.FillPolygon(sb, tri);
+                    }
+
+                    Bitmap bm = IconOf(rows[i].Node);
                     if (bm == null)
                     {
                         if (folderFallback == null) folderFallback = ShellIcon.FolderIcon(Px(16));
                         bm = folderFallback;
                     }
-                    int ix = narrow ? r.Left + (r.Width - ic) / 2 : r.Left + Px(6);
+                    int ix = narrow ? r.Left + (r.Width - ic) / 2 : r.Left + chev + Px(2);
                     if (bm != null) g.DrawImage(bm, new Rectangle(ix, r.Top + (r.Height - ic) / 2, ic, ic));
                     if (narrow) continue;
 
                     int tx = ix + ic + Px(5);
                     int tw = r.Right - Px(8) - tx;
                     if (tw <= 0) continue;
-                    TextRenderer.DrawText(g, items[i].Name, font,
+                    TextRenderer.DrawText(g, rows[i].Name, font,
                         new Rectangle(tx, r.Top, tw, r.Height),
                         i == hoverIndex ? Theme.Text : Theme.TextDim,
                         TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
@@ -550,7 +632,7 @@ namespace TabbedExplorer
                 }
 
                 // 拖动中的落点提示：放进文件夹 = 整行罩一层蓝；调顺序 = 在那一行的**上沿**画一条蓝横线
-                for (int i = 0; i < items.Count; i++)
+                for (int i = 0; i < rows.Count; i++)
                 {
                     Rectangle r = BoundsOf(i);
                     if (dropInto == i)
@@ -560,13 +642,15 @@ namespace TabbedExplorer
                     }
                     if (dropIndex == i)
                     {
+                        // `dropAfter` = 落在那行的**下半** ⇒ 横线画在它下沿
+                        int ly = dropAfter ? r.Bottom : r.Top;
                         using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
-                            g.DrawLine(p, r.Left, r.Top, r.Right, r.Top);
+                            g.DrawLine(p, r.Left, ly, r.Right, ly);
                     }
                 }
-                if (dropIndex >= items.Count && items.Count > 0)
+                if (dropIndex >= rows.Count && rows.Count > 0)
                 {
-                    Rectangle last = BoundsOf(items.Count - 1);
+                    Rectangle last = BoundsOf(rows.Count - 1);
                     using (Pen p = new Pen(Theme.Accent, Math.Max(2f, DpiScale * 2)))
                         g.DrawLine(p, last.Left, last.Bottom, last.Right, last.Bottom);
                 }
@@ -645,13 +729,13 @@ namespace TabbedExplorer
             // ⚠ 这里必须问 `Control.MouseButtons`（现读物理按键状态），**不能用 `e.Button`** ——
             //   WinForms 的 `MouseMove` 事件里那个字段经常是 `None`（它只对 Down/Up 才填得准），
             //   拿它判「左键还按着没」会一直判成「没按」，拖动就永远触发不了。
-            if (dragIndex >= 0 && (Control.MouseButtons & MouseButtons.Left) != 0)
+            if (dragIndex >= 0 && dragIndex < rows.Count && (Control.MouseButtons & MouseButtons.Left) != 0)
             {
                 if (!dragging &&
                     (Math.Abs(e.X - dragStart.X) > Px(4) || Math.Abs(e.Y - dragStart.Y) > Px(4)))
                 {
                     dragging = true;
-                    Diag.Step("书签栏: 开始拖动「" + items[dragIndex].Name + "」");
+                    Diag.Step("书签栏: 开始拖动「" + rows[dragIndex].Name + "」");
                 }
                 if (dragging)
                 {
@@ -711,10 +795,17 @@ namespace TabbedExplorer
                     int y = r.Bottom + Px(2);
                     if (vertical) { x = r.Right + Px(4); y = r.Top; }
                     else if (x + Px(240) > Width) x = Math.Max(0, Width - Px(240));
-                    string body = items[i].IsFolder
-                        ? ("子文件夹，里面有 " + items[i].Node.Kids.Count + " 项")
-                        : items[i].Node.Path;
-                    tips.Show(items[i].Name + "\r\n" + body, this, x, y, 8000);
+                    string body;
+                    if (rows[i].IsFolder)
+                    {
+                        body = "文件夹，里面有 " + rows[i].Node.Kids.Count + " 项";
+                        // 竖排里点文件夹 = **原地摊开 / 收起**（用户：「书签里面的文件和文件夹
+                        // 就可以直接在原地展开了，这样使用起来比较方便」）；
+                        // 横排那条只有 30 像素高，摊不下，还是弹飞到旁边的子菜单。
+                        if (vertical) body += rows[i].Expanded ? "（点一下收起）" : "（点一下原地展开）";
+                    }
+                    else body = rows[i].Node.Path;
+                    tips.Show(rows[i].Name + "\r\n" + body, this, x, y, 8000);
                 }
             }
         }
@@ -830,6 +921,7 @@ namespace TabbedExplorer
             dragging = false;
             dropIndex = -1;
             dropInto = -1;
+            dropAfter = false;
 
             EnsureLayout();
 
@@ -887,18 +979,21 @@ namespace TabbedExplorer
         /// <summary>项上松手（没拖动）= 普通点击 —— 原来这一套写在 `OnMouseDown` 里。</summary>
         private void ActivateItem(int i)
         {
-            if (i < 0 || i >= items.Count) return;
-            // 子文件夹：点一下往下列一层（浏览器书签栏就是这么干的）
-            if (items[i].IsFolder)
+            if (i < 0 || i >= rows.Count) return;
+            Row row = rows[i];
+            // 文件夹：**竖排原地摊开 / 收起**（用户：「书签里面的文件和文件夹就可以直接在原地展开了，
+            // 这样使用起来比较方便」）；横排那条只有 30 像素高，摊不下，还是弹飞到旁边的子菜单。
+            if (row.IsFolder)
             {
+                if (vertical) { ToggleExpand(row.Node); return; }
                 ShowSubMenu(i);
                 return;
             }
 
-            string p = items[i].Node.Path;
+            string p = row.Node.Path;
             if (FavStore.IsFolder(p))
             {
-                if (ItemClicked != null) ItemClicked(items[i].Node);      // 文件夹 → 新标签
+                if (ItemClicked != null) ItemClicked(row.Node);      // 文件夹 → 新标签
                 return;
             }
             try
@@ -911,6 +1006,48 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 竖排：把一个文件夹原地摊开 / 收起，然后重排。
+        /// 摊开后如果那一块装不下（屏幕底下剩下的不够），就把这个文件夹**滚进视线** ——
+        /// 不然点一下只有底下冒出一行、展开的子项全在屏幕外，看着像「没反应」。
+        /// </summary>
+        private void ToggleExpand(FavNode folder)
+        {
+            if (folder == null || !folder.IsFolder) return;
+
+            // ⚠ 先按**现在**的行集找它在第几行，再去切展开状态 ——
+            //   反过来（先切再找）拿到的是切完之后的行号，滚动定位会差一截。
+            int idx = -1;
+            EnsureLayout();
+            for (int i = 0; i < rows.Count; i++) if (rows[i].Node == folder) { idx = i; break; }
+
+            bool on = !expanded.Contains(folder);
+            if (on) expanded.Add(folder); else expanded.Remove(folder);
+            hoverIndex = -1;
+            tipKey = null;
+            tips.Hide(this);
+
+            EnsureLayout();               // 行集变了，重新摊平
+            if (on && idx >= 0)
+            {
+                // 坐标口径：第 i 行相对「内容区顶部」的位置 = `i*VRowH - scrollX`，
+                // 可视高度 = Height - VHeadH。
+                int avail = Math.Max(0, Height - VHeadH);
+                int rest = (rows.Count - idx) * VRowH;      // 这个文件夹连同它底下全部内容要占多少
+                int top = idx * VRowH - scrollX;
+                if (top < 0) scrollX = idx * VRowH;         // 它在视线**上面** ⇒ 拉下来
+                else if (avail > 0)
+                {
+                    int want = idx * VRowH + rest - avail;  // 底下装不下 ⇒ 让内容底对齐可视底
+                    if (want > 0) scrollX = want;
+                }
+            }
+            ClampScroll();
+            Invalidate();
+            Diag.Step("书签栏: " + (on ? "原地展开" : "收起") + "「" + FavStore.NameOf(folder) +
+                      "」（现在 " + rows.Count + " 行）");
+        }
+
+        /// <summary>
         /// 拖动中：算出落点（放进哪个文件夹 / 插到第几项之前）。
         /// 只改状态 + 重画，**不动数据** —— 真挪动在 MouseUp 里做一次。
         /// </summary>
@@ -918,37 +1055,55 @@ namespace TabbedExplorer
         {
             EnsureLayout();
             int ni = -1, nInto = -1;
+            bool nAfter = false;
             bool overItem = false;
 
-            for (int i = 0; i < items.Count; i++)
+            for (int i = 0; i < rows.Count; i++)
             {
                 Rectangle r = BoundsOf(i);
                 if (!r.Contains(p)) continue;
                 overItem = true;
                 if (i == dragIndex) break;                     // 拖回自己身上：什么也不提示
-                if (items[i].IsFolder)
-                    nInto = i;                                 // 落点在文件夹项上 = 放进它里面
+                if (rows[i].IsFolder)
+                    nInto = i;                                 // 落点在文件夹上（哪一层都行）= 放进它里面
                 else
-                    ni = vertical
-                         ? (p.Y < r.Top + r.Height / 2 ? i : i + 1)   // 竖排：上半 / 下半 = 插前 / 插后
-                         : (p.X < r.Left + r.Width / 2 ? i : i + 1);  // 横排：左半 / 右半
+                {
+                    // 横排：左半 / 右半；竖排：上半 / 下半
+                    nAfter = vertical ? (p.Y >= r.Top + r.Height / 2) : (p.X >= r.Left + r.Width / 2);
+                    ni = i;
+                }
                 break;
             }
 
-            // 落在最后一项外面那块空白里 = 挪到最末尾
-            if (!overItem && items.Count > 0 && dragIndex >= 0)
+            // 落在最后一行外面那块空白里 = 挪到最末尾
+            if (!overItem && rows.Count > 0 && dragIndex >= 0)
             {
-                Rectangle last = BoundsOf(items.Count - 1);
-                if (vertical) { if (p.Y >= last.Bottom) ni = items.Count; }
-                else if (p.X >= last.Right) ni = items.Count;
+                Rectangle last = BoundsOf(rows.Count - 1);
+                if (vertical) { if (p.Y >= last.Bottom) { ni = rows.Count; nAfter = false; } }
+                else if (p.X >= last.Right) { ni = rows.Count; nAfter = false; }
             }
 
-            if (ni != dropIndex || nInto != dropInto)
+            if (ni != dropIndex || nInto != dropInto || nAfter != dropAfter)
             {
                 dropIndex = ni;
                 dropInto = nInto;
+                dropAfter = nAfter;
                 Invalidate();
             }
+        }
+
+        /// <summary>
+        /// 把「插到第 `at` 行（之前 / 之后）」换算成「插到**顶层**第几项之前」。
+        /// ⚠ 展开之后**行号和顶层下标不是一回事** —— 拿行号直接调 `FavStore.Move` 会挪错位置
+        /// （表现是「拖到这儿，结果跑到上面去了」）。
+        /// 落在哪一行的下半 / 右半 ⇒ 插到它所属那棵顶层书签的**后面**。
+        /// 返回 -1 = 没有有效落点。
+        /// </summary>
+        private int DropTopIndex(int at, bool after)
+        {
+            if (at < 0) return -1;
+            if (at >= rows.Count) return items.Count;      // 落到末尾
+            return rows[at].TopIndex + (after ? 1 : 0);
         }
 
         /// <summary>
@@ -980,24 +1135,30 @@ namespace TabbedExplorer
                 int di = dragIndex;
                 bool wasDrag = dragging;
                 int into = dropInto, at = dropIndex;
+                bool after = dropAfter;
                 dragIndex = -1;
                 dragging = false;
                 dropInto = -1;
                 dropIndex = -1;
+                dropAfter = false;
 
                 if (wasDrag)
                 {
                     Invalidate();
-                    FavNode node = (di >= 0 && di < items.Count) ? items[di].Node : null;
+                    FavNode node = (di >= 0 && di < rows.Count) ? rows[di].Node : null;
                     bool ok = false;
                     if (node != null)
                     {
-                        if (into >= 0 && into < items.Count)          // 放进那个文件夹（追加到末尾）
-                            ok = FavStore.Move(node, items[into].Node, -1);
-                        else if (at >= 0)                             // 同一层里调顺序
+                        if (into >= 0 && into < rows.Count)            // 放进那个文件夹（追加到末尾）
+                            ok = FavStore.Move(node, rows[into].Node, -1);
+                        else
                         {
-                            FavNode bar = FavStore.BarFolder;
-                            ok = bar != null && FavStore.Move(node, bar, at);
+                            int top = DropTopIndex(at, after);
+                            if (top >= 0)                              // 调顺序（一律按**顶层**位置算）
+                            {
+                                FavNode bar = FavStore.BarFolder;
+                                ok = bar != null && FavStore.Move(node, bar, top);
+                            }
                         }
                     }
                     Diag.Step("书签栏: 拖动落点 -> " + (ok ? ("已挪动「" + (node != null ? FavStore.NameOf(node) : "?") + "」")
@@ -1017,8 +1178,8 @@ namespace TabbedExplorer
         /// <summary>把子文件夹里的东西列出来（支持继续往下嵌套）。</summary>
         private void ShowSubMenu(int index)
         {
-            if (index < 0 || index >= items.Count) return;
-            FavNode nd = items[index].Node;
+            if (index < 0 || index >= rows.Count) return;
+            FavNode nd = rows[index].Node;
             PopItem[] kids = ItemsOf(nd);
             if (kids.Length == 0) { Toast.Show(NotifyItems.FavEmptyFolder, nd.Display, "这个文件夹里还没有书签。"); return; }
             Rectangle r = BoundsOf(index);
@@ -1066,7 +1227,7 @@ namespace TabbedExplorer
 
             if (i >= 0)
             {
-                Item it = items[i];
+                Row it = rows[i];
                 string p = it.Node.Path;
                 if (it.IsFolder)
                 {
@@ -1076,7 +1237,13 @@ namespace TabbedExplorer
                     {
                         if (OpenAllRequested != null) OpenAllRequested(f);
                     }));
-                    m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(i); }));
+                    // 竖排里这一层是**原地**摊开的（跟左键一样），横排那条只有 30 像素高，
+                    // 摊不下，还是弹飞到旁边的子菜单。
+                    if (vertical)
+                        m.Add(PopMenu.It(it.Expanded ? "收起这一层" : "原地展开这一层",
+                            delegate { ToggleExpand(nd); }));
+                    else
+                        m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(i); }));
                     m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));
                     m.Add(PopMenu.Split());
                 }
@@ -1123,7 +1290,7 @@ namespace TabbedExplorer
                 delegate { if (HideRequested != null) HideRequested(this, EventArgs.Empty); }));
 
             PopItem[] menu = m.ToArray();
-            string title = i >= 0 ? ("书签项右键 " + items[i].Name) : "书签栏右键";
+            string title = i >= 0 ? ("书签项右键 " + rows[i].Name) : "书签栏右键";
             PopMenu.Show(menu, this, at, title);   // 「推后一轮」在 PopMenu.Show 里做
         }
         /// <summary>按节点删除（文件夹连里面的东西一起删，磁盘上不动）。</summary>

@@ -343,12 +343,10 @@ namespace TabbedExplorer
             {
                 CycleTab(delta > 0 ? -1 : 1);
             };
-            // 跨窗口拖拽（用户要的多窗口）：拖出标签条 → 不是并进别的窗口，就是在鼠标位置另开一个。
-            // 落点判定全交给 Hub（它知道全进程有哪些窗口），本窗口只管把事件转过去。
-            tabStrip.DragOutStarted += delegate(TabStrip s, int i) { OnTabDragOutStart(i); };
-            tabStrip.DragOutMoved += delegate(TabStrip s, int i, Point p) { OnTabDragOutMove(p); };
-            tabStrip.DragOutDropped += delegate(TabStrip s, int i, Point p) { OnTabDragOutDrop(i, p); };
-            tabStrip.DragOutEnded += delegate(TabStrip s, int i) { OnTabDragOutEnd(); };
+            // 拖标签（条内重排 + 跨窗口）：影窗自己管，落点判定全交给 Hub（它知道全进程有哪些窗口）。
+            tabStrip.TabDragBegan += delegate(TabStrip s, int i) { OnTabDragBegan(s, i); };
+            tabStrip.TabDragMoved += delegate(TabStrip s, int i, Point p) { OnTabDragMoved(p); };
+            tabStrip.TabDragEnded += delegate(TabStrip s, int i, Point p, bool outside) { OnTabDragEnded(i, p, outside); };
 
             favBar = new FavBar();
             favBar.ItemClicked += delegate(FavNode nd)
@@ -432,11 +430,10 @@ namespace TabbedExplorer
                 Diag.Step("EmbedForm: 垂直窗格图钉 -> 折叠窗格开关");
                 if (hub != null) hub.SetVTabCollapse(!Settings.VTabsCollapse);
             };
-            // 跨窗口拖拽：竖排窗格是**另一个实例**，事件得各接各的（跟标签条那套同名同义）
-            vPane.DragOutStarted += delegate(TabStrip s, int i) { OnTabDragOutStart(i); };
-            vPane.DragOutMoved += delegate(TabStrip s, int i, Point p) { OnTabDragOutMove(p); };
-            vPane.DragOutDropped += delegate(TabStrip s, int i, Point p) { OnTabDragOutDrop(i, p); };
-            vPane.DragOutEnded += delegate(TabStrip s, int i) { OnTabDragOutEnd(); };
+            // 拖标签：竖排窗格是**另一个实例**，事件得各接各的（跟标签条那套同名同义）
+            vPane.TabDragBegan += delegate(TabStrip s, int i) { OnTabDragBegan(s, i); };
+            vPane.TabDragMoved += delegate(TabStrip s, int i, Point p) { OnTabDragMoved(p); };
+            vPane.TabDragEnded += delegate(TabStrip s, int i, Point p, bool outside) { OnTabDragEnded(i, p, outside); };
             // 鼠标进出窗格 = 「临时展开成完整样式」的判据（Edge 那套折叠窗格）
             vPane.MouseEnter += delegate { PaneMouseMoved(true); };
             vPane.MouseLeave += delegate { PaneMouseMoved(false); };
@@ -542,6 +539,15 @@ namespace TabbedExplorer
                 paneHover = false;
                 DoLayout();
             };
+
+            // 拖拽影窗**先建出来藏着**（见 Ghost）：不能等开始拖了才现建 —— 那会儿鼠标正按着、
+            // 「动起来」之后很快还会被我们 Capture，此刻建窗 / Show 最不该走（一卡、捕获丢、拖拽断）。
+            // 用 Defer：构造函数里建窗体要等消息泵转起来才稳。
+            Defer(delegate
+            {
+                try { if (ghost == null) ghost = new DragGhost(); }
+                catch (Exception ex) { Diag.Log("EmbedForm: 预建拖拽影窗失败 " + ex.Message); }
+            });
 
             // 标签**不在这里开**：要等第一次现身时才知道该还原什么
             // （见 EnsureFirstTab：按本桌面记着的路径把标签摆回来，没记过才开一个「此电脑」）。
@@ -1278,29 +1284,57 @@ namespace TabbedExplorer
         // 跨窗口拖标签（用户要的多窗口 —— 体验照浏览器那套）
         // ==================================================================
 
-        /// <summary>拖出标签条：清一遍落点提示（真正的高亮由 `OnTabDragOutMove` 一路画）。</summary>
-        private void OnTabDragOutStart(int idx)
+        /// <summary>
+        /// 拖拽影窗（跟着鼠标跑的小浮窗，见 `DragGhost`）。**每个窗口一个、长期留着**，
+        /// 不能等开始拖了才现建：那是在鼠标已经按着、而且很可能已经被捕获的时候建窗口。
+        /// 构造函数尾部用 `Defer` 把它先建出来（建完就藏着），拖动时只剩 Show / 移位置。
+        /// </summary>
+        private DragGhost ghost;
+
+        /// <summary>拖拽影窗懒建 —— 句柄一建就留着，拖动途中不再动窗口创建这条路。</summary>
+        private DragGhost Ghost
         {
-            Diag.Step("EmbedForm: 标签拖出标签条 idx=" + idx);
+            get
+            {
+                if (ghost == null || ghost.IsDisposed) ghost = new DragGhost();
+                return ghost;
+            }
+        }
+
+        /// <summary>真开始拖了：把影窗摆到光标那儿（第二行告诉人"松手会发生什么"）。</summary>
+        private void OnTabDragBegan(TabStrip bar, int idx)
+        {
+            string t = (bar != null && bar.Tabs != null && idx >= 0 && idx < bar.Tabs.Count)
+                ? bar.Tabs[idx].Title : "";
+            Diag.Step("EmbedForm: 开始拖标签 idx=" + idx + "「" + t + "」");
             if (hub != null) hub.BeginTabDrag(this);
+            try { Ghost.Begin(t, hintNow(Cursor.Position), Cursor.Position); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 拖拽影窗起不来 " + ex.Message); }
         }
 
-        /// <summary>拖着跑：让 Hub 找落点，并给命中的那个窗口画插入线。</summary>
-        private void OnTabDragOutMove(Point screen)
+        /// <summary>拖着跑：更新影窗（位置 + 那句提示），并让 Hub 给命中的窗口画插入线。</summary>
+        private void OnTabDragMoved(Point screen)
         {
-            if (hub != null) hub.UpdateTabDrag(this, screen);
+            string hint = hintNow(screen);
+            try { Ghost.MoveTo(screen, hint); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 拖拽影窗移动失败 " + ex.Message); }
         }
 
-        /// <summary>在标签条之外松手：并进别的窗口，或者在鼠标位置另开一个。</summary>
-        private void OnTabDragOutDrop(int idx, Point screen)
+        /// <summary>松手：影窗收掉；松在标签条之外才把落点交给 Hub。</summary>
+        private void OnTabDragEnded(int idx, Point screen, bool outside)
         {
-            if (hub != null) hub.EndTabDrag(this, idx, screen);
+            try { Ghost.HideIt(); } catch { }
+            if (hub == null) return;
+            if (outside) hub.EndTabDrag(this, idx, screen);
+            else hub.CancelTabDrag(this);
         }
 
-        /// <summary>拖出去了又拖回来（在自己这条上松手）—— 落点提示撤掉，走正常的条内重排。</summary>
-        private void OnTabDragOutEnd()
+        /// <summary>问 Hub 现在这个落点松手会发生什么（顺带把落点提示画出来），给影窗第二行用。</summary>
+        private string hintNow(Point screen)
         {
-            if (hub != null) hub.CancelTabDrag(this);
+            if (hub == null) return "";
+            try { return hub.UpdateTabDrag(this, screen); }
+            catch (Exception ex) { Diag.Log("EmbedForm: 落点判定失败 " + ex.Message); return ""; }
         }
 
         /// <summary>Hub 用它给「被拖到本窗口上」的落点画那条插入线（`-1` = 撤掉）。</summary>

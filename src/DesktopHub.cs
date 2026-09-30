@@ -1499,8 +1499,11 @@ namespace TabbedExplorer
             Diag.Step("Hub: 标签拖出标签条 -> 开始跨窗口拖拽");
         }
 
-        /// <summary>拖动中：跟着鼠标把「该插到哪个窗口的第几位」实时画出来。</summary>
-        internal void UpdateTabDrag(EmbedForm src, Point screen)
+        /// <summary>
+        /// 拖动中：跟着鼠标把「该插到哪个窗口的第几位」实时画出来，
+        /// 并**返回一句人话**告诉用户现在松手会发生什么（显示在拖拽影窗上，见 `DragGhost`）。
+        /// </summary>
+        internal string UpdateTabDrag(EmbedForm src, Point screen)
         {
             EmbedForm t = FormAtScreen(screen);
             foreach (EmbedForm f in AllForms())
@@ -1508,6 +1511,12 @@ namespace TabbedExplorer
                 if (f == null || f.IsDisposed) continue;
                 f.SetDropHint(f != src && f == t ? f.DropIndexAt(screen) : -1);
             }
+
+            if (t != null && t != src) return "松手：并入这个窗口";
+            int away = src == null || src.IsDisposed ? int.MaxValue : src.DistanceFromTabBar(screen);
+            if (away == 0) return "松手：移到这个位置";
+            if (t != null && away < TypeSlop) return "松手：取消（离标签条太近）";
+            return "松手：在这里开一扇新窗口";
         }
 
         /// <summary>拖到一半又拖回自家标签条上（在自己这条上松手 = 走正常的条内重排，跨窗口这条作废）。</summary>

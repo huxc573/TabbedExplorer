@@ -274,6 +274,13 @@ namespace TabbedExplorer
             // 空格（「空格键预览」）：钩子线程只判「前台是不是我们某个宿主窗体」，
             // 真干活（问 shell 要选中项 + 起 QuickLook）投回 UI 线程，见 `OnSpacePreview`。
             hook.SpacePreview += delegate { Post(OnSpacePreview); };
+            // 方向键 / Esc / Enter（「换预览内容 / 关预览」，见 QLPreview）：同理，钩子线程只判前台，
+            // 真干活投回 UI 线程，见 `OnPreviewKey`。
+            hook.PreviewKey += delegate(int vk)
+            {
+                int k = vk;
+                Post(delegate { OnPreviewKey(k); });
+            };
             hook.Start();
 
             // 第二个实例被启动（双击 exe）时只会 set 一下这个事件，由我们现身。            // 事件挂在字段上、不能 using 掉 —— 注册等待之后句柄要一直活着。
@@ -2210,6 +2217,21 @@ namespace TabbedExplorer
             EmbedForm f = ForegroundForm();
             if (f == null) return;
             QLPreview.Do(f.ActiveTabPath);
+        }
+
+        /// <summary>
+        /// 方向键 / Esc / Enter（见 `QLPreview.PreviewKey`）：原生资源管理器里这几键也是 QuickLook 管的，
+        /// 但它的判据是**前台窗口的类名**，自绘宿主它不认 ⇒ 由我们替它转发。在 UI 线程上跑。
+        ///   · 方向键 ⇒ `DoSwitch`：读当前标签所在文件夹**此刻**的选中项发过去
+        ///     （卡点：钩子报的是**松开**，那会儿内嵌列表已经自己把选中项移完了）。
+        ///   · Esc / Enter ⇒ `DoClose`：关掉预览。Enter 仍然照常打开文件 —— 那是内嵌列表自己的事。
+        /// </summary>
+        private void OnPreviewKey(int vk)
+        {
+            EmbedForm f = ForegroundForm();
+            if (f == null) return;
+            if (QLPreview.IsCloseKey(vk)) { QLPreview.DoClose(); return; }
+            QLPreview.DoSwitch(f.ActiveTabPath);
         }
 
         /// <summary>

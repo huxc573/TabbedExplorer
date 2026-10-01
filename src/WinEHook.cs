@@ -80,6 +80,16 @@ namespace TabbedExplorer
         public event Action SpacePreview;
 
         /// <summary>
+        /// 松开了一条「预览导航键」（**方向键 / Esc / Enter**，见 `QLPreview` 的类注释）。
+        /// **在钩子线程上触发**（订阅者自己往 UI 线程转），参数是虚拟键码。
+        ///
+        /// 为什么要挂在**松开**上：按下那一刻内嵌列表还没处理这个键（它得先收到 `WM_KEYDOWN`），
+        /// 那时候问「你选中了谁」拿到的还是旧值。QuickLook 自己也是绑的 KeyUp。
+        /// ⚠ **绝不吞这些键** —— 方向键还要留给内嵌列表去移动选中项，我们只是回头把它移动之后的结果接上。
+        /// </summary>
+        public event Action<int> PreviewKey;
+
+        /// <summary>
         /// 我们的一个窗口句柄（只是「其中一个」）。**只有我们进程是前台时才接管快捷键** ——
         /// 否则就成了全局霸占 Ctrl+W（浏览器里关标签、别的编辑器里存盘都会被我吃掉）。
         /// 每张虚拟桌面一个窗口之后，这里不再拿它当唯一判据，见 OursIsForeground。
@@ -141,7 +151,17 @@ namespace TabbedExplorer
                             if (up)
                             {
                                 // 松开只清标志（空格预览「这次已经处理过了」那个），**绝不吞键**
-                                QLPreview.NoteKeyUp((int)st.vkCode);
+                                int uvk = (int)st.vkCode;
+                                QLPreview.NoteKeyUp(uvk);
+
+                                // 方向键 / Esc / Enter：原生资源管理器里这几键也归 QuickLook 管，但它的判据是
+                                // **前台窗口的类名**，我们自绘宿主它不认 ⇒ 由我们替它转发（见 QLPreview 类注释）。
+                                // ⚠ **绝不吞键**：方向键还要送给内嵌列表让它自己移动选中项。
+                                if ((QLPreview.IsArrowKey(uvk) || QLPreview.IsCloseKey(uvk)) && QLPreview.WantsNav())
+                                {
+                                    Action<int> nav = PreviewKey;
+                                    if (nav != null) nav(uvk);
+                                }
                             }
                             else if (Handle((int)st.vkCode))
                             {

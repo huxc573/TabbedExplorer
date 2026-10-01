@@ -39,16 +39,37 @@ namespace TabbedExplorer
     /// 用**搜索框**时，焦点在内嵌窗口的一个 `Edit` 上，而前台窗口仍然是我们的宿主窗体 ——
     /// 只看宿主白名单就会把他的中文输入直接吞成预览（用户实测报过）。判据见 `TextInputFocused`：
     /// 用 `GetGUIThreadInfo` 看前台线程里**真正有焦点的控件**，是文本框就整条让路。
+    ///
+    /// 方向键 / Esc / Enter（2026-09-30 补，用户报「在桌面按空格之后上下左右能换内容，我们不行」）：
+    /// 在原生资源管理器里这几键**也是 QuickLook 自己管的** —— 它有个全局键盘钩子
+    ///（`KeystrokeDispatcher`），KeyUp 时发 `Switch` / `Close`。但它的第一关是
+    /// `Shell32::GetFocusedWindowType()`，**只看前台窗口的类名**（`CabinetWClass` / `ExploreWClass` /
+    /// `Progman` / `WorkerW` …），我们自绘宿主过不了 ⇒ 它那一套到这里全哑。
+    /// 而它的管道消息里 **`Switch`(`SwitchPreview`) / `Close`(`ClosePreview`) 带路径时根本不看类名**，
+    /// 只要求预览窗已经开着（`!_viewerWindow.IsVisible` 就直接 return）⇒ 由**我们替它转发**：
+    ///   · 方向键（KeyUp，**不吞键**）：读「当前标签所在文件夹**此刻**的选中项」→ `Switch|路径|`。
+    ///     方向键本身仍归内嵌列表管，它自己会移动选中项；我们只是回头把它移动之后的结果接上去 ——
+    ///     跟桌面上的观感一致（那边也是「选中项一动，预览跟着换」，见 `getSelectedFromExplorer`）。
+    ///   · Esc / Enter → `Close||`（⚠ **不能**发 `RunAndClose`：它内部也先问一遍类名，对我们一律空转）。
+    /// ⚠ 「把宿主窗体伪装成 `CabinetWClass`、让 QuickLook 自己认」这条路**绝不能走**：本工程十几处
+    ///   （`DesktopHub` / `ExplorerHost` / `EmbedApi`）都是拿类名认 shell 顶层窗的，宿主一旦顶着这个
+    ///   类名，我们自己就会把宿主动成「shell 开着的窗口」去收编。
     /// </summary>
     internal static class QLPreview
     {
+        private const int VK_RETURN = 0x0D;
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
         private const int VK_CAPITAL = 0x14;   // CapsLock
+        private const int VK_ESCAPE = 0x1B;
+        private const int VK_SPACE = 0x20;
+        private const int VK_LEFT = 0x25;
+        private const int VK_UP = 0x26;
+        private const int VK_RIGHT = 0x27;
+        private const int VK_DOWN = 0x28;
         private const int VK_LWIN = 0x5B;
         private const int VK_RWIN = 0x5C;
-        private const int VK_SPACE = 0x20;
 
         /// <summary>
         /// 「这些键按着的时候，空格不是我们的」。**CapsLock 和 Win 必须在里面**：
@@ -64,6 +85,29 @@ namespace TabbedExplorer
 
         /// <summary>QuickLook 的跨进程消息名（照抄它自己的 `PipeMessages` 常量）。</summary>
         private const string MsgToggle = "QuickLook.App.PipeMessages.Toggle";
+
+        /// <summary>
+        /// 「换到某个文件」（`ViewWindowManager.SwitchPreview`）。⚠ 与 `Toggle` 的关键差别：**带路径时
+        /// 它完全不看前台窗口类名**，只要求预览窗已经活着（没开着就直接 return）—— 就靠这一条，
+        /// 我们才能在自绘宿主里接上方向键。
+        /// </summary>
+        private const string MsgSwitch = "QuickLook.App.PipeMessages.Switch";
+
+        /// <summary>「关掉预览」（`ViewWindowManager.ClosePreview`）。**无条件**关，不看类名也不看前台是谁。</summary>
+        private const string MsgClose = "QuickLook.App.PipeMessages.Close";
+
+        /// <summary>
+        /// QuickLook 的 WPF 窗口类名里都带这一段（本机实测 `HwndWrapper[QuickLook.exe;;&lt;guid&gt;]`）。
+        /// 拿它认「常驻实例的窗口」，见 <see cref="PreviewVisible"/>。
+        /// </summary>
+        private const string WindowClassMark = "QuickLook.exe";
+
+        /// <summary>
+        /// 两次「换预览」之间至少隔这么久（毫秒）。`SelectedPathsIn` 一次全量枚举 16~41ms 且只能在
+        /// UI 线程跑，而方向键长按会被连发 —— 超了就丢掉这一下（QuickLook 侧本来也会把上一次未执行的
+        /// 派发任务作废，见 `PipeServerManager._lastOperation`）。
+        /// </summary>
+        private const int NavMinGapMs = 90;
 
         /// <summary>
         /// 连管道的超时（毫秒）。**必须给** —— `NamedPipeClientStream.Connect()` 不传超时是
@@ -90,6 +134,12 @@ namespace TabbedExplorer
         /// <summary>这一次按下的空格已经处理过了（防长按那串重复的 `WM_KEYDOWN` 连着弹好几次预览）。</summary>
         private static bool spaceDown;
 
+        /// <summary>上一次「换预览」尝试的时刻（见 `NavMinGapMs`）。只在 UI 线程读写。</summary>
+        private static int lastNavTick;
+
+        /// <summary>上一次发出去的预览路径（`Toggle` / `Switch` 都记）。选择没动就别再发一遍。只在 UI 线程读写。</summary>
+        private static string lastNavPath;
+
         /// <summary>把宿主窗体句柄同步进来。只在 UI 线程调（`DesktopHub.SyncHosts`）。</summary>
         public static void SetHosts(List<IntPtr> list)
         {
@@ -110,8 +160,42 @@ namespace TabbedExplorer
         /// </summary>
         public static bool WantsSpace()
         {
-            if (!Settings.QLPreview) return false;
             if (spaceDown) return false;
+            if (!OurGate()) return false;
+            spaceDown = true;
+            return true;
+        }
+
+        /// <summary>
+        /// 方向键 / Esc / Enter 该不该归我们转发（**钩子线程**：只读字段 + 纯 Win32）。
+        /// 跟空格同一套闸（见 <see cref="OurGate"/>），但**不碰 `spaceDown`** —— 那是空格专用的
+        /// 「这一次按下已经处理过」标记。
+        /// </summary>
+        public static bool WantsNav()
+        {
+            return OurGate();
+        }
+
+        /// <summary>方向键（发 `Switch`：换到某个文件）。</summary>
+        public static bool IsArrowKey(int vk)
+        {
+            return vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN;
+        }
+
+        /// <summary>Esc / Enter（发 `Close`：关掉预览）。原生里这两键也是 QuickLook 管的。</summary>
+        public static bool IsCloseKey(int vk)
+        {
+            return vk == VK_ESCAPE || vk == VK_RETURN;
+        }
+
+        /// <summary>
+        /// 空格与导航键共用的四道闸：开关开着、**没按着别的键**（见 `HeldModifiers` —— Ctrl+空格、
+        /// Win+空格、CapsLock+空格 一个都不能抢）、前台是我们某个宿主窗体、**且焦点不在文本框里**
+        /// （否则是在改名字/打地址，键归文本和输入法）。
+        /// </summary>
+        private static bool OurGate()
+        {
+            if (!Settings.QLPreview) return false;
             for (int i = 0; i < HeldModifiers.Length; i++)
             {
                 if ((NativeMethods.GetAsyncKeyState(HeldModifiers[i]) & 0x8000) != 0) return false;
@@ -130,11 +214,8 @@ namespace TabbedExplorer
             }
             if (!ours) return false;
 
-            // 焦点在文本框里（重命名框 / 地址栏 / 搜索框）= 在打字 —— 空格归文本和输入法，绝不碰。
-            if (TextInputFocused(fg)) return false;
-
-            spaceDown = true;
-            return true;
+            // 焦点在文本框里（重命名框 / 地址栏 / 搜索框）= 在打字 —— 键归文本和输入法，绝不碰。
+            return !TextInputFocused(fg);
         }
 
         /// <summary>
@@ -184,10 +265,90 @@ namespace TabbedExplorer
             List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
             if (sel.Count == 0) return;
 
+            lastNavPath = sel[0];
             Preview(sel[0]);
             Diag.Step("QLPreview: 预览 " + sel[0]);   // ⚠ 记账放在预览**之后**：这条落盘是
                                                      // 每行一次 `AppendAllText`（开→写→关），
                                                      // Debug 开着时别让它挡在预览前面。
+        }
+
+        /// <summary>
+        /// 方向键（**UI 线程**，由 `DesktopHub` 从钩子投过来）：把 `folder` 里**此刻**选中的那一项
+        /// 用 `Switch` 发给常驻实例 —— 等于替 QuickLook 做了它自己做不了的那一步（见类注释）。
+        ///
+        /// 为什么读「此刻的选中项」而不是自己算「下一个」：QuickLook 在原生资源管理器里也**不是**自己算的
+        /// —— 它靠它自己的钩子收到方向键后重新问前台窗口选了什么（`Shell32::GetCurrentSelection`）。
+        /// 而方向键本身是**内嵌列表**去移动选中项的（我们不吞键），所以松开时读一次拿到的就是它移动后的
+        /// 结果，与桌面上按方向键的观感一致。
+        ///
+        /// ⚠ 必须在**松开**时读：按下那一刻列表还没处理这个键（它得先收到 `WM_KEYDOWN`），那时候问到的
+        ///   还是旧选中项。QuickLook 自己也是绑的 KeyUp（`KeystrokeDispatcher`）。
+        ///
+        /// 两道省钱闸（`SelectedPathsIn` 一次枚举 16~41ms，长按方向键会被连发）：
+        ///   · <see cref="PreviewVisible"/> —— 预览没开就一眼都不看（最常见的情形：平时拿方向键翻目录）；
+        ///   · <see cref="NavMinGapMs"/> —— 最短间隔，超了就丢掉这一下。
+        /// </summary>
+        public static void DoSwitch(string folder)
+        {
+            if (string.IsNullOrEmpty(folder)) return;
+            if (!PreviewVisible()) return;
+
+            int now = Environment.TickCount;
+            if (unchecked(now - lastNavTick) < NavMinGapMs) return;
+            lastNavTick = now;
+
+            List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
+            if (sel.Count == 0) return;
+            if (string.Equals(sel[0], lastNavPath, StringComparison.OrdinalIgnoreCase)) return;  // 选择没动，白跑一趟
+            lastNavPath = sel[0];
+
+            if (Send(MsgSwitch, sel[0])) Diag.Step("QLPreview: 切换 " + sel[0]);
+        }
+
+        /// <summary>
+        /// Esc / Enter（**UI 线程**）：关掉预览。
+        /// ⚠ 这里**不能**发 `RunAndClose`：它内部先问一遍 `GetFocusedWindowType()`，对我们一律是 `Invalid`，
+        ///   于是跳过「关窗、交给系统开」那条路，又撞上 `IsForegroundWindowBelongToSelf()`（前台是我们的宿主，
+        ///   不是 QuickLook 自己）⇒ 什么都不做。`Close` 是**无条件**关窗的，正是我们要的。
+        /// </summary>
+        public static void DoClose()
+        {
+            if (!PreviewVisible()) return;
+            lastNavPath = null;
+            Send(MsgClose, "");
+        }
+
+        /// <summary>
+        /// 常驻实例**现在是不是开着预览窗**。
+        ///
+        /// 判据：QuickLook 的窗口都是 WPF 的，类名长 `HwndWrapper[QuickLook.exe;;&lt;guid&gt;]`
+        /// （本机实测：常驻进程有 3 扇这种窗，闲置时全都不可见；预览一露脸就看得到可见的那一扇）。
+        /// 只认「可见」，**不认标题** —— 标题会跟着预览的文件变。
+        ///
+        /// 为什么非要这道闸：`SelectedPathsIn` 一次 16~41ms 且只能在 UI 线程跑，而**平时拿方向键翻目录
+        /// 根本不关预览的事** —— 没它的话，每次方向键都要白花这几十毫秒，界面会一格一格地顿。
+        /// ⚠ 判错的代价是不对称的：判成「开着」只是多枚举一次（无害），判成「没开」则方向键不换内容
+        ///   ⇒ 所以**宁可宽一点**（任何可见的 QuickLook WPF 窗都算数）。
+        /// </summary>
+        private static bool PreviewVisible()
+        {
+            try
+            {
+                bool vis = false;
+                EmbedApi.EnumWindowsProc cb = null;
+                cb = delegate(IntPtr h, IntPtr l)
+                {
+                    if (!EmbedApi.IsWindowVisible(h)) return true;
+                    string c = EmbedApi.ClassOf(h);
+                    if (c == null || c.IndexOf(WindowClassMark, StringComparison.OrdinalIgnoreCase) < 0) return true;
+                    vis = true;
+                    return false;
+                };
+                EmbedApi.EnumWindows(cb, IntPtr.Zero);
+                GC.KeepAlive(cb);
+                return vis;
+            }
+            catch { return false; }
         }
 
         /// <summary>
@@ -207,15 +368,28 @@ namespace TabbedExplorer
         /// </summary>
         public static void Preview(string path)
         {
-            if (SendViaPipe(path)) return;
+            Send(MsgToggle, path);
+        }
+
+        /// <summary>
+        /// 发一条消息给常驻实例。先走管道；管道不通再回退到「起第二实例」那条老路
+        /// （第二实例会把 `Toggle` 转给常驻的那个；对 `Switch` 也够用 —— 预览已经开着时
+        /// `Toggle(别的文件)` 的语义就是「切过去」，见 `ViewWindowManager.TogglePreview`）。
+        /// ⚠ 唯独 `Close` **不走回退**：第二实例关不掉那个常驻窗口，起了也是白发一个进程。
+        /// </summary>
+        private static bool Send(string msg, string path)
+        {
+            if (SendViaPipe(msg, path)) return true;
+            if (msg == MsgClose) return false;
 
             string exe = FindExe();
-            if (exe == null) { Diag.Step("QLPreview: 管道不通，也找不到 QuickLook.exe"); return; }
+            if (exe == null) { Diag.Step("QLPreview: 管道不通，也找不到 QuickLook.exe"); return false; }
             LegacyStart(exe, path);
+            return true;
         }
 
         /// <summary>往常驻实例的命名管道写一行消息。连上并写完返回 true。</summary>
-        private static bool SendViaPipe(string path)
+        private static bool SendViaPipe(string msg, string path)
         {
             string name = PipeNameOf();
             if (string.IsNullOrEmpty(name)) return false;
@@ -226,7 +400,10 @@ namespace TabbedExplorer
                     c.Connect(PipeConnectMs);
                     using (StreamWriter w = new StreamWriter(c, new UTF8Encoding(false)))
                     {
-                        w.WriteLine(MsgToggle + "|" + path + "|");
+                        // 协议是 `消息|路径|选项`：路径/选项可以为空，但那两根竖线必须都在
+                        //（服务端按 `Split('|')` 取，因为 `Split.Length <= 1` 会被当成非法消息丢掉）。
+                        // ⚠ `Close` 发出去的是 `Close||`，不是空行 —— 空行会让它 `ReadLine()` 拿到 null。
+                        w.WriteLine(msg + "|" + path + "|");
                         w.Flush();
                     }
                 }

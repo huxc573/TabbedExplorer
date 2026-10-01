@@ -849,7 +849,13 @@ namespace TabbedExplorer
                 return;
             }
             DesktopMemory.Bucket b = (hub == null) ? null : hub.MemoryOf(DesktopKey);
-            if (b == null || string.IsNullOrEmpty(b.Bounds)) return;
+            if (b == null || string.IsNullOrEmpty(b.Bounds))
+            {
+                // 别把这一句省成 return —— 这是「窗口怎么是默认尺寸」唯一没有痕迹的分支，
+                // 之前查那个 bug 时就是卡在这里（记忆里没这张桌面的桶 / 桶里没 bounds）。
+                Diag.Step("窗口: 记忆里没有 " + DesktopKey + " 的窗口尺寸 -> 用默认尺寸");
+                return;
+            }
 
             string[] p = b.Bounds.Split(',');
             int x, y, w, h;
@@ -879,10 +885,16 @@ namespace TabbedExplorer
             }
 
             if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            // 起点改成 Manual 再摆：`CenterScreen` 是按**构造时**的尺寸居中算的（见 `CreateExtraWindow`
+            // 那条注释），句柄建得晚的时候会在 `Show()` 那一刻把这里摆好的位置整个盖掉。
+            StartPosition = FormStartPosition.Manual;
             Bounds = r;
             bool max = (p.Length >= 5 && p[4].Trim() == "1");
-            Diag.Step("窗口: 还原位置和大小 " + b.Bounds);
             if (max) WindowState = FormWindowState.Maximized;
+            // 「摆上后」那一截是给「明明还原过、用户还是看到默认尺寸」这类故障对账用的：
+            // 赋值不一定真的落到位（窗口还没句柄 / 被别的东西盖掉），光看记忆里那份看不出来。
+            Diag.Step("窗口: 还原位置和大小 " + b.Bounds + "（摆上后 " + Bounds.Width + "x" + Bounds.Height
+                      + "，状态 " + WindowState + "）");
         }
 
         /// <summary>
@@ -1244,11 +1256,15 @@ namespace TabbedExplorer
                 }
 
                 ApplyRememberedBounds();
+                bool firstShow = !Visible;
                 if (!Visible) Show();
                 windowShown = true;
                 preloadBatch = false;      // 有人在等了 —— 预加载那档「慢慢来」到此为止（见 preloadBatch）
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
+                if (firstShow)
+                    Diag.Step("EmbedForm: 首次现身（Win+E）窗口=" + Bounds.Width + "x" + Bounds.Height
+                              + " @" + Bounds.X + "," + Bounds.Y);
 
                 EnsureFirstTab();
 
@@ -1530,11 +1546,24 @@ namespace TabbedExplorer
             if (IsDisposed || Disposing) return;
             try
             {
+                // ⚠ 这条路的首次现身**也要**把记忆里的窗口位置和大小摆上：收编用户自己开的窗、
+                //   以及 shell 那扇窗「转生」过来，走的都是这里而不是 `ShowForUser`。
+                //   少了这一句，窗口会拿构造函数里的默认尺寸露脸，而且紧接着 `MarkDirty`
+                //   → `BoundsString` 会把这个默认尺寸**写回记忆**，把用户上次调好的尺寸洗掉
+                //   （用户报的「程序重启后窗口大小还原默认」就是这条）。
+                //   排在 `Show()` **之前** —— 不然会先按默认尺寸画一帧再跳成记忆里的尺寸。
+                ApplyRememberedBounds();
+                bool firstShow = !Visible;
                 if (!Visible) Show();
                 windowShown = true;
                 preloadBatch = false;      // 见 preloadBatch
                 if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                 ActivateToFront();
+                // 「窗口怎么是这个尺寸」要能一眼对账：只在**第一次露面**记一行（这条路每次收编都会走，
+                // 每次都记就成了刷屏）。
+                if (firstShow)
+                    Diag.Step("EmbedForm: 首次现身（收编/转生）窗口=" + Bounds.Width + "x" + Bounds.Height
+                              + " @" + Bounds.X + "," + Bounds.Y);
                 // ★ 前面那句「收标签」（`NewAdoptedTab` → `Activate`）可能是在 `windowShown` 还是 false
                 //   的时候跑的（收编这条路的顺序就是「先收标签、再 ShowForCapture」）—— 那一下可见性
                 //   被那道闸挡掉了。这会儿是真露面了，按 activeIndex 把「谁可见、谁有焦点」补一遍；
@@ -1807,6 +1836,12 @@ namespace TabbedExplorer
         /// </summary>
         internal void ActivateToFront()
         {
+            // 兜底：**任何**一条「第一次把窗口顶出来」的路都要先把记忆里的尺寸摆上 ——
+            // `ShowForUser` / `ShowForCapture` 各自在前面已经摆过一次（这里是幂等的，`boundsDone` 挡着），
+            // 留着它是为了以后新加一条露窗的路不会再漏掉这一句。
+            // 额外窗口不读记忆（它就开在鼠标松手那儿，见 `ShowExtra`），所以排掉。
+            if (!IsExtra) ApplyRememberedBounds();
+
             IntPtr h = Handle;
             if (NativeMethods.IsIconic(h)) NativeMethods.ShowWindow(h, 9);   // SW_RESTORE
             else NativeMethods.ShowWindow(h, 5);                             // SW_SHOW
@@ -1972,6 +2007,43 @@ namespace TabbedExplorer
                 if (PathRules.Norm(LivePath(hosts[i])) == want) return i;
             }
             return -1;
+        }
+
+        /// <summary>
+        /// 把键盘焦点交给「正开在 <paramref name="path"/> 这个目录上」的那个标签里的 explorer。
+        ///
+        /// 为什么要它（用户报的「原生自动选中文件夹后，我可以上下左右或者 enter 进去，你这个不行」）：
+        /// 三方程序（wb / VS Code / 各种「在资源管理器中显示」）点开文件夹走的是
+        /// `explorer /select,"&lt;目标&gt;"`，原生那一下之所以紧接着就能用上下左右挪选中项、用 Enter 进去，
+        /// 靠的是**文件列表拿着键盘焦点**。我们这边把选中项「摆」回去只画了个高亮，
+        /// 焦点还在我们自己的窗体 / 标签条上 —— 键盘敲下去没人接。
+        ///
+        /// ⚠ 两条闸，缺一个都会变成「抢用户焦点」：
+        ///   · 只认**当前标签**：摆选中项是重试的（最多 8 秒），用户中途切走标签了就别抢回来；
+        ///   · 只认**本窗口是前台**：多窗口 / 多个虚拟桌面时，别的窗可能正在摆它自己的那份。
+        /// </summary>
+        public bool FocusFolder(string path)
+        {
+            if (string.IsNullOrEmpty(path) || IsDisposed) return false;
+            int i = IndexOfPath(path);
+            if (i < 0 || i != activeIndex)
+            {
+                // 失败要说得出为什么 —— 这条路上「静默 return」就等于「用户敲键盘没反应」，
+                // 上一轮就是卡在这儿查不出来的（2026-10-01 23:00:52 那次真因是地址栏轮询没跟上，
+                // 见 `RevealNow` 里那段注释）。
+                Diag.Step("EmbedForm: 没交键盘焦点（" + (i < 0 ? "找不到这个路径的标签" : "它不是当前标签")
+                          + "，找得到的是 idx=" + i + "，当前 idx=" + activeIndex + "）：" + path);
+                return false;
+            }
+            if (NativeMethods.GetForegroundWindow() != Handle)
+            {
+                Diag.Step("EmbedForm: 没交键盘焦点（这一刻我们不是前台）：" + path);
+                return false;
+            }
+            ExplorerHost h = hosts[i];
+            if (h == null) { Diag.Step("EmbedForm: 没交键盘焦点（标签的宿主没了）：" + path); return false; }
+            h.Focus();
+            return true;
         }
 
         /// <summary>
@@ -2516,7 +2588,13 @@ namespace TabbedExplorer
             ExplorerHost h = revealPending;
             revealPending = null;
             BeatReveal(false);
-            if (h != null) h.PendingPath = null;   // 到位了，路径以地址栏为准（见 LivePath）
+            // ⚠ 这里**不能**顺手把 `PendingPath` 抹掉（原来就是那么写的，是个坑）：
+            //   判「到位」靠的是外壳窗口刚读到的地址栏原文，而 `ExplorerHost.currentPath` 是**轮询**
+            //   地址栏读回来的，两者实测差 ~0.9 秒（2026-10-01 23:00:52 那次）。
+            //   这中间 `LivePath` 一退回旧目录，`IndexOfPath` 就找不到这个标签
+            //   ⇒ `FocusFolder` 静默失败 ⇒ 用户看到「选中项摆上了，可上下左右按下去没反应」。
+            //   `PendingPath` 有它自己的收口：地址栏轮询一读到新路径就清（见 ExplorerHost 的
+            //   `PathRules.Same(s, PendingPath)` 那一句），留着它只会让这几百毫秒里的路径是对的。
             if (h == null || IsDisposed || Disposing) return;
             if (!hosts.Contains(h)) return;
             h.Host.Visible = true;

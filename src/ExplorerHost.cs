@@ -856,14 +856,23 @@ namespace TabbedExplorer
         /// </summary>
         public void Focus()
         {
-            if (!embedded || CabWindow == IntPtr.Zero) return;
+            if (!embedded || CabWindow == IntPtr.Zero)
+            {
+                Diag.Step("Embed: 交键盘焦点失败（还没收编好 / 壳窗没了）");
+                return;
+            }
             uint ourTid = EmbedApi.GetCurrentThreadId();
             uint cabTid = EmbedApi.GetWindowThreadProcessId(CabWindow, IntPtr.Zero);
-            if (cabTid == 0) return;
+            if (cabTid == 0) { Diag.Step("Embed: 交键盘焦点失败（问不出壳窗线程）"); return; }
 
             IntPtr target = WinFind.ByClass(CabWindow, "SHELLDLL_DefView");
             if (target == IntPtr.Zero) target = WinFind.ByClass(CabWindow, "DirectUIHWND");
-            if (target == IntPtr.Zero) return;
+            if (target == IntPtr.Zero)
+            {
+                Diag.Step("Embed: 交键盘焦点失败（壳窗里找不到列表控件）cab=0x"
+                          + CabWindow.ToInt64().ToString("X"));
+                return;
+            }
 
             bool attached = false;
             try
@@ -882,6 +891,17 @@ namespace TabbedExplorer
                     try { EmbedApi.AttachThreadInput(ourTid, cabTid, false); } catch { }
                 }
             }
+
+            // 交完回头看一眼**它到底落在谁身上**：`SetFocus` 跨进程没有返回值，而
+            // 「压根没交上」和「交上了转眼又被抢走」在用户那儿长得一模一样（都是敲键盘没反应）。
+            // 只记没落到目标那一种，正常切标签（落点就是目标）不会刷屏。
+            IntPtr got = EmbedApi.FocusedWindowOf(cabTid);
+            if (got != target)
+                Diag.Step(string.Format("Embed: 交键盘焦点没落到位 -> 目标 {0} 0x{1:X}（可见={2}），实际在 {3} 0x{4:X}（附着={5}）",
+                    EmbedApi.ClassOf(target), target.ToInt64(),
+                    EmbedApi.IsWindowVisible(target) ? "是" : "否",
+                    got == IntPtr.Zero ? "(空)" : EmbedApi.ClassOf(got), got.ToInt64(),
+                    attached ? "是" : "否"));
         }
 
         private void OnTitlePoll(object sender, EventArgs e)

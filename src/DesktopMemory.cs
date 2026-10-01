@@ -206,6 +206,23 @@ namespace TabbedExplorer
         {
             return string.Equals(Norm(a), Norm(b), StringComparison.Ordinal);
         }
+
+        /// <summary>
+        /// 取上一级目录（`D:\a\b` → `D:\a`；盘根 `D:\` 就返回它自己）。
+        /// 给「三方点开的文件夹其实是要在父目录里选中它」那条用（见 `DesktopHub.ScheduleReveal`）：
+        /// 那扇 shell 窗报回来的选中项要和「我们开的目录」对上，判据就是「选中项的父目录 == 那个目录」。
+        /// ⚠ 返回的也是 <see cref="Norm"/> 过的形式（小写、无尾斜杠），调用方一律用 <see cref="Same"/> 比。
+        /// </summary>
+        public static string ParentOf(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return "";
+            string s = Norm(p);
+            if (s.Length <= 3) return s;                       // `d:\` 这种根：没有上一级
+            int i = s.LastIndexOf('\\');
+            if (i < 0) return "";
+            if (i == 2) return s.Substring(0, 3);              // `d:\a` → `d:\`
+            return s.Substring(0, i);
+        }
     }
 
     /// <summary>

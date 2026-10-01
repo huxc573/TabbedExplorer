@@ -133,6 +133,52 @@ namespace TabbedExplorer
             try { SetWindowRgn(h, IntPtr.Zero, true); } catch { }
         }
 
+        /// <summary>
+        /// DWM 的「非客户区渲染策略」。**`SetWindowRgn` 管不到 DWM 画的标题栏/右上角那三个按钮** ——
+        /// 2026-10-02 对照实验（`probe/ncrender_probe.py`）坐实：清空绘制区之后，客户区确实不画了，
+        /// 但那三个按钮原封不动地留在屏幕上（亮像素数没减少）。关掉它才能连非客户区一起不画。
+        /// </summary>
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        private const int DWMWA_NCRENDERING_POLICY = 2;
+        private const int DWMNCRP_USEWINDOWSTYLE = 0;
+        private const int DWMNCRP_DISABLED = 1;
+
+        /// <summary>
+        /// 连 DWM 画的非客户区（标题栏 + 最小化/最大化/关闭三个按钮）一起按住。
+        ///
+        /// 为什么需要这一手（2026-10-02，`probe/ncrender_probe.py` 对照实验）：
+        ///   只靠 <see cref="MakeBlank"/>（空绘制区）时，客户区不画了，但 **DWM 画的那三个按钮
+        ///   照样留在屏幕上** —— 用户看到的就是「没有标题栏、只剩右上角三个按钮」。这是 Win10
+        ///   DWM 的既定行为：`SetWindowRgn` 对 DWM 合成的非客户区无效。
+        ///
+        /// ⚠ 与那条红线（不改样式位）不冲突：这里改的是 DWM 的**渲染策略**，不是 `GWL_EXSTYLE`；
+        ///   可逆（<see cref="RestoreNonClient"/> 一句还原），不会在 shell 进程里留任何东西。
+        /// </summary>
+        public static void BlankNonClient(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            try
+            {
+                int v = DWMNCRP_DISABLED;
+                DwmSetWindowAttribute(h, DWMWA_NCRENDERING_POLICY, ref v, 4);
+            }
+            catch { }
+        }
+
+        /// <summary>还原 <see cref="BlankNonClient"/>（收尾必做，跟绘制区一样是对称的一对）。</summary>
+        public static void RestoreNonClient(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return;
+            try
+            {
+                int v = DWMNCRP_USEWINDOWSTYLE;
+                DwmSetWindowAttribute(h, DWMWA_NCRENDERING_POLICY, ref v, 4);
+            }
+            catch { }
+        }
+
         /// <summary>读窗口样式，统一按 32 位无符号处理（避免 0x80000000 位被符号扩展搞乱）。</summary>
         public static uint GetStyle(IntPtr h)
         {

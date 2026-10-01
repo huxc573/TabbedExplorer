@@ -53,6 +53,12 @@ namespace TabbedExplorer
         /// </summary>
         private const int Lookback = 8;
 
+        /// <summary>
+        /// <see cref="SelectedPathOfWindow"/> 从清单队尾往前找几项。比 <see cref="Lookback"/> 宽，因为那 800ms 里
+        /// 我们自己开标签的窗口也在往队尾追加，会把目标往后挤。只翻这么多项就是为了把「反复轮询」压到 2~4ms。
+        /// </summary>
+        private const int RevealLookback = 24;
+
         /// <summary>上次全量登记的时间（见 <see cref="ExcludeOurs"/> 里的节流）。</summary>
         private static DateTime lastRun = DateTime.MinValue;
         private static readonly TimeSpan minInterval = TimeSpan.FromSeconds(2);
@@ -91,6 +97,7 @@ namespace TabbedExplorer
 
         private const short VT_I4 = 3;                  // 32 位整数
         private const short VT_BSTR = 8;                // 宽字符串（BSTR）
+        private const short VT_DISPATCH = 9;            // 一个 IDispatch*（`SelectItem` 要的 FolderItem）
         private const short VT_BOOL = 11;               // VARIANT_TRUE = -1
         private const short VT_VARIANT = 12;            // 「值是个 VARIANT」
         private const short VT_BYREF = 0x4000;          // 按引用传
@@ -332,28 +339,188 @@ namespace TabbedExplorer
                     if (p == null) continue;
                     if (!string.Equals(p.TrimEnd('\\'), want, StringComparison.OrdinalIgnoreCase)) continue;
 
-                    IDispatch doc = ReadObject(item, "Document");
-                    if (doc == null) return res;
-
-                    IDispatch items = InvokeGet(doc, "SelectedItems");
-                    int n = items == null ? 0 : ReadInt(items, "Count");
-                    for (int j = 0; j < n; j++)
-                    {
-                        IDispatch fi = ReadItem(items, j);
-                        string sp = fi == null ? null : ReadString(fi, "Path");
-                        if (!string.IsNullOrEmpty(sp)) res.Add(sp);
-                    }
-                    if (res.Count == 0)
-                    {
-                        IDispatch foc = ReadObject(doc, "FocusedItem");
-                        string fp = foc == null ? null : ReadString(foc, "Path");
-                        if (!string.IsNullOrEmpty(fp)) res.Add(fp);
-                    }
+                    ReadSelection(item, res);
                     return res;         // 找到那一项了，不管有没有选中都收工
                 }
             }
             catch (Exception ex) { Diag.Log("ShellReg: 读选中项失败 " + ex.Message); }
             return res;
+        }
+
+        /// <summary>
+        /// 某扇 shell 窗口**现在选中了什么**（第一个，完整路径）。给「三方在资源管理器里显示某个文件/文件夹」
+        /// 那条用：原生那一下是**在父目录里把目标选中**的，我们只把目录开成标签就把这个意图丢了
+        /// （见 `DesktopHub.TakeOverShellWindow` / `ScheduleReveal`）。
+        ///
+        /// 跟 <see cref="SelectedPathsIn"/> 只差「怎么找到那一项」：这里按 **HWND** 找 —— 调用它的
+        /// 那一刻那扇窗**还是顶层窗**（shell 自己的窗我们从不 SetParent），所以句柄对得上。
+        /// ⚠ 只在它**还活着**的时候才有答案：shell 一关，清单里那一项也就没了。它活多久见
+        ///   `DesktopHub.ShellSettleMs`（读到路径后还有 800ms）。
+        ///
+        /// 从**队尾**往前找（理由同 <see cref="Lookback"/>）：要问的那扇窗是刚建出来的、必在末尾几项里，
+        /// 只翻 `RevealLookback` 项实测 2~4ms —— 而全量枚举是 16~41ms，而这一条要被**反复轮询**。
+        /// ⚠ 余量比 `Lookback` 给得宽：那 800ms 里我们自己开标签的窗口也在往队尾追加，会把目标往后挤。
+        /// </summary>
+        internal static string SelectedPathOfWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return null;
+            try
+            {
+                Application.OleRequired();
+                Type t = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (t == null) return null;
+                IDispatch root = Activator.CreateInstance(t) as IDispatch;
+                if (root == null) return null;
+
+                int total = ReadInt(root, "Count");
+                for (int i = 0; i < RevealLookback && i < total; i++)
+                {
+                    IDispatch item = ReadItem(root, total - 1 - i);
+                    if (item == null) continue;
+                    if (ReadHwnd(item) != hwnd) continue;
+                    List<string> res = new List<string>();
+                    ReadSelection(item, res);
+                    return res.Count > 0 ? res[0] : null;
+                }
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 读窗口选中项失败 " + ex.Message); }
+            return null;
+        }
+
+        /// <summary>
+        /// 让**某个已经开着 <paramref name="folderPath"/> 的窗口**选中 <paramref name="itemPath"/>。
+        ///
+        /// 怎么调（照文档 `shellfolderview-selectitem`）：
+        ///   `Document`（就是 `ShellFolderView`，本文件取 `SelectedItems` 用的就是它）
+        ///   → `Document.Folder.ParseName(&lt;名字&gt;)` 拿到 `FolderItem`
+        ///   → `Document.SelectItem(folderItem, 29)`。`29 = 1|4|8|16` = 选中 + 只留它 + 滚进视线 + 给焦点。
+        /// ⚠ 形参要一个 **FolderItem 对象**，不是字符串（文档写明）—— 网上流传的「直接传路径」不是文档口径。
+        /// ⚠ 找哪扇窗：清单项的 `HWND` 对**我们的**标签全是宿主窗体（见类注释），只能按 `LocationURL` 认；
+        ///   同一个目录开着两个标签时会撞 —— 先接受（选中的还是这个目录里的东西）。
+        ///   ★ **必须排掉 <paramref name="exclude"/> 那扇窗**：那正是刚把用户引过来的 shell 自己的窗，
+        ///   它开着同一个目录、而且 `/select,` 本来就把它选中了 ⇒ 摆到它身上会「核对轻松通过」，
+        ///   可它下一秒就被关掉，用户什么也没看到（实测 2026-10-01：标签的 explorer 还在加载、
+        ///   目录下根本没有我们的窗，于是唯一匹配就是它 —— 摆完 272ms 后就被关了）。
+        /// ⚠ `SelectItem` 没有返回值，只能**读回来核对**（选中项对不对得上）。
+        /// </summary>
+        internal static bool SelectItemInWindow(string folderPath, string itemPath, IntPtr exclude)
+        {
+            if (string.IsNullOrEmpty(folderPath) || string.IsNullOrEmpty(itemPath)) return false;
+            try
+            {
+                Application.OleRequired();
+                Type t = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (t == null) return false;
+                IDispatch root = Activator.CreateInstance(t) as IDispatch;
+                if (root == null) return false;
+
+                string want = folderPath.TrimEnd('\\');
+                string name = LastSegment(itemPath);
+                if (string.IsNullOrEmpty(name)) return false;
+
+                // 先挑窗、再动手：队尾往前第一扇**正显示着**的（我们的标签如果在那儿，它就是用户看的那扇），
+                // 一扇可见的都没有才退回队尾第一扇（可能还在加载 / 被藏在后台）。
+                IDispatch item = null;
+                IntPtr pickedHwnd = IntPtr.Zero;
+                IDispatch fallback = null;
+                IntPtr fallbackHwnd = IntPtr.Zero;
+                int total = ReadInt(root, "Count");
+                for (int i = 0; i < total; i++)
+                {
+                    IDispatch it = ReadItem(root, total - 1 - i);        // 队尾往前
+                    if (it == null) continue;
+                    string p = FileUrlToPath(ReadString(it, "LocationURL"));
+                    if (p == null) continue;
+                    if (!string.Equals(p.TrimEnd('\\'), want, StringComparison.OrdinalIgnoreCase)) continue;
+                    IntPtr hw = ReadHwnd(it);
+                    if (exclude != IntPtr.Zero && hw == exclude) continue;      // ★ 绝不摆到它身上
+                    if (fallback == null) { fallback = it; fallbackHwnd = hw; }
+                    if (EmbedApi.IsWindowVisible(hw)) { item = it; pickedHwnd = hw; break; }
+                }
+                if (item == null) { item = fallback; pickedHwnd = fallbackHwnd; }
+                if (item == null) return false;      // 目录下还没有我们的窗（标签还在加载）—— 交给调用方重试
+
+                IDispatch doc = ReadObject(item, "Document");
+                if (doc == null) { Diag.Log("ShellReg: 拿不到 Document"); return false; }
+                IDispatch folder = ReadObject(doc, "Folder");
+                if (folder == null) { Diag.Log("ShellReg: 拿不到 Document.Folder"); return false; }
+                IDispatch fi = Call1String(folder, "ParseName", name);
+                if (fi == null) { Diag.Log("ShellReg: ParseName 找不到 " + name); return false; }
+                if (!CallDispatchInt(doc, "SelectItem", fi, 29)) return false;
+
+                // ⚠ 核对要分得清「真选中了」和「只是焦点落上去了」：`SelectItem` 没有返回值，
+                //   而 `SelectedItems()` 为空时 `FocusedItem` 仍会报回目标 —— 两个混着读会把
+                //   「高亮没上」判成成功（用户看到的就成了「日志说摆了、可没选中」）。分开读、分开记。
+                List<string> now = new List<string>();
+                ReadSelected(doc, now);
+                if (Holds(now, itemPath))
+                {
+                    Diag.Step(string.Format("ShellReg: 摆选中项到 cab=0x{0:X} -> {1}", pickedHwnd.ToInt64(), itemPath));
+                    return true;
+                }
+                List<string> foc = new List<string>();
+                ReadFocused(doc, foc);
+                if (Holds(foc, itemPath))
+                {
+                    Diag.Log("ShellReg: SelectItem 只有焦点项对上、SelectedItems 是空的（高亮可能没上）目标 " + itemPath);
+                    return true;
+                }
+                Diag.Log("ShellReg: SelectItem 调过了、目标却没对上（SelectedItems=" +
+                         (now.Count == 0 ? "空" : now[0]) + "，FocusedItem=" +
+                         (foc.Count == 0 ? "空" : foc[0]) + "）目标 " + itemPath);
+                return false;
+            }
+            catch (Exception ex) { Diag.Log("ShellReg: 选中项失败 " + ex.Message); }
+            return false;
+        }
+
+        /// <summary>路径的最后一段（`Folder.ParseName` 要的是名字，不是整条路径）。</summary>
+        private static string LastSegment(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return null;
+            string s = p.TrimEnd('\\', '/');
+            int i = s.LastIndexOfAny(new char[] { '\\', '/' });
+            return i >= 0 ? s.Substring(i + 1) : s;
+        }
+
+        /// <summary>从一扇窗的清单项里读「选中的那些」；一个都没选中就退回「焦点项」（见 `SelectedPathsIn`）。</summary>
+        private static void ReadSelection(IDispatch item, List<string> res)
+        {
+            IDispatch doc = ReadObject(item, "Document");
+            if (doc == null) return;
+            ReadSelected(doc, res);
+            if (res.Count == 0) ReadFocused(doc, res);
+        }
+
+        /// <summary>只读 `Document.SelectedItems()`（**不含**焦点项兜底）—— 核对「真选中」用，见 `SelectItemInWindow`。</summary>
+        private static void ReadSelected(IDispatch doc, List<string> res)
+        {
+            IDispatch items = InvokeGet(doc, "SelectedItems");
+            int n = items == null ? 0 : ReadInt(items, "Count");
+            for (int j = 0; j < n; j++)
+            {
+                IDispatch fi = ReadItem(items, j);
+                string sp = fi == null ? null : ReadString(fi, "Path");
+                if (!string.IsNullOrEmpty(sp)) res.Add(sp);
+            }
+        }
+
+        /// <summary>只读 `Document.FocusedItem`（键盘上下移动时只有焦点、没有选中）。</summary>
+        private static void ReadFocused(IDispatch doc, List<string> res)
+        {
+            IDispatch foc = ReadObject(doc, "FocusedItem");
+            string fp = foc == null ? null : ReadString(foc, "Path");
+            if (!string.IsNullOrEmpty(fp)) res.Add(fp);
+        }
+
+        /// <summary>这张表里有没有它（路径按大小写不敏感比）。</summary>
+        private static bool Holds(List<string> list, string path)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i], path, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         /// <summary>读一个**对象**属性（`Document` / `FocusedItem`）：拿到的 RCW 按 QI 转成 `IDispatch`。</summary>
@@ -380,6 +547,74 @@ namespace TabbedExplorer
                 return o as IDispatch;
             }
             finally { Marshal.FreeCoTaskMem(v); }
+        }
+
+        /// <summary>调一个「一个字符串参数」的方法（`Folder.ParseName`），返回值当对象看。</summary>
+        private static IDispatch Call1String(IDispatch d, string name, string arg)
+        {
+            int id;
+            if (!DispIdOf(d, name, out id)) return null;
+
+            IntPtr a = Marshal.AllocCoTaskMem(VarSize);
+            IntPtr result = Marshal.AllocCoTaskMem(VarSize);
+            IntPtr bstr = IntPtr.Zero;
+            try
+            {
+                bstr = Marshal.StringToBSTR(arg);
+                Zero(a, VarSize);
+                Marshal.WriteInt16(a, 0, VT_BSTR);
+                Marshal.WriteIntPtr(a, 8, bstr);
+                Zero(result, VarSize);
+                object o = Invoke(d, id, DISPATCH_METHOD, result, a, 1);
+                return o as IDispatch;
+            }
+            finally
+            {
+                if (bstr != IntPtr.Zero) { try { Marshal.FreeBSTR(bstr); } catch { } }
+                Marshal.FreeCoTaskMem(a);
+                Marshal.FreeCoTaskMem(result);
+            }
+        }
+
+        /// <summary>
+        /// 调一个「`IDispatch` + 整数」两个形参的方法（`ShellFolderView.SelectItem(vItem, dwFlags)`）。
+        /// ⚠ `DISPPARAMS.rgvarg` 是**倒序**的（第 0 个放的是**最后**一个形参）⇒ flags 在前、item 在后。
+        /// </summary>
+        private static bool CallDispatchInt(IDispatch d, string name, IDispatch arg, int flag)
+        {
+            int id;
+            if (!DispIdOf(d, name, out id)) return false;
+
+            IntPtr buf = Marshal.AllocCoTaskMem(VarSize * 2);
+            IntPtr punk = IntPtr.Zero;
+            try
+            {
+                punk = Marshal.GetComInterfaceForObject(arg, typeof(IDispatch));
+                Zero(buf, VarSize * 2);
+                Marshal.WriteInt16(buf, 0, VT_I4);                  // [0] = dwFlags（最后一个形参）
+                Marshal.WriteInt32(buf, 8, flag);
+                Marshal.WriteInt16(buf, VarSize, VT_DISPATCH);      // [1] = vItem
+                Marshal.WriteIntPtr(buf, VarSize + 8, punk);
+
+                // ⚠ 结果缓冲区给 IntPtr.Zero：SelectItem 没有返回值（pVarResult 允许为 NULL）
+                DISPPARAMS dp = new DISPPARAMS();
+                dp.rgvarg = buf;
+                dp.cArgs = 2;
+                Guid none = Guid.Empty;
+                int hr = d.Invoke(id, ref none, 0, DISPATCH_METHOD, ref dp,
+                    IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (hr != 0)
+                {
+                    Diag.Log(string.Format("ShellReg: SelectItem hr=0x{0:X8}", hr));
+                    return false;
+                }
+                return true;
+            }
+            finally
+            {
+                if (punk != IntPtr.Zero) { try { Marshal.Release(punk); } catch { } }
+                Marshal.FreeCoTaskMem(buf);
+            }
         }
 
         /// <summary>

@@ -122,6 +122,64 @@ namespace TabbedExplorer
         private readonly HashSet<IntPtr> shellWatched = new HashSet<IntPtr>();
         /// <summary>被我们清空过绘制区的 shell 窗口（收尾要还原，见 <see cref="BlankShellWindow"/>）。</summary>
         private readonly HashSet<IntPtr> shellBlanked = new HashSet<IntPtr>();
+        /// <summary>
+        /// 「转生之后还得替用户把选中项摆回去」的那批活儿（见 <see cref="ScheduleReveal"/>）。
+        ///
+        /// 三方（wb / VS Code / 各种「在资源管理器里显示」）点开一个文件夹，走的其实是
+        /// `explorer /select,"&lt;目标&gt;"` —— 原生那一下是**父目录 + 把目标选中**。
+        /// 我们只把它开成「父目录」这一个标签，选中项就丢了（用户报的「没有选中指定目录，原生是选中的」）。
+        /// </summary>
+        private readonly List<RevealTask> reveals = new List<RevealTask>();
+        /// <summary>摆选中项的节拍器（见 <see cref="DrainReveal"/>）。⚠ 用 `System.Threading.Timer` 而不是
+        /// `System.Windows.Forms.Timer`：后者走 `WM_TIMER`，只在消息队列空的时候才发 —— 而这段正是
+        /// 起 explorer 最忙的时候，会被饿死（详见 `MEMORY-internals` 里那条）。</summary>
+        private System.Threading.Timer revealTimer;
+        /// <summary>
+        /// 摆选中项的节拍。给得短是因为**第一段能用的时间只有几百毫秒**：转生那一刻到那扇 shell 窗
+        /// 被关掉之间（`ShellSettleMs` 减去 `DrainShell` 的等待），要问出「选中了什么」。
+        /// 一次 `SelectedPathOfWindow` 实测 2~4ms，这个节拍无所谓。
+        /// </summary>
+        private const int RevealTickMs = 100;
+        /// <summary>补交键盘焦点的间隔与拍数（见 <see cref="TryFocusRevealed"/>）。</summary>
+        private const int FocusRetryMs = 500;
+        private const int FocusRetryRounds = 3;
+        /// <summary>
+        /// 第一段（等盯梢线程把「用户要的是哪一个」问出来）的上限。
+        /// 答案由盯梢线程在「读到路径 + `ShellSettleMs`」那 800ms 里抓，所以这里给得比它宽 ——
+        /// 这段只是「别让单子永远挂着」，不是「窗口还活着多久」（见 <see cref="WatchShellWindow"/>）。
+        /// </summary>
+        private const int RevealAskMs = 1500;
+        /// <summary>
+        /// 第二段（把选中项摆进**我们自己**的标签）的总时长。给得宽：新建的标签要等 explorer
+        /// 真把目录列出来才认得 `ParseName`（实测那一步 1.5~5 秒，慢盘 / 网络盘更久）。
+        /// </summary>
+        private const int RevealApplyMs = 8000;
+        /// <summary>第二段的重试间隔。摆一次只要几毫秒，失败了下一拍再来。</summary>
+        private const int RevealApplyGapMs = 400;
+
+        /// <summary>
+        /// 盯梢线程问出来的「那扇 shell 窗选中了什么」（hwnd → 结果）。见 <see cref="WatchShellWindow"/>。
+        ///
+        /// 为什么要单开一份、不让 UI 线程自己去问：**问它的机会只有那 800ms** —— 窗口一关，
+        /// `IShellWindows` 里那一项就没了。而转生那一刻 UI 线程正被收编 / 起 explorer 塞满，
+        /// `Post` 回来的节拍能晚到一秒以上，等它跑起来窗口早没了（实锤：日志
+        /// `Hub: 那扇 shell 窗已经没了，问不出选中项`）。盯梢线程自己 25ms 一拍、不受 UI 线程影响，
+        /// 问着了就存这儿，UI 线程什么时候来取都行。
+        /// </summary>
+        private readonly Dictionary<IntPtr, ShellCandidate> shellSelected =
+            new Dictionary<IntPtr, ShellCandidate>();
+        /// <summary>
+        /// 已经转生过的 shell 窗口（hwnd → 转生那一刻的 TickCount）。
+        ///
+        /// 为什么非要挡：同一条命令会在几十~几百毫秒里被报**好几遍**（CREATE 一次、SHOW 一次、
+        /// 盯梢线程把路径交上来又一次），每一遍都能凑齐「窗口 + 路径」再走进 <see cref="TakeOverShellWindow"/>。
+        /// 不挡就是**同一个文件夹开两个标签**（实测 21:51:45 那次：第一次用掉预热标签、第二次又新起一个
+        /// explorer 进程），而多出来的这一下正好压在用户要点开的那扇窗上、把它的 SHOW 事件顶后 47ms ——
+        /// 用户看到的就是那一下闪（同一命令的前几次 SHOW 都是 0ms 处理、不闪）。
+        /// </summary>
+        private readonly Dictionary<IntPtr, int> shellTaken = new Dictionary<IntPtr, int>();
+        /// <summary>`shellTaken` 记多久。窗口句柄会被系统复用，记太久会误挡后来的窗。</summary>
+        private const int TakenRememberMs = 10000;
         /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
         private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
@@ -494,6 +552,21 @@ namespace TabbedExplorer
             public int ReactMs;
         }
 
+        /// <summary>一条「把选中项摆回去」的单子（见 <see cref="ScheduleReveal"/>）。整条只在 UI 线程上动。</summary>
+        private sealed class RevealTask
+        {
+            /// <summary>那扇 shell 窗 —— 我们要**趁它还活着**问出它选中了什么。</summary>
+            public IntPtr Shell;
+            /// <summary>它开着的目录 = 我们标签开着的那个。</summary>
+            public string Folder;
+            /// <summary>问出来的目标（问不到就一直空着，`RevealAskMs` 到点作废）。</summary>
+            public string Item;
+            /// <summary>起算时刻（TickCount，用来算两段活儿各自的上限）。</summary>
+            public int Started;
+            /// <summary>下一次试着摆的时刻（TickCount）。</summary>
+            public int NextApply;
+        }
+
         /// <summary>shell 窗口转生候选：等它的地址栏出现真路径（见 ShellResolveMs）。</summary>
         private sealed class ShellCandidate
         {
@@ -595,6 +668,11 @@ namespace TabbedExplorer
                     long hz = Environment.TickCount;
                     bool hushed = (isShow || wasVisible) && HushShellWindow(h);   // 露脸了：按住
                     int hms = Environment.TickCount - (int)hz;
+                    // ★ SHOW 之后**再清一次绘制区**，而且排在「按住」后面 —— SHOW 那一刻窗已经画在
+                    //   屏幕上了，先把可见性压掉最要紧。这一下兜的是「我们设的空绘制区被谁重置了」：
+                    //   `SetWindowRgn` 是别人进程的窗也能设的，但 explorer 自己后续那轮 UI 重建完全可能
+                    //   把它顶掉。重设是幂等的（还是空区域，屏幕上一点差别都看不出来）。
+                    if (isShow) BlankShellWindow(h);
                     // ⚠ 别用 `GetWindowRgn` 去验证：它对**别的进程**的窗口恒返回 0（实测），
                     //   看上去像「没设上」。我们自己的账（shellBlanked）才是真的；
                     //   「空绘制区确实让出屏幕」是用 `probe/startmenu_timeline_probe.py --grab`
@@ -626,14 +704,28 @@ namespace TabbedExplorer
                 }
                 else
                 {
-                    // 兜底层先上（不管它现在可不可见），再补一刀 SW_HIDE。
-                    // ⚠ CREATE 那一次**不能**打「不进任务栏」那两位 —— explorer 见着它就**不建 Ribbon**、
-                    //   退回老式菜单栏（内嵌窗口顶上那条白条，见 MakeTransparent）；
-                    //   可等 SHOW 事件到了才补又太晚（任务栏已经按「可见那一帧」加了按钮、图标闪一下）。
-                    //   中间那段时机交给 ScheduleTaskbarBits：Ribbon 一建出来就补（见那边的实测时间线）。
-                    EmbedApi.MakeTransparent(h, isShow);
-                    if (!isShow) EmbedApi.ScheduleTaskbarBits(h);
-                    bool hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                    // ⚠ SHOW 那一下**先按下去、再补透明兜底**：那扇窗从「可见」到我们动手之间隔着
+                    //   一次事件投递 + 两三次跨进程调用 —— 用户看到的就是这一段（实测同一台机器上
+                    //   0ms ~ 47ms 不等，UI 线程一忙就往 47ms 靠）。`SW_HIDE` 才是止闪的那一下，
+                    //   所以它排最前；顺序反一下等于白晾几十毫秒出来（用户报的「原生资源管理器闪一下」）。
+                    bool hid;
+                    if (isShow)
+                    {
+                        hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                        EmbedApi.MakeTransparent(h, true);
+                    }
+                    else
+                    {
+                        // CREATE 那一次反过来：它还没显示，`SW_HIDE` 本来就按不着，
+                        // 真正管用的是先置透明（见 OnWindowShown 类注释①）。
+                        // ⚠ 这一次**不能**打「不进任务栏」那两位 —— explorer 见着它就**不建 Ribbon**、
+                        //   退回老式菜单栏（内嵌窗口顶上那条白条，见 MakeTransparent）；
+                        //   可等 SHOW 事件到了才补又太晚（任务栏已经按「可见那一帧」加了按钮、图标闪一下）。
+                        //   中间那段时机交给 ScheduleTaskbarBits：Ribbon 一建出来就补（见那边的实测时间线）。
+                        EmbedApi.MakeTransparent(h, false);
+                        EmbedApi.ScheduleTaskbarBits(h);
+                        hid = EmbedApi.ShowWindow(h, EmbedApi.SW_HIDE);
+                    }
                     if (isShow) MarkHidden(h);      // 只有「真被显示过」的才当作候选去收
 
                     Diag.Step(string.Format(
@@ -800,6 +892,7 @@ namespace TabbedExplorer
             {
                 bool hushed = false;
                 bool asked = false;          // 已经发过 `SC_CLOSE`
+                string picked = null;        // 问出来的「用户要的是哪一个」（见 shellSelected）
                 try
                 {
                     DateTime deadline = DateTime.Now.AddMilliseconds(ShellResolveMs);
@@ -828,14 +921,38 @@ namespace TabbedExplorer
                             }
                             else if (DateTime.Now >= deadline) break;   // 等不到路径：放开它，当没这回事
                         }
-                        else if (Environment.TickCount >= closeAt)
+                        else
                         {
-                            EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);   // WM_SYSCOMMAND / SC_CLOSE
-                            Diag.Step(string.Format(
-                                "Hub: 关掉 shell 那扇窗（当时{0}）cab=0x{1:X} -> {2}",
-                                hushed ? "被我们按着" : "还没显示", h.ToInt64(), path));
-                            asked = true;
-                            break;
+                            // ★ 顺手把「用户要的是哪一个」问出来。
+                            //   三方（wb / VS Code / 各种「在资源管理器中显示」）点开一个文件夹，走的其实是
+                            //   `explorer /select,"<目标>"` —— 原生那一下是**父目录 + 把目标选中**；
+                            //   我们只把父目录开成标签，这个意图就丢了（用户报的「没有选中指定目录」）。
+                            //   而这段窗口期（`ShellSettleMs`）是**唯一**问得到的机会：窗口一关，
+                            //   `IShellWindows` 里那一项就没了。所以放在这条线程上 —— 它 25ms 一拍、
+                            //   不受 UI 线程忙不忙影响（那正是 UI 线程那条路会错过的地方）。
+                            if (picked == null)
+                            {
+                                string sel = ShellBrowserReg.SelectedPathOfWindow(h);
+                                // 只认「它的父目录正是这扇窗开着的目录」的那些：shell 换过目录、或者
+                                // 只有焦点没有选中时报回来的东西（比如目录自己）一律不算。
+                                if (sel != null && PathRules.Same(PathRules.ParentOf(sel), path))
+                                {
+                                    picked = sel;
+                                    lock (shellSelected)
+                                        shellSelected[h] = new ShellCandidate { Path = sel, SeenAt = DateTime.Now };
+                                    Diag.Step(string.Format(
+                                        "Hub: 盯梢中问出三方要的是选中 {0} cab=0x{1:X}", sel, h.ToInt64()));
+                                }
+                            }
+                            if (Environment.TickCount >= closeAt)
+                            {
+                                EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);   // WM_SYSCOMMAND / SC_CLOSE
+                                Diag.Step(string.Format(
+                                    "Hub: 关掉 shell 那扇窗（当时{0}）cab=0x{1:X} -> {2}",
+                                    hushed ? "被我们按着" : "还没显示", h.ToInt64(), path));
+                                asked = true;
+                                break;
+                            }
                         }
                         Thread.Sleep(25);
                     }
@@ -853,14 +970,40 @@ namespace TabbedExplorer
                     // 收尾必做：到这儿它要是还活着，就说明我们没关掉它 —— 那它必须是一扇
                     // **正常可见的窗**，绝不能是被我们按住 / 被我们清空绘制区的状态
                     //（在 shell 进程里留隐形窗 = v1.13.1 那个「Win+E 按下去毫无反应」，见 `OnWindowShown`）。
-                    UnblankShellWindow(h);
-                    UnhushShellWindow(h, asked ? "关窗请求没被理" : "等不到路径");
+                    // ⚠ 但先验明正身：上面那 2 秒等待足够让这个句柄被系统回收给别人，
+                    //   那样下面这两句就砸在一扇无辜的窗上了（见 `StillShellBrowser`）。
+                    if (StillShellBrowser(h))
+                    {
+                        UnblankShellWindow(h);
+                        UnhushShellWindow(h, asked ? "关窗请求没被理" : "等不到路径");
+                    }
+                    else
+                    {
+                        ForgetBlanked(h);
+                        UnmarkHidden(h);
+                    }
                     lock (shellWatched) shellWatched.Remove(h);
                 }
             });
             t.IsBackground = true;
             t.Name = "TBE-shell窗口盯梢";
+            // ★ 必须是 STA：这条线程现在要问「它选中了什么」，那一路要走 `IShellWindows` 的自动化
+            //   （`ShellBrowserReg.SelectedPathOfWindow`），而它里面 `Application.OleRequired()`
+            //   在 MTA 线程上会直接抛 —— `new Thread` 默认就是 MTA。
+            try { t.SetApartmentState(ApartmentState.STA); } catch { }
             t.Start();
+        }
+
+        /// <summary>取走盯梢线程问出来的选中项（取了就清）。见 <see cref="shellSelected"/>。</summary>
+        private ShellCandidate TakeShellSelected(IntPtr h)
+        {
+            lock (shellSelected)
+            {
+                ShellCandidate c;
+                if (!shellSelected.TryGetValue(h, out c)) return null;
+                shellSelected.Remove(h);
+                return c;
+            }
         }
 
         /// <summary>
@@ -880,16 +1023,45 @@ namespace TabbedExplorer
         private bool BlankShellWindow(IntPtr h)
         {
             if (h == IntPtr.Zero) return false;
-            if (!EmbedApi.MakeBlank(h)) return false;
-            lock (shellBlanked) shellBlanked.Add(h);
-            return true;
+            // ★ 非客户区要**单独**按住：`SetWindowRgn` 管不到 DWM 画出来的标题栏/右上角那三个按钮
+            //   （2026-10-02 对照实验坐实）。它跟绘制区是两码事，所以**不管 MakeBlank 成不成都要做**。
+            EmbedApi.BlankNonClient(h);
+            bool ok = EmbedApi.MakeBlank(h);
+            lock (shellBlanked) shellBlanked.Add(h);      // 记账改成「我们动过这扇窗」的记号（供还原）
+            return ok;
         }
 
-        /// <summary>去掉我们加在 shell 窗口上的绘制区限制（没加过 / 窗已经没了就什么都不做）。</summary>
+        /// <summary>去掉我们加在 shell 窗口上的绘制区限制和非客户区按住（没加过 / 窗已经没了就什么都不做）。</summary>
         private void UnblankShellWindow(IntPtr h)
         {
             lock (shellBlanked) { if (!shellBlanked.Remove(h)) return; }
             EmbedApi.Unblank(h);
+            EmbedApi.RestoreNonClient(h);
+        }
+
+        /// <summary>只把「这扇窗被我清过绘制区」的账抹掉，**一个字节都不往那扇窗上写**。
+        /// 什么时候用：句柄可能已经被系统回收给别人了（见 `StillShellBrowser`）。</summary>
+        private void ForgetBlanked(IntPtr h)
+        {
+            lock (shellBlanked) shellBlanked.Remove(h);
+        }
+
+        /// <summary>
+        /// 这个句柄**还是不是**我们当初那扇 shell 浏览窗。
+        ///
+        /// 为什么必须有：**hwnd 会被系统飞快复用**（实测 2026-10-01 22:36:30.680 关掉 `0x240D78`，
+        /// 222ms 后同一个值已经戴在一扇新窗头上），而盯梢线程发出关窗请求后还要等最多 2 秒才收尾 ——
+        /// 这段时间足够那个句柄改姓。收尾那两句（还绘制区 / 恢复显示）都是**会改动别人窗口状态**的：
+        /// 砸在一扇无辜的窗上就是「它平白被抠掉一块绘制区」或「一扇本来藏着的窗被我们 `SW_SHOW` 出来」。
+        /// 所以动手之前先验明正身。
+        /// </summary>
+        private static bool StillShellBrowser(IntPtr h)
+        {
+            if (h == IntPtr.Zero || !NativeMethods.IsWindow(h)) return false;
+            string c = EmbedApi.ClassOf(h);
+            if (c != "CabinetWClass" && c != "ExploreWClass") return false;
+            if (EmbedApi.GetParent(h) != IntPtr.Zero) return false;      // 已经被谁嵌走了
+            return EmbedApi.IsShellOwned(h);
         }
 
         /// <summary>这扇 shell 窗口的绘制区现在是不是被我们清空的（只管我们自己记的账）。</summary>
@@ -1044,18 +1216,46 @@ namespace TabbedExplorer
 
         /// <summary>
         /// 「转生」：shell 进程开的文件夹窗口不归我们（不能 SetParent、也不能改它的样式），但它的目标是我们的。
-        /// 读出目标目录 → **像用户点 × 一样**把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录
-        /// 开成标签。这样既拿到了标签，又没碰过它的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
+        /// 读出目标目录 → 把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录开成标签。
+        /// 这样既拿到了标签，又没碰过它的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
         ///
         /// 关它用 `WM_SYSCOMMAND`/`SC_CLOSE`（点 × 走的就是这条），不用手写 `WM_CLOSE` ——
         /// 关一个**别人的**窗口，越接近正常操作越好（shell 那边可能还有它自己的账要结）。
+        /// ⚠ **这里通常不发它**：那扇窗正被 <see cref="WatchShellWindow"/> 盯着，它自己会在
+        ///   「读到路径 + `ShellSettleMs`」那一刻关（那条实测不出声；这里再补一刀就变成**重复关**，
+        ///   关完约 0.6s 会响一声「咚」，见 `ShellSettleMs` 的注释）。只有没人在盯的时候才在这里兜底关。
+        ///   顺带，那 800ms 也正好是 `/select,` 把「选中目标」落实下来的窗口期 —— 见 <see cref="ScheduleReveal"/>。
         ///
         /// ⚠ 我们**没有**给它置过透明 / 动过样式位（见 OnWindowShown 里那段教训）——只可能清过它的
-        ///   绘制区、`SW_HIDE` 按过它一下；两者都有自己的收尾（`WatchShellWindow` 的 finally），
-        ///   这里只管发关闭请求。它要是没关掉，也是留在屏幕上的一个**正常窗口**，不是隐形窗口。
+        ///   绘制区、`SW_HIDE` 按过它一下；两者都有自己的收尾（`WatchShellWindow` 的 finally）。
+        ///   它要是没关掉，也是留在屏幕上的一个**正常窗口**，不是隐形窗口。
         /// </summary>
         private void TakeOverShellWindow(IntPtr h, string path, int react)
         {
+            // ★ 同一条命令会被报好几遍（CREATE / SHOW / 盯梢线程交路径），每一遍都能走到这儿。
+            //   不挡就是同一个文件夹开两个标签 + 多起一个 explorer，还会把用户要点开的那扇窗的
+            //   SHOW 事件顶后几十毫秒（＝那一下闪）。见 `shellTaken` 的注释。
+            lock (shellTaken)
+            {
+                int tick0 = Environment.TickCount;
+                List<IntPtr> stale = null;
+                foreach (KeyValuePair<IntPtr, int> kv in shellTaken)
+                {
+                    if (tick0 - kv.Value >= TakenRememberMs)
+                    {
+                        if (stale == null) stale = new List<IntPtr>();
+                        stale.Add(kv.Key);
+                    }
+                }
+                if (stale != null) foreach (IntPtr k in stale) shellTaken.Remove(k);
+                if (shellTaken.ContainsKey(h))
+                {
+                    Diag.Step(string.Format(
+                        "Hub: 这扇 shell 窗已经转生过了，跳过（别再多开一个标签）cab=0x{0:X} -> {1}", h.ToInt64(), path));
+                    return;
+                }
+                shellTaken[h] = tick0;
+            }
             try
             {
                 Guid d = VirtualDesktop.WindowDesktopId(h);
@@ -1063,7 +1263,16 @@ namespace TabbedExplorer
                 Diag.Step(string.Format(
                     "Hub: shell 开的文件夹 -> {0}（pid={1}，反应 {2}ms）=> 关掉它、用自己的标签重开",
                     path, EmbedApi.ProcessIdOf(h).ToInt32(), react));
-                EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);      // WM_SYSCOMMAND / SC_CLOSE
+                bool watched;
+                lock (shellWatched) watched = shellWatched.Contains(h);
+                if (!watched)
+                {
+                    EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);  // WM_SYSCOMMAND / SC_CLOSE
+                }
+                else
+                {
+                    Diag.Step("Hub: 那扇 shell 窗有盯梢线程在，关窗交给它（顺带给 /select 留出落定时间）");
+                }
                 EmbedForm f = EnsureForm(d);
                 if (f == null) { Diag.Log("Hub: shell 窗口转生失败：没有可用的窗口"); return; }
                 // 这扇窗是**为了外面那个文件夹**才现建出来的：先把本桌面记着的标签摆回来，再加上它。
@@ -1079,12 +1288,200 @@ namespace TabbedExplorer
                 f.OpenPathAsTab(path);
                 f.StartRestLaunches(path, true);   // 用户在等这一个：其余等它落定再排
                 Diag.Step(string.Format("Hub: 转生完成 标签={0} 当前标签={1}", f.TabCount, f.ActiveIdx));
+                // ★ 三方的「打开文件夹」多半是 `/select,` 语义（父目录 + 选中目标）：目录开出来了，
+                //   可用户要的是「那个东西被选中」。趁那扇 shell 窗还没被关掉，把它选中了什么问出来、
+                //   再摆进我们自己的标签里（见 ScheduleReveal）。
+                ScheduleReveal(h, path);
                 // 这一步不能省：用户是在**别的程序**里点的「打开文件夹」，本该有一扇窗弹到最前面。
                 // 只 `OpenPathAsTab` 的话窗口只是被 `Show()` 出来、还压在那个程序后面，
                 // 用户看到的就只有「原生窗闪了一下 + 任务栏图标闪」= 像什么都没发生。
                 f.ShowForCapture();
             }
             catch (Exception ex) { Diag.Log("Hub: shell 窗口转生失败 " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 记下一件「把选中项摆回去」的活儿（见 <see cref="DrainReveal"/>）。
+        ///
+        /// 什么时候需要它：用户在**别的程序**里点「打开文件夹」时，系统走的是
+        /// `explorer /select,"&lt;目标&gt;"` —— 造出来的是「父目录的窗 + 目标被选中」。
+        /// 我们读到的是**父目录**（`ShellBrowserReg.PathOfWindow` 报的是地址栏那个），
+        /// 于是只开出一个「父目录」标签，选中项整个丢了。
+        /// 用户看到的差别：原生是「到了那个目录、那个文件夹高亮着」，我们这边是「到了那个目录」。
+        ///
+        /// 为什么不在转生时直接开 `explorer /n,/select,"&lt;目标&gt;"`：那一刻我们还**不知道**目标是谁
+        /// （`/select` 是 shell 导航完之后才落实的，读路径那一瞬读它必为空），而且实测用户点开的父目录
+        /// **多半已经开着标签**（日志：`当时标签=9 … 转生完成 标签=9`，一个 explorer 都没起）——
+        /// 那种情况下连窗口都没有，只能把选中项**摆进已有的标签**里。
+        /// </summary>
+        private void ScheduleReveal(IntPtr shell, string folder)
+        {
+            if (shell == IntPtr.Zero || string.IsNullOrEmpty(folder)) return;
+            // 顺手清掉没人来取的（那扇窗的转生被 `shellTaken` 去重挡了 / 早就过期了）
+            lock (shellSelected)
+            {
+                List<IntPtr> gone = null;
+                foreach (KeyValuePair<IntPtr, ShellCandidate> kv in shellSelected)
+                {
+                    if ((DateTime.Now - kv.Value.SeenAt).TotalMilliseconds >= TakenRememberMs)
+                    {
+                        if (gone == null) gone = new List<IntPtr>();
+                        gone.Add(kv.Key);
+                    }
+                }
+                if (gone != null) foreach (IntPtr k in gone) shellSelected.Remove(k);
+            }
+            lock (reveals)
+            {
+                for (int i = 0; i < reveals.Count; i++)
+                {
+                    if (reveals[i].Shell == shell) return;      // 同一扇窗那条已经在了（CREATE/SHOW 各来一次）
+                }
+                reveals.Add(new RevealTask
+                {
+                    Shell = shell,
+                    Folder = folder,
+                    Started = Environment.TickCount
+                });
+            }
+            Diag.Step(string.Format("Hub: 记下「要把选中项摆回去」 {0}（那扇 shell 窗 cab=0x{1:X}）",
+                folder, shell.ToInt64()));
+            if (revealTimer == null)
+            {
+                revealTimer = new System.Threading.Timer(
+                    delegate { Post(delegate { DrainReveal(); }); }, null, RevealTickMs, RevealTickMs);
+            }
+            else
+            {
+                revealTimer.Change(RevealTickMs, RevealTickMs);
+            }
+        }
+
+        /// <summary>
+        /// 摆选中项的节拍（`RevealTickMs` 一拍，跑在 UI 线程上）。分两段：
+        ///
+        /// ① **问**：那扇 shell 窗还活着的那几百毫秒里，问它「你现在选中了什么」
+        ///    （`ShellBrowserReg.SelectedPathOfWindow`，按 HWND 找它 —— 它还是顶层窗，句柄对得上）。
+        ///    只认「它的父目录＝我们开的这个目录」的那些选中项：shell 换过目录、或者只有焦点没有选中时
+        ///    报回来的东西（比如目录自己）一律不算，宁可退化成「就是打开这个目录」。
+        /// ② **摆**：把问出来的目标摆进**我们自己**的标签里（`ShellBrowserReg.SelectItemInWindow`）。
+        ///    这是个重试：新建的标签要等 explorer 真把目录列出来才认得 `ParseName`（实测 1.5~5 秒）。
+        ///
+        /// ⚠ 两段都有上限（`RevealAskMs` / `RevealApplyMs`），到点就把单子丢掉 —— 这是个**锦上添花**的
+        ///   功能，任何一段失败都退化成「功能没实现前的老样子」，绝不能反过来影响开标签本身。
+        /// </summary>
+        private void DrainReveal()
+        {
+            int now = Environment.TickCount;
+            lock (reveals)
+            {
+                if (reveals.Count == 0) { StopRevealTimer(); return; }
+                for (int i = reveals.Count - 1; i >= 0; i--)
+                {
+                    RevealTask t = reveals[i];
+
+                    // ---- 第一段：等盯梢线程把「用户要的是哪一个」交上来 ----
+                    //  ⚠ 这里**不再自己问**：问它的机会只有那 800ms，而这段节拍跑在 UI 线程上，
+                    //    转生那一刻会被收编 / 起 explorer 顶到一秒开外 —— 等它跑起来窗口早没了
+                    //    （实测栽过一次）。改成盯梢线程自己问、存进 shellSelected（见那边的注释）。
+                    if (t.Item == null)
+                    {
+                        ShellCandidate got = TakeShellSelected(t.Shell);
+                        if (got != null)
+                        {
+                            t.Item = got.Path;
+                            t.NextApply = now;
+                            Diag.Step("Hub: 三方要的其实是选中 " + got.Path +
+                                      "（它的父目录正是我们开的 " + t.Folder + "）");
+                        }
+                        else if (now - t.Started >= RevealAskMs)
+                        {
+                            Diag.Step("Hub: 没问出选中项（就是打开这个目录，没选中别的东西）-> 不摆 " + t.Folder);
+                            reveals.RemoveAt(i);
+                        }
+                        continue;
+                    }
+
+                    // ---- 第二段：摆进我们自己的标签里 ----
+                    if (now < t.NextApply) continue;
+                    // ⚠ 第三个形参是**要排掉的那扇窗**：就是刚把用户引过来的 shell 自己的窗。
+                    //   它开着同一个目录、而且 `/select,` 本来就把它选中了 —— 不排掉的话，标签还在加载
+                    //   那几百毫秒里它是唯一匹配，摆上去「核对还能通过」，然后它被关掉、选中一起没
+                    //   （实测 2026-10-01：摆完 272ms 后那扇窗就被关了，用户什么也没看到）。
+                        if (ShellBrowserReg.SelectItemInWindow(t.Folder, t.Item, t.Shell))
+                        {
+                            Diag.Step("Hub: 已把选中项摆回去 " + t.Item);
+                            // ★ 摆完还得把**键盘焦点**交过去。原生那一下之所以紧接着就能上下左右挪、
+                            //   用 Enter 进去，靠的是文件列表拿着键盘焦点；只画个高亮是白画
+                            //   （用户报的「原生自动选中文件夹后，我可以上下左右或者 enter 进去，你这个不行」）。
+                            TryFocusRevealed(t.Folder, 0);
+                            reveals.RemoveAt(i);
+                            continue;
+                        }
+                    if (now - t.Started >= RevealApplyMs)
+                    {
+                        Diag.Step("Hub: 摆选中项超时，放弃 " + t.Item);
+                        reveals.RemoveAt(i);
+                        continue;
+                    }
+                    t.NextApply = now + RevealApplyGapMs;      // 标签可能还没加载完，下一拍再来
+                }
+                if (reveals.Count == 0) StopRevealTimer();
+            }
+        }
+
+        /// <summary>
+        /// 把键盘焦点交给「正开在 <paramref name="folder"/> 这个目录上」的那个标签
+        /// （实现在 `EmbedForm.FocusFolder`，那边带两条防抢焦点的闸）。
+        /// 返回有没有真交出去。
+        /// </summary>
+        private bool FocusRevealedTab(string folder)
+        {
+            foreach (EmbedForm f in AllForms())
+            {
+                try { if (f.FocusFolder(folder)) return true; }
+                catch (Exception ex) { Diag.Log("Hub: 交键盘焦点失败 " + ex.Message); }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 补交键盘焦点（见 <see cref="FocusRevealedTab"/>）。
+        ///
+        /// 为什么要补（2026-10-01 实测，用户报「上下左右只生效了一下」）：
+        ///   · 摆选中项是**每一拍都在试**的，而焦点只在成功那一拍交一次 —— 可那一刻标签常常
+        ///     **还没把新目录认下来**（`ExplorerHost` 的地址栏是轮询读的，比外壳窗口晚约 0.9 秒），
+        ///     `FocusFolder` 找不到那个标签就静默失败；等下一拍路径对上了，却已经没人再交焦点；
+        ///   · 另外 shell 那扇窗要过几百毫秒才真被关掉，它一消失，系统可能把前台 / 焦点重新分配一次。
+        /// 所以成功之后再补一拍「确认」，失败就接着试 —— 上限 3 拍、合计约 1.5 秒。
+        /// 让路条件只有一个：这会儿我们不是前台（用户已经点回别的程序了，别把人拽回来）。
+        /// </summary>
+        private void TryFocusRevealed(string folder, int round)
+        {
+            if (quitting) return;
+            bool ok = FocusRevealedTab(folder);
+            if (ok)
+                Diag.Step(round == 0
+                    ? "Hub: 键盘焦点已交给那个标签（接着就能上下左右 / Enter）"
+                    : "Hub: 键盘焦点补交成功（第 " + round + " 拍）");
+            if (round >= FocusRetryRounds)
+            {
+                if (!ok) Diag.Step("Hub: 键盘焦点一直没交上（试到第 " + round + " 拍）：" + folder);
+                return;
+            }
+            System.Threading.Timer t = null;
+            t = new System.Threading.Timer(delegate(object o)
+            {
+                try { t.Dispose(); } catch { }
+                Post(delegate { TryFocusRevealed(folder, round + 1); });
+            }, null, FocusRetryMs, System.Threading.Timeout.Infinite);
+        }
+
+        /// <summary>摆选中项那批活儿都完了 —— 停掉节拍器（下次再有活儿 `Change` 把它叫醒）。</summary>
+        private void StopRevealTimer()
+        {
+            if (revealTimer == null) return;
+            try { revealTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
         }
 
         /// <summary>
@@ -2407,6 +2804,7 @@ namespace TabbedExplorer
             }
             if (favManager != null) { try { favManager.Close(); } catch { } favManager = null; }
             if (captureTimer != null) { try { captureTimer.Dispose(); } catch { } captureTimer = null; }
+            if (revealTimer != null) { try { revealTimer.Dispose(); } catch { } revealTimer = null; }
             if (preloadTimer != null) { try { preloadTimer.Stop(); preloadTimer.Dispose(); } catch { } preloadTimer = null; }
             if (hook != null) { try { hook.Dispose(); } catch { } hook = null; }
             if (wheelHook != null) { try { wheelHook.Dispose(); } catch { } wheelHook = null; }

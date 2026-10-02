@@ -45,6 +45,7 @@ namespace TabbedExplorer
         private const int VK_RMENU = 0xA5;
         private const int VK_F10 = 0x79;
         private const int VK_E = 0x45;
+        private const int VK_RETURN = 0x0D;
         private const int VK_1 = 0x31;      // 主键盘的 1..9（Ctrl+1..9 = 第 N 个标签）
         private const int VK_9 = 0x39;
         private const int VK_LWIN = 0x5B;
@@ -80,6 +81,12 @@ namespace TabbedExplorer
         public event Action SpacePreview;
 
         /// <summary>
+        /// 吞到 **Alt+Enter** 了（原生那个「属性」，见 `Handle` 里那一段）。**在钩子线程上触发**，
+        /// 订阅者自己往 UI 线程转（真正去叫系统属性表的是 `DesktopHub.OnAltEnter`）。
+        /// </summary>
+        public event Action AltEnter;
+
+        /// <summary>
         /// 松开了一条「预览导航键」（**方向键 / Esc / Enter**，见 `QLPreview` 的类注释）。
         /// **在钩子线程上触发**（订阅者自己往 UI 线程转），参数是虚拟键码。
         ///
@@ -97,6 +104,10 @@ namespace TabbedExplorer
         public IntPtr MainWindow;
 
         private readonly int ourPid = Process.GetCurrentProcess().Id;
+
+        /// <summary>这一次按下的 Alt+Enter 已经处理过了（长按 Enter 会连发，只算一次；松开时清）。
+        /// 只在钩子线程读写。</summary>
+        private bool altEnterDown;
 
         private Thread thread;
         private HookProc proc;
@@ -153,6 +164,8 @@ namespace TabbedExplorer
                                 // 松开只清标志（空格预览「这次已经处理过了」那个），**绝不吞键**
                                 int uvk = (int)st.vkCode;
                                 QLPreview.NoteKeyUp(uvk);
+                                if (uvk == VK_RETURN) altEnterDown = false;   // 见 Handle 里 Alt+Enter 那段
+
 
                                 // 方向键 / Esc / Enter：原生资源管理器里这几键也归 QuickLook 管，但它的判据是
                                 // **前台窗口的类名**，我们自绘宿主它不认 ⇒ 由我们替它转发（见 QLPreview 类注释）。
@@ -201,6 +214,25 @@ namespace TabbedExplorer
             if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU || vk == VK_F10)
             {
                 if (OursIsForeground()) EmbedApi.LetGoMenuBar(EmbedApi.MenuLetGoMs);
+                return false;
+            }
+
+            // ★ Alt+Enter = 原生那个「属性」（文件 / 文件夹都算）。**内嵌窗口里 explorer 自己认不出这个组合**：
+            //   收编之后那扇 cab 是 `WS_CHILD`，explorer 那套菜单 / 快捷键表对**子窗口**不走 —— 实测下去
+            //   它根本不弹属性，那个 Enter 直接落到文件列表上，把**选中的项目全部打开**（用户报的
+            //   「Alt+Enter 结果直接打开了一堆文件夹」，日志里能对上：一下冒出 6 扇 shell 窗，
+            //   开的是那 6 个被选中的文件夹）。所以这一条我们接管：吞掉它，回 UI 线程自己叫系统属性表。
+            //   ⚠ 只吞这一个组合：Alt 本身**绝不吞**（它后面还有 Alt+Tab / Alt+F4 一大串）；
+            //     `!ctrl && !shift` 是为了不误伤 Ctrl+Alt+Enter / Shift+Alt+Enter 这类别的绑定。
+            if (vk == VK_RETURN && !altEnterDown
+                && Down(VK_MENU) && !Down(VK_CONTROL) && !Down(VK_SHIFT))
+            {
+                if (OursIsForeground())
+                {
+                    altEnterDown = true;
+                    Raise(AltEnter);
+                    return true;
+                }
                 return false;
             }
 

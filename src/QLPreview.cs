@@ -161,7 +161,7 @@ namespace TabbedExplorer
         public static bool WantsSpace()
         {
             if (spaceDown) return false;
-            if (!OurGate()) return false;
+            if (!OurGate(true)) return false;      // ★ 空格按「深查」算（见 OurGate 的形参说明）
             spaceDown = true;
             return true;
         }
@@ -173,7 +173,7 @@ namespace TabbedExplorer
         /// </summary>
         public static bool WantsNav()
         {
-            return OurGate();
+            return OurGate(false);                 // ★ 导航键走「浅查」：这一类键太频繁，见形参说明
         }
 
         /// <summary>方向键（发 `Switch`：换到某个文件）。</summary>
@@ -192,8 +192,13 @@ namespace TabbedExplorer
         /// 空格与导航键共用的四道闸：开关开着、**没按着别的键**（见 `HeldModifiers` —— Ctrl+空格、
         /// Win+空格、CapsLock+空格 一个都不能抢）、前台是我们某个宿主窗体、**且焦点不在文本框里**
         /// （否则是在改名字/打地址，键归文本和输入法）。
+        ///
+        /// ⚠ `deep` = 要不要**连内嵌 explorer 那边**一起查（见 `TextInputFocused`）：
+        ///   · 空格（<see cref="WantsSpace"/>）要 —— 吞错一下就是用户中文打不进去，值这个开销；
+        ///   · 方向键这种 KeyUp 每下都要问的走浅查就够（内嵌列表那边的箭头只影响预览切不切，
+        ///     而且 <see cref="DoSwitch"/> 自己还有「预览没开就一眼不看」那道闸）。
         /// </summary>
-        private static bool OurGate()
+        private static bool OurGate(bool deep)
         {
             if (!Settings.QLPreview) return false;
             for (int i = 0; i < HeldModifiers.Length; i++)
@@ -215,7 +220,7 @@ namespace TabbedExplorer
             if (!ours) return false;
 
             // 焦点在文本框里（重命名框 / 地址栏 / 搜索框）= 在打字 —— 键归文本和输入法，绝不碰。
-            return !TextInputFocused(fg);
+            return !TextInputFocused(fg, deep);
         }
 
         /// <summary>
@@ -223,32 +228,86 @@ namespace TabbedExplorer
         /// 以及任何挂在里面的输入框。
         ///
         /// ⚠ **必须判这个**：中文输入法**上屏就是按空格** —— 我们一吞，用户连字都打不进去
-        /// （用户实测报过：改文件名时按空格，直接给他弹了预览）。英文场景也一样，空格是正经字符。
+        /// （用户实测报过：改文件名时按空格，直接给他弹了预览；2026-10-02 又报了一次：
+        ///  在资源管理器自己的**搜索框**里打中文，一按空格跳出了 QuickLook）。
         ///
-        /// 怎么判：前台窗是**别人的进程**，`GetFocus()`（只对本线程有效）拿不到，所以用
-        /// `EmbedApi.FocusedWindowOf(前台线程)`（内部就是 `GetGUIThreadInfo` 取 `hwndFocus`），
-        /// 再看那个控件的类名 —— 资源管理器这几个框都是 `Edit`（搜索框是 `Edit` 外面套一层
-        /// `SearchEditBoxWrapperClass`），所以「类名里含 edit」就是文本输入。
-        /// 判不出来时**一律放行**（宁可偶尔多预览一次，也不能因为查不到就整个功能失灵）。
+        /// 怎么判：跨进程 `GetFocus()` 拿不到（只对本线程有效），只能拿线程去问
+        /// `GetGUIThreadInfo`。⚠ 但**「前台窗口那条线程」不等于「拿着焦点的线程」** ——
+        /// shell 那块被 `SetParent` 成子窗口之后，前台窗口永远是我们的宿主窗体，它的线程是**我们**的，
+        /// 问出来的是我们自己的焦点。所以分两步（<paramref name="deep"/> 就是这件事的开关）：
+        ///   ① 前台窗口那条线程 —— 我们自己的框（面包屑编辑框 / 我们自己的搜索框）；
+        ///   ② 宿主窗口树里**别的进程**的线程（每扇 cab 一条）—— 内嵌 explorer 那几个框。
+        /// 判据见 <see cref="ThreadHasTextFocus"/>；**判不出来一律放行**（宁可偶尔多预览一次，
+        /// 也不能因为查不到就整个功能失灵）。
         /// </summary>
-        private static bool TextInputFocused(IntPtr fg)
+        private static bool TextInputFocused(IntPtr fg, bool deep)
+        {
+            // ① 前台窗口**那个线程**的焦点 —— 我们自己进程里的框走这条（面包屑编辑框 / 我们自己的搜索框）。
+            if (ThreadHasTextFocus(NativeMethods.GetWindowThreadProcessId(fg, IntPtr.Zero))) return true;
+
+            // ② ★ 内嵌 explorer 那几个框：焦点在**别人的线程**上。
+            //    `SetParent` 之后 shell 那块是子窗口，前台窗口**永远是我们的宿主窗体**，所以拿它的
+            //    线程去问，问到的是我们自己的焦点 —— 在资源管理器的搜索框里打字时，这一问必然落空
+            //    （用户报：「搜索框里输入中文，一按空格就调了 QuickLook」）。
+            //    而窗口树里那些 explorer 的子窗口各自属于**它们自己那条线程**，得挨个问。
+            if (!deep) return false;
+            return HostTreeHasTextFocus(fg);
+        }
+
+        /// <summary>
+        /// 宿主窗口树里，有没有哪个**别的进程**的线程正把焦点放在文本输入上（见 `TextInputFocused` ②）。
+        ///
+        /// 怎么找：把宿主窗体底下的窗口全捞出来（`WinFind.All` 是递归的），按线程去重，只问**不是我们
+        /// 这条线程**的那些 —— 一扇 cab 一条线程，最多问「标签数 + 几个」次 `GetGUIThreadInfo`。
+        /// 一次全量枚举实测不到 2ms，而空格是人的动作，这个量级无所谓。
+        /// </summary>
+        private static bool HostTreeHasTextFocus(IntPtr fg)
         {
             try
             {
-                uint tid = NativeMethods.GetWindowThreadProcessId(fg, IntPtr.Zero);
-                if (tid == 0) return false;
+                uint ourTid = NativeMethods.GetWindowThreadProcessId(fg, IntPtr.Zero);
+                List<IntPtr> all = WinFind.All(fg);
+                List<uint> seen = new List<uint>(8);
+                for (int i = 0; i < all.Count; i++)
+                {
+                    uint tid = NativeMethods.GetWindowThreadProcessId(all[i], IntPtr.Zero);
+                    if (tid == 0 || tid == ourTid) continue;      // 我们这条线程上面第 ① 步已经问过
+                    bool dup = false;
+                    for (int j = 0; j < seen.Count; j++) if (seen[j] == tid) { dup = true; break; }
+                    if (dup) continue;
+                    seen.Add(tid);
+                    if (ThreadHasTextFocus(tid)) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
 
-                IntPtr h = EmbedApi.FocusedWindowOf(tid);
+        /// <summary>
+        /// 那条线程现在是不是把焦点放在「会吃掉空格的文本输入」上。两条判据：
+        ///   ① 焦点窗口类名里含 `edit`（`Edit` / `EditBoxWrapper` / `SearchEditBoxWrapperClass`……
+        ///      资源管理器这几个框都是这么套的）；
+        ///   ② 焦点窗口**身上有插入符**（`GUITHREADINFO.hwndCaret`）—— 自绘输入框类名认不出来时靠它兜底。
+        /// ⚠ 问不出来 / 没有焦点一律 false（= 不拦着预览）：宁可偶尔多预览一次，也不能因为查不到就整个功能失灵。
+        /// </summary>
+        private static bool ThreadHasTextFocus(uint tid)
+        {
+            if (tid == 0) return false;
+            try
+            {
+                bool caret;
+                IntPtr h = EmbedApi.FocusWindowOf(tid, out caret);
                 if (h == IntPtr.Zero) return false;
 
                 StringBuilder sb = new StringBuilder(64);
-                if (NativeMethods.GetClassName(h, sb, sb.Capacity) <= 0) return false;
-                string cls = sb.ToString();
-
-                if (cls.IndexOf("edit", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-
-                // 万一焦点跑到了输入法自己那扇窗上（组合期间可能发生）
-                return cls == "IME" || cls == "MSCTFIME UI" || cls == "Default IME";
+                if (NativeMethods.GetClassName(h, sb, sb.Capacity) > 0)
+                {
+                    string cls = sb.ToString();
+                    if (cls.IndexOf("edit", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                    // 万一焦点跑到了输入法自己那扇窗上（组合期间可能发生）
+                    if (cls == "IME" || cls == "MSCTFIME UI" || cls == "Default IME") return true;
+                }
+                return caret;
             }
             catch { return false; }
         }
@@ -263,7 +322,13 @@ namespace TabbedExplorer
             if (string.IsNullOrEmpty(folder)) return;
 
             List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
-            if (sel.Count == 0) return;
+            if (sel.Count == 0)
+            {
+                // 记账：分得清「没选中项 / 焦点只停在目录上」（原生 QuickLook 也不预览）
+                // 和「选中了却没出来」。2026-10-02 川报「空格没反应」时要靠这行定位。
+                Diag.Step("QLPreview: 没选中项，不预览（" + folder + "）");
+                return;
+            }
 
             lastNavPath = sel[0];
             Preview(sel[0]);

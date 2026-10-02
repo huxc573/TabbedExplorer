@@ -51,11 +51,48 @@ namespace TabbedExplorer
         private static object shellObj;          // 保活：ImmersiveShell 实例
         private static bool triedPublic;
         private static bool triedInternal;
+        /// <summary>
+        /// 取这两个接口时记下的 shell 进程 pid。**shell 换了一茬就得把旧对象全扔了重取** ——
+        /// `CLSID_ImmersiveShell` 是 explorer.exe 里的东西，shell 一重启，我们手上那个代理就死了：
+        /// 实测重启后 `it.GetCurrentDesktop` **不抛异常、静默返回非 0** ⇒ `CurrentDesktopId()` 给出
+        /// `Guid.Empty` ⇒ `DesktopKey` 掉到 `"unknown"`（用户报的「6 个标签重启后变 4 个」，见 `DesktopHub.EnsureForm`）。
+        /// </summary>
+        private static int shellPidSeen;
+
+        /// <summary>shell 换人了就把手上的 COM 代理全作废，下一次访问现场重取。</summary>
+        private static void EnsureShellFresh()
+        {
+            int now = EmbedApi.ShellExplorerPid();
+            if (now == 0) return;                     // shell 正在重启的空档：先不判，等它回来 pid 自然对不上
+            if (shellPidSeen == 0) { shellPidSeen = now; return; }
+            if (now == shellPidSeen) return;
+            Diag.Step("虚拟桌面: shell 换人了（pid " + shellPidSeen + " -> " + now + "）-> 旧的 COM 代理作废、重取");
+            Reset();
+            shellPidSeen = now;
+        }
+
+        /// <summary>
+        /// 把两个接口的缓存全清掉，下次访问重新 CoCreate。shell 重启后**必须**走一趟
+        /// （`EnsureShellFresh` 按 pid 自动判，`DesktopHub.RestartShell` 自己点的那次也显式叫一声，防 pid 复用）。
+        /// </summary>
+        public static void Reset()
+        {
+            lock (gate)
+            {
+                vdm = null;
+                vdmi = null;
+                shellObj = null;          // 松开旧的 ImmersiveShell 引用（它指向已经死掉的那个 explorer）
+                triedPublic = false;
+                triedInternal = false;
+                shellPidSeen = 0;         // 忘了 pid：下次访问重新认一个，不用再白重置一遍
+            }
+        }
 
         private static IVirtualDesktopManager Manager
         {
             get
             {
+                EnsureShellFresh();
                 if (triedPublic) return vdm;
                 triedPublic = true;
                 try
@@ -78,6 +115,7 @@ namespace TabbedExplorer
         {
             get
             {
+                EnsureShellFresh();
                 if (triedInternal) return vdmi;
                 triedInternal = true;
                 try
@@ -169,6 +207,23 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 「这扇窗在不在**当前**桌面」的**三态版**：判不出来返回 null。
+        ///
+        /// 跟 `IsOnCurrentDesktop` 的区别就是「判不出来」这一档：那个一律当「在」（它是给「拦抢前台」用的，
+        /// 宁可放过）；这里要反过来 —— 判不出来就说判不出来，好让调用方另想办法。
+        /// 用途：桌面 GUID 取不到时靠它挑出手上哪个窗口是当前桌面的（见 `DesktopHub.EnsureForm`）。
+        /// 它比 GUID 活得久：shell 重启后未公开接口死了，这条公开接口实测还好使。
+        /// ⚠ 名字故意不叫 `OnCurrentDesktop` —— `VdOutcome` 里已经有一个同名枚举值，读起来会混。
+        /// </summary>
+        public static bool? WindowOnCurrentDesktop(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return null;
+            IVirtualDesktopManager m = Manager;
+            if (m == null) return null;
+            lock (gate) { return OnCurrent(m, hwnd); }
+        }
+
+        /// <summary>
         /// 窗口现在在不在当前桌面。**判不出来一律当作「在」** —— 这个判断只用来拦「抢前台会把人拽走」
         /// 这一种情况，而每张桌面一个窗口之后，窗口根本不会被搬来搬去，能走到这里说明本来就该显示它。
         /// </summary>
@@ -197,10 +252,19 @@ namespace TabbedExplorer
                 try
                 {
                     IVirtualDesktop d = null;
-                    if (it.GetCurrentDesktop(out d) == 0 && d != null)
+                    int hr = it.GetCurrentDesktop(out d);
+                    if (hr == 0 && d != null)
                     {
                         Guid id;
                         if (d.GetId(out id) == 0 && id != Guid.Empty) return id;
+                        Diag.Log("虚拟桌面: 未公开接口给的桌面 id 是空的 -> 退回前台反推");
+                    }
+                    else
+                    {
+                        // ⚠ 这条以前是静默的，害得「重启 shell 后桌面读不出来」查了半天没证据：
+                        //   它会**不抛异常、直接返回非 0**（代理死了）。留下来当第一手证据。
+                        Diag.Log("虚拟桌面: 未公开 GetCurrentDesktop 失败 hr=0x" + hr.ToString("X8")
+                                 + " -> 退回前台反推");
                     }
                 }
                 catch (Exception ex) { Diag.Log("虚拟桌面: 未公开取当前桌面失败 " + ex.Message); }

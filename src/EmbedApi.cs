@@ -1271,6 +1271,29 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 某个线程的焦点窗口 + **它身上有没有插入符**（跨进程）。
+        ///
+        /// 给 `QLPreview` 判「是不是在文本框里打字」用：光看类名不够 —— 资源管理器那几个框有一半
+        /// 是自绘的（类名认不出来），但**只有文本框才会有插入符**，`GUITHREADINFO.hwndCaret` 就是它。
+        /// ⚠ 没焦点时返回 0（`GetGUIThreadInfo` 对没拿到焦点的线程不给焦点窗口），所以「问不出来」
+        ///   天然等价于「这个线程没在打字」，调用方不用再判一次。
+        /// </summary>
+        public static IntPtr FocusWindowOf(uint tid, out bool hasCaret)
+        {
+            hasCaret = false;
+            if (tid == 0) return IntPtr.Zero;
+            try
+            {
+                GUITHREADINFO g = new GUITHREADINFO();
+                g.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+                if (!GetGUIThreadInfo(tid, ref g)) return IntPtr.Zero;
+                hasCaret = g.hwndCaret != IntPtr.Zero;
+                return g.hwndFocus;
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        /// <summary>
         /// 嵌入窗口顶部那条「explorer 留给标题栏、但子窗口不会画」的高度。
         ///
         /// 原生窗口里这条就是标题栏 + 快速访问工具栏的位置；降级成 WS_CHILD 之后它里面是空的，

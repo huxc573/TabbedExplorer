@@ -17,6 +17,8 @@ namespace TabbedExplorer
     ///
     /// 启动命令行带 `--tray`：开机只**常驻托盘 + 装 Win+E 钩子**，不弹窗口
     /// （窗口等第一次 Win+E 才出现，见 Program / DesktopHub）。
+    /// ⚠ 这个 `--tray` **优先于**设置里的 `startopen`（「启动时打开主窗口」开关）——
+    ///   所以开机自启永远不弹窗，不跟那个开关走（川明确要求的，2026-10-02）。
     /// </summary>
     internal static class AutoStart
     {

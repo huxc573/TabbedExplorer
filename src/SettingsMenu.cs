@@ -350,6 +350,12 @@ namespace TabbedExplorer
             n.Add(Leaf("开机自启",
                        () => AutoStart.IsEnabled(),
                        () => hub.SetAutoStart(!AutoStart.IsEnabled())));
+            // ⑧′ 启动时开不开主窗口（川：「从图标启动并没有默认打开我们的主程序。重启却打开了。
+            //     加个开关统一一下，默认都打开。而且不要影响开机自启，开机自启不用打开。」）
+            //     ⚠ 「开机自启」**不跟这个走** —— 那条命令行固定 `--tray`（见 `AutoStart.CommandLine`）。
+            n.Add(WinOnly(Leaf("启动时打开主窗口（关 = 只驻托盘，按 Win+E 才出来）",
+                       () => Settings.StartOpenWindow,
+                       () => hub.SetStartOpenWindow(!Settings.StartOpenWindow))));
             n.Add(Sep());
 
             // ⑨ 诊断（用户：「是否写入日志，由设置中的 Debug 模式决定，默认不开，

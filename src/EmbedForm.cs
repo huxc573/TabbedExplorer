@@ -1661,6 +1661,14 @@ namespace TabbedExplorer
             //   「下载」），而 `Restorable` 只认「`::` / `shell:` 前缀」或「绝对且真实存在的目录」——
             //   显示名两条都不占，会被整条跳过（用户报的「还原时有个标签报错」就是这个）。
             //   所以一律先 `Store`（显示名 → 真路径 / shell 标识）再判。
+            // ⚠⚠ **这里故意不去重**（2026-10-02 川定的口径）：「保留标签页」是**照原样**还原 ——
+            //   他自己按 `+` 开出来三个「此电脑」，重启后就该还是三个。`+` / Ctrl+T 那条路本来
+            //   也不去重（见 `NewTab`、`OnNewTabClicked`）。**别再往这儿加** `HashSet` 之类的
+            //   「同一路径只留一条」：一加就是「我开的标签被它合并了」，正是川报的那句。
+            //   ⚠ 下面那条 `IndexOfPath` 只拦「窗口里已经开着同一个」，而这一整遍筛子在「摆标签」
+            //     **之前**就跑完了，那会儿 `hosts` 还是空的 ⇒ 它对**记忆文件自己的重复行**从来不生效
+            //     （当年注释里那句「不管文件脏成什么样都不会冒出两个一样的标签」只兑现了「跟已开窗口比」
+            //     这半边）。留着它是给「收编 / 转生那条路已经先摆了一部分」的情况兜底。
             List<string> want = new List<string>();
             for (int i = 0; i < b.Paths.Count; i++)
             {
@@ -1671,9 +1679,9 @@ namespace TabbedExplorer
                     Diag.Step("记忆: 跳过开不了的项「" + b.Paths[i] + "」（可能是个库/虚拟文件夹，没有真实路径）");
                     continue;
                 }
-                // 同一个路径已经有标签了就别再开一个。
-                // 记忆文件里偶尔会有重复行（老版本并发开标签时写坏的），去重放在这儿最稳：
-                // 不管文件脏成什么样，界面上都不会冒出两个一模一样的标签。
+                // 同一个路径**已经开在窗口里**了就别再开一个（收编 / 转生那条路会先把用户那扇窗
+                // 收进来，这时才真的会撞上）。⚠ 它**不是**记忆文件的去重器 —— 这一遍筛子跑在
+                // 「摆标签」之前，`hosts` 空着，文件内部的重复行它一条也看不见（见上面那段）。
                 if (IndexOfPath(p) >= 0)
                 {
                     skipped++;
@@ -1826,6 +1834,36 @@ namespace TabbedExplorer
             int act = IndexOfPath(stagedActive);
             Activate(act >= 0 ? act : 0);
             return true;
+        }
+
+        /// <summary>
+        /// 把「记忆标签只还原一次」那几道闩**重新上弦** —— 窗口又空了，就得能再按记忆摆一遍。
+        ///
+        /// 为什么必须有这一步（用户报的「用重启系统资源管理器之后，只剩一个『此电脑』标签」）：
+        ///   `restored` / `restLaunched` 原来是一辈子一次的闩。外面那套「重启 explorer / 重启任务栏」
+        ///   （`taskkill /im explorer.exe` 之类）会**一口气把我们内嵌的 explorer 全杀掉**（同一个映像名，
+        ///   连坐），窗口瞬间变空、收进托盘；这时候再按 Win+E，`StageRememberedTabs` 因为 `restored`
+        ///   还立着**直接返回 0** ⇒ `EnsureFirstTab` 兜底开一个「此电脑」，接着 `SaveNow` 把这 1 个标签
+        ///   存进记忆 ⇒ 用户原来那一整排被洗掉（日志实锤：11:53:05 Win+E 只开「此电脑」、
+        ///   11:53:06「记忆已保存：1 个标签」，而 11:47:37 外面刚把我们 5 个标签一起杀掉）。
+        ///
+        ///   窗口空 = 这扇窗又回到「什么都没装」的初始状态，按记忆重新摆一遍才是对的 ——
+        ///   这跟程序重启时 `PreloadTabs` 走的是同一条路，行为一致。
+        ///
+        /// ⚠ 代价（想清楚了再动）：用户**故意**一个个关光标签之后按 Win+E，标签也会回来。
+        ///   不另开一条「用户关的不算数」的规矩 —— 因为「0 标签不动记忆桶」（`SaveNow`）本来就让这批标签
+        ///   活在记忆里，程序重启一样会把它们摆回来。两边口径一致，比多一条特例好维护。
+        /// </summary>
+        private void RearmMemoryRestore()
+        {
+            if (!restored && !restLaunched) return;      // 本来就还没还原过，没什么可上弦的
+            Diag.Step("记忆: 窗口空了 -> 给「只还原一次」那几道闩重新上弦（下次现身穿回记忆）");
+            restored = false;
+            restLaunched = false;
+            stagedPaths = null;
+            stagedActive = null;
+            restPending = false;       // 上一轮那个「优先落定」的等待到此为止（兜底定时器自己会退场）
+            restFirstHost = null;
         }
 
         /// <summary>
@@ -2093,6 +2131,23 @@ namespace TabbedExplorer
             {
                 if (activeIndex < 0 || activeIndex >= hosts.Count) return null;
                 return LivePath(hosts[activeIndex]);
+            }
+        }
+
+        /// <summary>
+        /// **当前标签那扇 cab** 的窗口句柄（拿不到返回 0）。
+        ///
+        /// 干什么用：「把某条原生命令交给这个标签自己的 shell 视图」时必须精确落到**当前这扇** ——
+        /// 拿宿主窗体去 `WinFind.ByClass` 会撞上树里**第一扇** DefView（可能是别的标签的、隐藏的那扇），
+        /// 命令递过去就石沉大海（2026-10-02 Alt+Enter 那条踩过这个坑）。
+        /// </summary>
+        internal IntPtr ActiveCabWindow
+        {
+            get
+            {
+                if (activeIndex < 0 || activeIndex >= hosts.Count) return IntPtr.Zero;
+                ExplorerHost h = hosts[activeIndex];
+                return (h == null) ? IntPtr.Zero : h.CabWindow;
             }
         }
 
@@ -3031,6 +3086,10 @@ namespace TabbedExplorer
 
             if (hosts.Count == 0)
             {
+                // ★ 先给「记忆还原」重新上弦（见 RearmMemoryRestore）—— 必须排在下面那两个 `return`
+                //   前面，不然额外窗口那条路会漏掉。窗口空了 = 又有资格按记忆摆一遍。
+                RearmMemoryRestore();
+
                 // 额外窗口（多窗口）：最后一个标签被关 = 这个窗口没用了 ⇒ **真关掉它**
                 // （用户选的口径：「关闭窗口把窗口里所有标签一起关掉」；主窗口那条路不能这么走，
                 //   它是 Win+E 的落点，得一直接得住）。

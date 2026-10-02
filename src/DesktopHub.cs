@@ -70,6 +70,11 @@ namespace TabbedExplorer
 
         /// <summary>迁移模式（v1.0.0）下，全进程唯一那个窗口在登记表里的键。</summary>
         private const string SingleKey = "single";
+        /// <summary>
+        /// 桌面 GUID 问不出来时用的钥匙。⚠ 它是个**跨桌面共用**的桶（见 `KeyOf`）——
+        /// 正常情况不该有窗口落在这个钥匙上（`EnsureForm` 会先按「窗口在不在当前桌面」把手上的窗口认回去）。
+        /// </summary>
+        private const string UnknownKey = "unknown";
 
         /// <summary>钩子回调在别的线程上，动界面之前得先转回 UI 线程 —— 就是它。</summary>
         private readonly Control syncTarget = new Control();
@@ -180,6 +185,19 @@ namespace TabbedExplorer
         private readonly Dictionary<IntPtr, int> shellTaken = new Dictionary<IntPtr, int>();
         /// <summary>`shellTaken` 记多久。窗口句柄会被系统复用，记太久会误挡后来的窗。</summary>
         private const int TakenRememberMs = 10000;
+        /// <summary>
+        /// 我们自己刚「重启系统资源管理器」的时刻（`Environment.TickCount`；0 = 没重启过）。
+        ///
+        /// 用途只有一个：shell 重新起来时**会自己开一扇「此电脑」窗**（Windows 的行为），
+        /// 那不是用户要的东西 —— 按正常流程转生就是每次重启都白多一个「此电脑」标签。
+        /// 见 <see cref="SkipShellRestartWindow"/>。
+        /// </summary>
+        private int shellRestartAt;
+        /// <summary>
+        /// 上面那个「忽略 shell 自己开的那扇窗」的宽限期。给 20 秒：shell 从被杀到开出那扇窗实测 1~4 秒，
+        /// 留足余量；而且**只吃一次**（见 `SkipShellRestartWindow`），过期的宽限不会误伤用户自己开的窗。
+        /// </summary>
+        private const int ShellRestartGraceMs = 20000;
         /// <summary>本进程 pid（`IsCapturable` 在 watcher 线程上也要用，别每次现问）。</summary>
         private readonly int ourPid = Process.GetCurrentProcess().Id;
         private System.Windows.Forms.Timer captureTimer;
@@ -292,6 +310,10 @@ namespace TabbedExplorer
             // 重启本程序放在**主菜单**、紧挨着「退出」上面（用户点名要的位置）：
             // 改完设置 / 换完皮肤想让程序从头走一遍时，它就在手边。
             // ⚠ `SettingsMenu.Spec` 里那一条套了 `WinOnly`（托盘里不排）—— 就是为了不在这里再排一遍。
+            // 重启系统资源管理器（川点名要的）：只重启 **shell 本体**那个 explorer.exe ——
+            // 我们内嵌的标签是独立的 explorer 进程，不会被连坐（见 RestartShell）。
+            // 放在「重启本程序」上面：两个都是「重启」，家族挨着。
+            MenuItem miShellRestart = new MenuItem("重启系统资源管理器", delegate { RestartShell(); });
             MenuItem miRestart = new MenuItem("重启本程序", delegate { RestartApp(); });
             MenuItem miQuit = new MenuItem("退出", delegate { Quit("托盘菜单"); });
 
@@ -301,7 +323,8 @@ namespace TabbedExplorer
 
             trayMenu = new ContextMenu(new MenuItem[]
             {
-                miShow, miNewWin, miFav, miHist, traySettings.Root, new MenuItem("-"), miRestart, miQuit
+                miShow, miNewWin, miFav, miHist, traySettings.Root, new MenuItem("-"),
+                miShellRestart, miRestart, miQuit
             });
             // 自绘：勾选列独立（跟同级项左对齐）+ 深色下也看得见勾（用户报的「没和其它选项一样居左对齐」）
             MenuFx.Hook(trayMenu);
@@ -332,6 +355,9 @@ namespace TabbedExplorer
             // 空格（「空格键预览」）：钩子线程只判「前台是不是我们某个宿主窗体」，
             // 真干活（问 shell 要选中项 + 起 QuickLook）投回 UI 线程，见 `OnSpacePreview`。
             hook.SpacePreview += delegate { Post(OnSpacePreview); };
+            // Alt+Enter（原生「属性」）：内嵌的 cab 是 `WS_CHILD`，explorer 自己那套菜单 / 快捷键表
+            // 对子窗口不走 —— 不接管的话这个 Enter 会落到文件列表上，把选中项全打开（见 `WinEHook`）。
+            hook.AltEnter += delegate { Post(OnAltEnter); };
             // 方向键 / Esc / Enter（「换预览内容 / 关预览」，见 QLPreview）：同理，钩子线程只判前台，
             // 真干活投回 UI 线程，见 `OnPreviewKey`。
             hook.PreviewKey += delegate(int vk)
@@ -347,7 +373,7 @@ namespace TabbedExplorer
                 try
                 {
                     sigWait = ThreadPool.RegisterWaitForSingleObject(Program.ShowSignal,
-                        delegate { Post(OnWinE); }, null, -1, false);
+                        delegate { Post(OnShowSignal); }, null, -1, false);
                 }
                 catch (Exception ex) { Diag.Log("Hub: 注册唤醒事件失败 " + ex.Message); }
             }
@@ -1215,6 +1241,38 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 「这扇 shell 窗是不是**我们刚重启完 shell、它自己开出来的**那一扇」—— 是就关掉、不当标签。
+        ///
+        /// 背景：托盘里那条 <see cref="RestartShell"/> 杀掉 shell 之后，shell 重新起来会**自动开一扇
+        /// 「此电脑」窗**（Windows 的行为）。它走的是正常转生那条路，于是每重启一次资源管理器就白多出
+        /// 一个「此电脑」标签（日志实锤：11:53:26 `shell 开的文件夹 -> ::{20D04FE0-…}` → 转生完成 标签=1）。
+        ///
+        /// 判据三条，全中才算（宁可不忽略，也别误伤用户自己开的窗）：
+        ///   ① 我们刚点过「重启系统资源管理器」（`shellRestartAt`）；② 还在 <see cref="ShellRestartGraceMs"/>
+        ///   宽限期内；③ 目标是「此电脑」这个虚拟根（shell 起来开的就是它）。
+        /// ⚠ **只吃一次**：判中就把 `shellRestartAt` 清掉 —— 宽限期内用户自己再点开「此电脑」照常进标签条。
+        /// </summary>
+        private bool SkipShellRestartWindow(IntPtr h, string path)
+        {
+            if (shellRestartAt == 0) return false;
+            if (Environment.TickCount - shellRestartAt > ShellRestartGraceMs)
+            {
+                shellRestartAt = 0;
+                return false;
+            }
+            if (!PathRules.Same(PathRules.Store(path), ExplorerView.ThisPcPath)) return false;
+
+            shellRestartAt = 0;
+            Diag.Step("Hub: 重启资源管理器后 shell 自己开的那扇「此电脑」窗 -> 关掉、不当标签 cab=0x"
+                      + h.ToInt64().ToString("X"));
+            bool watched;
+            lock (shellWatched) watched = shellWatched.Contains(h);
+            // 跟 TakeOverShellWindow 里同一套关法（见那儿关于「重复关会咚一声」的注释）：有人在盯就交给它。
+            if (!watched) EmbedApi.PostMessageW(h, 0x0112, (IntPtr)0xF060, IntPtr.Zero);   // SC_CLOSE
+            return true;
+        }
+
+        /// <summary>
         /// 「转生」：shell 进程开的文件夹窗口不归我们（不能 SetParent、也不能改它的样式），但它的目标是我们的。
         /// 读出目标目录 → 把它关掉 → 用我们自己的 `explorer /n,/separate` 把同一个目录开成标签。
         /// 这样既拿到了标签，又没碰过它的窗口对象 —— v1.13.1 那个「Win+E 按下去没反应」不会发生。
@@ -1256,6 +1314,10 @@ namespace TabbedExplorer
                 }
                 shellTaken[h] = tick0;
             }
+
+            // ★ 我们自己刚重启过资源管理器：shell 起来会自己开一扇「此电脑」窗，那扇不当标签（见该方法）。
+            if (SkipShellRestartWindow(h, path)) return;
+
             try
             {
                 Guid d = VirtualDesktop.WindowDesktopId(h);
@@ -1698,6 +1760,23 @@ namespace TabbedExplorer
         // Win+E：找到「当前这张桌面」的窗口
         // ==================================================================
 
+        /// <summary>
+        /// 第二个实例被启动（双击 exe / 图标）后的「现身」处理。
+        ///
+        /// 跟 `OnWinE` 的区别：窗口**已经就是前台**时啥也不干 —— 再顶一次只会闪一下、
+        /// 还会把焦点从别的程序硬抢回来（2026-10-02 川定）。窗口在后台 / 缩在托盘时照常唤出来。
+        /// 判定必须 Post 到 UI 线程再做（等待回调跑在线程池线程上，查窗口状态不可靠）。
+        /// </summary>
+        private void OnShowSignal()
+        {
+            if (ForegroundForm() != null)
+            {
+                Diag.Step("Hub: 双击唤醒 -> 窗口已在前台，不动");
+                return;
+            }
+            OnWinE();
+        }
+
         public void OnWinE()
         {
             if (quitting) return;
@@ -1774,12 +1853,67 @@ namespace TabbedExplorer
                     if (g != Guid.Empty && g == desktop) return Adopt(f, key);
                 }
             }
+            else
+            {
+                // ★ 桌面 GUID 问不出来（shell 刚重启：未公开接口的代理是死的、前台窗口又刚好是 0）时，
+                //   **绝不能**拿 `"unknown"` 当钥匙走到下面去建新窗口 —— 那会凭空多出「第二个窗口」：
+                //   它读的是 `unknown` 那个跨桌面共用的脏桶（用户报的「重启前 6 个标签、重启后变 4 个」，
+                //   4 就是那个桶里的条数），而且它一登记进 `forms`，往后每次 Win+E 都往它上面落，
+                //   用户原来那扇（真 GUID 钥匙、内存里标签还在）就再也回不来了。
+                //   改法：用公开接口的「这扇窗在不在当前桌面」把手上的窗口筛一遍 —— 它比 GUID 活得久，
+                //   实测 shell 重启后照样好使。挑中了就用它，一个都挑不出来才退回老逻辑。
+                EmbedForm pick = PickByCurrentDesktop();
+                if (pick != null)
+                {
+                    Diag.Step("Hub: 桌面 GUID 问不出来 -> 按「窗口在不在当前桌面」挑中了 "
+                              + pick.DesktopKey + "（现有 " + forms.Count + " 个窗口）");
+                    return pick;
+                }
+                Diag.Log("Hub: 桌面 GUID 问不出来、按当前桌面也挑不出窗口 -> 退回 unknown 那把钥匙");
+            }
 
             EmbedForm hit;
             if (forms.TryGetValue(key, out hit) && hit != null && !hit.IsDisposed) return hit;
 
             Diag.Step(string.Format("Hub: 给桌面 {0} 建窗口（现有 {1} 个）", key, forms.Count));
             return NewForm(key);
+        }
+
+        /// <summary>
+        /// 桌面 GUID 问不出来时的兜底：用公开的 `IsWindowOnCurrentVirtualDesktop` 把登记过的窗口筛一遍，
+        /// 取「确实在当前桌面」的那个。全都不在当前桌面（或公开接口也死了）就返回 null，让调用方退回老逻辑。
+        ///
+        /// ⚠ 两张都「在当前桌面」是有可能的 —— `"unknown"` 那个脏窗口跟真窗口物理上就在同一张桌面
+        ///   （当年就是在当前桌面建出来的）⇒ 这时**一律优先钥匙是真桌面 GUID 的那个**，
+        ///   `"unknown"` 只是我们判不出来时的临时桶，不该盖过真钥匙。
+        /// ⚠ 用三态的 `VirtualDesktop.WindowOnCurrentDesktop`（判不出来是 null），不能用那个「一律当真」的版本 ——
+        ///   后者在本机什么都死了的时候会把随便一扇窗都当成「在当前桌面」。
+        /// </summary>
+        private EmbedForm PickByCurrentDesktop()
+        {
+            EmbedForm best = null;
+            EmbedForm only = null;
+            int live = 0;
+            foreach (EmbedForm f in new List<EmbedForm>(forms.Values))
+            {
+                if (f == null || f.IsDisposed) continue;
+                live++;
+                only = f;
+                if (VirtualDesktop.WindowOnCurrentDesktop(f.Handle) != true) continue;
+                bool realKey = (f.DesktopKey != null && f.DesktopKey != UnknownKey);
+                bool bestFake = (best != null && (best.DesktopKey == null || best.DesktopKey == UnknownKey));
+                if (best == null || (realKey && bestFake)) best = f;
+            }
+            // ★ 公开接口也判不出来、可手上**就一扇窗** —— 那就是它，没有第二种解释。
+            //   （不能省：`unknown` 那把钥匙一旦被用上就会常驻，用户原来那扇窗再也回不来。
+            //    多窗口时才真的需要「在不在当前桌面」这个判据去挑。）
+            if (best == null && live == 1 && only != null)
+            {
+                Diag.Step("Hub: 桌面判不出来、公开接口也不给答案，但手上只有一扇窗 -> 就是它（"
+                          + only.DesktopKey + "）");
+                return only;
+            }
+            return best;
         }
 
         private EmbedForm NewForm(string key)
@@ -2243,21 +2377,17 @@ namespace TabbedExplorer
         /// （不然它把自己当成「第二个实例」，转头去 Set 唤醒事件然后自杀，看着就是「点了重启、程序没了」）。
         /// 标签记忆由 `Quit()` 落盘，这里不用另存。
         ///
-        /// 新进程的可见性跟着现在走：窗口正开着就 `--open`（重启完还在眼前，正好看效果 / 验懒加载），
-        /// 收在托盘里就 `--tray`（不无缘无故弹窗、不抢前台）。
+        /// 新进程的可见性**跟「双击图标」同一套口径**（2026-10-02 川：加个开关统一，默认都打开）——
+        /// 一律看 `Settings.StartOpenWindow`（settings.json 的 `startopen`），不再看「现在窗口可不可见」。
+        /// 开机自启那条（固定 `--tray`）不受这个开关管，见 `AutoStart.CommandLine`。
         /// </summary>
         public void RestartApp()
         {
             try
             {
-                bool visible = false;
-                foreach (EmbedForm f in AllForms())
-                {
-                    if (f != null && !f.IsDisposed && f.Visible) { visible = true; break; }
-                }
                 int pid = Process.GetCurrentProcess().Id;
                 string exe = Application.ExecutablePath;
-                string args = (visible ? "--open" : "--tray") + " --embed --restart-wait " + pid;
+                string args = (Settings.StartOpenWindow ? "--open" : "--tray") + " --embed --restart-wait " + pid;
                 Diag.Step("Hub: 重启本程序 -> " + args);
                 Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false });
             }
@@ -2269,6 +2399,92 @@ namespace TabbedExplorer
                 return;
             }
             Quit("重启本程序");
+        }
+
+        /// <summary>
+        /// 重启**系统资源管理器**（托盘菜单里那条，川点名要的）。
+        ///
+        /// 干什么：**只杀 shell 本体那个 explorer.exe**（`Shell_TrayWnd` 的属主，退回 `Progman`），
+        /// 等它退干净，再等它自己回来 —— 5 秒还没回来才手动 `explorer.exe` 拉一次。
+        /// 等价于任务管理器里那个「重新启动 Windows 资源管理器」。
+        ///
+        /// ⚠ **不再杀全部 explorer.exe**（原来就是那么写的）：
+        ///   我们内嵌的标签每个都是**独立的** `explorer /n,/separate` 进程，不归 shell 管 ——
+        ///   杀 shell 不会连坐它们。原来那句 `GetProcessesByName("explorer")` 把**自己的标签也一起杀了**
+        ///   （用户报的「打开 3 个标签 → 重启系统资源管理器 → 只剩一个『此电脑』」就是这么来的）。
+        ///   外面那些「重启任务栏」小工具走的是 `taskkill /f /im explorer.exe`（全杀），那种我们拦不住 ——
+        ///   那条路靠 `EmbedForm.RearmMemoryRestore` 把记忆标签还原回来兜。
+        ///
+        /// ⚠ 另外两件必须知道的事：
+        ///   ① shell 重新起来会**自己开一扇「此电脑」窗**，那不是用户要的 —— 靠 <see cref="SkipShellRestartWindow"/>
+        ///      关掉（不然每重启一次就白多一个「此电脑」标签）。
+        ///   ② 只 kill 进程、再起进程：**绝不碰 shell 那扇窗**（不进宿主、不动样式位 —— 红线）。
+        ///
+        /// 托盘图标不用操心：走的是 WinForms 的 `NotifyIcon`，它自己盯着 `TaskbarCreated`、会把图标重新贴回来。
+        /// </summary>
+        public void RestartShell()
+        {
+            try
+            {
+                int shellPid = EmbedApi.ShellExplorerPid();
+                if (shellPid == 0)
+                {
+                    Diag.Log("Hub: 重启资源管理器 -> 找不到 shell 进程（Shell_TrayWnd / Progman 都没有），不动作");
+                    return;
+                }
+                Process shell = null;
+                try { shell = Process.GetProcessById(shellPid); }
+                catch (Exception ex) { Diag.Log("Hub: 重启资源管理器 -> 打不开 pid=" + shellPid + "：" + ex.Message); }
+                if (shell == null) return;
+
+                // ★ 先记下「是**我们**点的」：shell 起来之后它自己开的那扇「此电脑」窗要忽略
+                //   （见 SkipShellRestartWindow）。宽限期只吃一次，用户自己开的窗不受影响。
+                shellRestartAt = Environment.TickCount;
+                try
+                {
+                    Diag.Step("Hub: 重启资源管理器 -> 结束 shell 本体 pid=" + shellPid + "（内嵌的标签一个都不动）");
+                    shell.Kill();
+                }
+                finally { try { shell.Dispose(); } catch { } }
+
+                // ★ 手上那两个虚拟桌面 COM 代理（`CLSID_ImmersiveShell` 在 explorer.exe 里）随着 shell
+                //   一起死了 —— 不扔的话 `GetCurrentDesktop` 会静默失败、`CurrentDesktopId()` 给出空 GUID，
+                //   于是 Win+E 把桌面钥匙算成 "unknown"、凭空多开一扇窗去读脏桶（用户报的「6 个变 4 个」）。
+                //   `EnsureShellFresh` 按 pid 变化也会自动重置（那条管**外面**杀 shell 的情况），
+                //   这里显式叫一声是为了防新 shell 复用了同一个 pid。
+                VirtualDesktop.Reset();
+
+                // 用一个一次性后台线程 —— 别在 UI 线程上 Sleep（托盘菜单那一刻还在跑我们的消息循环）。
+                Thread t = new Thread(delegate()
+                {
+                    try
+                    {
+                        // 轮询等 shell 自己回来（Winlogon 会重启它，实测 1~4 秒）。
+                        bool back = false;
+                        for (int i = 0; i < 20; i++)
+                        {
+                            Thread.Sleep(250);
+                            if (EmbedApi.ShellExplorerPid() != 0) { back = true; break; }
+                        }
+                        if (back)
+                        {
+                            Diag.Step("Hub: 重启资源管理器 -> shell 自己回来了（不重复拉起）");
+                            // ★ shell 回来了才去预热虚拟桌面接口 —— 刚 Reset 过，这次现取的一定是新 shell 的。
+                            //   排在 UI 线程上做（`Post`）：这些 COM 调用跟别处共用同一批对象，别在后台线程上抢。
+                            Post(delegate { VirtualDesktop.WarmUp(); });
+                        }
+                        else
+                        {
+                            Diag.Step("Hub: 重启资源管理器 -> 等了 5 秒 shell 还没回来，手动拉起");
+                            Process.Start("explorer.exe");
+                        }
+                    }
+                    catch (Exception ex) { Diag.Log("Hub: 重启资源管理器 -> 拉起 shell 失败 " + ex.Message); }
+                });
+                t.IsBackground = true;
+                t.Start();
+            }
+            catch (Exception ex) { Diag.Log("Hub: 重启资源管理器失败 " + ex.Message); }
         }
 
         /// <summary>现在有标签正等着 explorer 起来吗（任何一张桌面）。见 DrainCapture 的那道闸。</summary>
@@ -2332,6 +2548,19 @@ namespace TabbedExplorer
             Settings.SetWinENewPc(on);
             RefreshTrayMenu();
             Diag.Step("Hub: Win+E 开「此电脑」-> " + (on ? "开" : "关（只唤回窗口）"));
+        }
+
+        /// <summary>
+        /// 「启动时打开主窗口」开关（默认开）。管两条路：双击图标 / 重启本程序，口径一致。
+        /// ⚠ 开机自启**不跟它走**（那条固定 `--tray`，见 `AutoStart.CommandLine`）。
+        /// 只影响**下次启动 / 重启**，当场没有副作用要补 —— 改完只能日志里记一笔。
+        /// </summary>
+        public void SetStartOpenWindow(bool on)
+        {
+            if (Settings.StartOpenWindow == on) return;
+            Settings.SetStartOpenWindow(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: 启动时打开主窗口 -> " + (on ? "开" : "关（只驻托盘，Win+E 才出来）"));
         }
 
         private void RetabAll()
@@ -2544,6 +2773,7 @@ namespace TabbedExplorer
             SetQLPreview(s.QLPreview);
             SetNewTabBeside(s.NewTabBeside);
             SetWinENewPc(s.WinENewPc);
+            SetStartOpenWindow(s.StartOpenWindow);   // 只影响下次启动，当场没有副作用要补
             SetNotify(s.Notify);
             // ⚠ 通知的**逐条开关表**在这儿**不用**管（以前这里有四行 `SetNotifyPart`）：
             //   它是纯数据、没有副作用（不像捕获方式会搬记忆、休眠要重排定时器），
@@ -2632,6 +2862,46 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// Alt+Enter（原生「属性」，见 `WinEHook.Handle` 里那一段）：把命令交给**前台那个窗口的当前标签**
+        /// 自己那扇真 `SHELLDLL_DefView` 去执行。
+        ///
+        /// 为什么要我们自己转这一下：内嵌的 cab 是 `WS_CHILD`，explorer 那套菜单 / 快捷键路对子窗口不走 ——
+        /// Alt+Enter 到不了它自己的「属性」，而且那个 Enter 会落到文件列表上，把选中项**全部打开**
+        /// （用户报的「Alt+Enter 打开了一堆文件夹」）。
+        ///
+        /// ⭐ **不在这边读选中项、也不判虚拟位置**（2026-10-02 川定案：「让窗口内自己正确调用」）：
+        ///   我们只把 `FCIDM_SHVIEW_PROPERTIES` 递给那扇真 view，**由它自己决定** ——
+        ///   选了东西 ⇒ 那些东西的属性（多选就是合并表）；什么都没选 ⇒ **当前文件夹**的属性。
+        ///   ⚠ 原先「先读选中项、读到 0 就不动作」是错的：川在 `D:\` 根目录按 Alt+Enter 时
+        ///     日志只有「没有选中项（不动作）」⇒ **毫无反应**，而原生照旧会弹「当前文件夹 属性」。
+        /// </summary>
+        private void OnAltEnter()
+        {
+            EmbedForm f = ForegroundForm();
+            if (f == null) return;
+
+            // ⚠ 一定要拿**当前标签**那扇 cab：拿宿主窗体去找会撞上树里第一扇 DefView（别的标签 / 隐藏的那扇）。
+            IntPtr cab = f.ActiveCabWindow;
+            if (cab == IntPtr.Zero) { Diag.Log("Hub: Alt+Enter 时拿不到当前标签的窗口"); return; }
+
+            // ⭐ 首选：让那扇真 view 自己执行原生命令（见方法注释）。
+            if (ShellVerbs.NativeProperties(cab))
+            {
+                Diag.Step("Hub: Alt+Enter -> 让内嵌 DefView 自己弹属性");
+                return;
+            }
+
+            // 兜底：那扇 view 都找不到（实测几乎不会发生）才退回「自己叫」那条老路 —— 走当前选中项，
+            // 至少别让这一下**无声无息**（老路的坑见 `ShellVerbs.InvokeProperties` 的注释）。
+            string folder = f.ActiveTabPath;
+            if (string.IsNullOrEmpty(folder) || folder.IndexOf("::") >= 0) return;
+            List<string> sel = ShellBrowserReg.SelectedPathsIn(folder);
+            if (sel.Count == 0) { Diag.Log("Hub: Alt+Enter 找不到 view，也没选中项：" + folder); return; }
+            if (ShellVerbs.InvokeProperties(sel, cab))
+                Diag.Step(string.Format("Hub: Alt+Enter -> 兜底叫属性 {0} 项：{1}", sel.Count, sel[0]));
+        }
+
+        /// <summary>
         /// 方向键 / Esc / Enter（见 `QLPreview.PreviewKey`）：原生资源管理器里这几键也是 QuickLook 管的，
         /// 但它的判据是**前台窗口的类名**，自绘宿主它不认 ⇒ 由我们替它转发。在 UI 线程上跑。
         ///   · 方向键 ⇒ `DoSwitch`：读当前标签所在文件夹**此刻**的选中项发过去
@@ -2685,6 +2955,10 @@ namespace TabbedExplorer
         /// 只覆盖「有窗口在的桌面」—— 这一轮没碰过的那些桌面，读进来什么样就写回去什么样，不会被清空。
         /// 另外**不动已经关掉的窗口**的桶：那次会话最后长什么样就留着什么样的标签，下次还在。
         ///
+        /// ⭐ **0 标签的窗口同样不动它的桶**（2026-10-02 川拍板，见 ① 里的注释）：标签被外部弄死
+        ///   （典型：别的程序重启 `explorer.exe`，把我们内嵌的那些 explorer 一起带走）或收进托盘时，
+        ///   窗口会瞬间变成 0 标签 —— 那不能当成「用户把工作集关光了」，否则一次外部事故就把记忆洗空。
+        ///
         /// ⚠ 多窗口：**一张桌面只有一个桶**。主窗口那份是正本（`Clear` 再写），
         ///   额外窗口的标签接在后面追加（去重）—— 重启回到一个窗口，但标签一个不丢。
         /// </summary>
@@ -2699,16 +2973,26 @@ namespace TabbedExplorer
                 foreach (EmbedForm f in all)
                 {
                     if (f == null || f.IsDisposed || f.IsExtra) continue;
+
+                    // ⭐ **一个标签都没有的窗口：整桶不动**（连 `Ensure` 都不调，免得凭空建个空桶）。
+                    //    为什么（2026-10-02 川拍板）：标签可能是**被外部弄死的** —— 比如别的程序重启
+                    //    explorer.exe，会把我们内嵌的那些 explorer 一起带走，标签瞬间清零；而收进托盘
+                    //    （Ctrl+W 关到最后一个）也是 0 标签。这两种都**不是「用户把工作集关光了」**，
+                    //    不该拿它去洗掉桶里那份记忆（实测踩过：shell 重启一次 ⇒ 整份记忆被抹成空）。
+                    //    代价：没有「关光标签 = 清空记忆」这条隐式手段了。
+                    List<string> mine = new List<string>();
+                    foreach (string p in f.TabPaths()) if (!string.IsNullOrEmpty(p)) mine.Add(p);
+                    if (mine.Count == 0) { live++; continue; }
+
                     DesktopMemory.Bucket b = memory.Ensure(f.DesktopKey);
                     b.Paths.Clear();
                     b.Active = null;
 
                     string active = f.ActiveTabPath;
-                    foreach (string p in f.TabPaths())
+                    for (int i = 0; i < mine.Count; i++)
                     {
-                        if (string.IsNullOrEmpty(p)) continue;
-                        b.Paths.Add(p);
-                        if (PathRules.Same(p, active)) b.Active = p;
+                        b.Paths.Add(mine[i]);
+                        if (PathRules.Same(mine[i], active)) b.Active = mine[i];
                         tabs++;
                     }
                     // 窗口位置和大小（用户：完全退出后下次照原样打开）。
@@ -2728,11 +3012,14 @@ namespace TabbedExplorer
                 foreach (EmbedForm f in all)
                 {
                     if (f == null || f.IsDisposed || !f.IsExtra) continue;
+                    List<string> mine = new List<string>();
+                    foreach (string p in f.TabPaths()) if (!string.IsNullOrEmpty(p)) mine.Add(p);
+                    if (mine.Count == 0) { live++; continue; }        // 同上：0 标签的窗口不动记忆
                     DesktopMemory.Bucket b = memory.Ensure(f.DesktopKey);
                     string active = f.ActiveTabPath;
-                    foreach (string p in f.TabPaths())
+                    for (int i = 0; i < mine.Count; i++)
                     {
-                        if (string.IsNullOrEmpty(p)) continue;
+                        string p = mine[i];
                         if (b.Paths.Exists(delegate(string s) { return PathRules.Same(s, p); })) continue;
                         b.Paths.Add(p);
                         if (PathRules.Same(p, active)) b.Active = p;
@@ -2791,7 +3078,7 @@ namespace TabbedExplorer
 
         private static string KeyOf(Guid g)
         {
-            return g == Guid.Empty ? "unknown" : g.ToString("D");
+            return g == Guid.Empty ? UnknownKey : g.ToString("D");
         }
 
         private static string Short(Guid g)

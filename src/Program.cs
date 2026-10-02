@@ -145,6 +145,16 @@ namespace TabbedExplorer
                 }
             }
             if (AutoOpen) StartHidden = false;   // --open 想看效果，就别藏着
+            // ★ 「从图标启动」（命令行里既没 `--open` 也没 `--tray`）跟「重启本程序」**口径一致**：
+            //   看不看窗口一律问设置 `startopen`（默认开）。川报的「从图标启动并没有默认打开我们的主程序，
+            //   重启却打开了」就是这里缺了这条 —— 原来只有 `--open` 才开窗，裸起 exe 是「什么都不开」。
+            //   ⚠ 必须排在 `--tray` 之后判：开机自启那条命令行固定带 `--tray`（见 `AutoStart.CommandLine`），
+            //     它**永远不弹窗** —— 川明确要求「不要影响开机自启」。
+            if (!StartHidden && !AutoOpen && Settings.StartOpenWindow)
+            {
+                AutoOpen = true;
+                Diag.Step("启动: 没带 --tray -> 按设置 startopen=开，起来就把窗口打开");
+            }
 
             // --restart-wait <旧 pid>：等那个实例真退出再往下走。
             // 必须在抢互斥体**之前** —— 它退出的那一刻锁才放开（见 RestartWaitPid 的注释）。
@@ -212,7 +222,10 @@ namespace TabbedExplorer
                 LogFatal("未处理异常: " + e.ExceptionObject);
             };
 
-            LogFatal("启动 pid=" + System.Diagnostics.Process.GetCurrentProcess().Id);
+            // ⚠ 顺手把**原始命令行**记下来：以后「从图标启动到底带了什么参数」看这行就够了，
+            //   不用再翻快捷方式 / 计划任务 / 启动器配置来回猜（2026-10-02 查 --tray 来路吃过亏）。
+            LogFatal("启动 pid=" + System.Diagnostics.Process.GetCurrentProcess().Id
+                     + " 命令行=" + Environment.CommandLine);
 
             if (EmbedMode)
             {

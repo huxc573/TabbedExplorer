@@ -632,6 +632,12 @@ namespace TabbedExplorer
         /// <summary>
         /// `file:///D:/Dev/!tmp/` → `D:\Dev\!tmp`。认不出来的（UNC / 虚拟位置 / 别的协议）返回 null ——
         /// 宁可退回地址栏那条路，也不要交一个可能开不出来的字符串出去。
+        ///
+        /// ⚠ **盘符根目录会只剩 `D:`（长度 2）**：`file:///D:/` 去掉尾部反斜杠就是它。
+        ///   所以这里只能判 `Length >= 2`——判 `>= 3` 会把 `C:\` / `D:\` 这类根目录当成非法，
+        ///   于是 <see cref="SelectedPathsIn"/> 里 `p == null` 直接 `continue`、**永远匹配不上那扇窗**，
+        ///   表现就是「停在盘符根目录时读不到选中项 ⇒ 空格不预览 / Alt+Enter 没反应」
+        ///   （2026-10-02 实测踩到：目录一深就正常，一停在 `D:\` 必哑）。
         /// </summary>
         private static string FileUrlToPath(string url)
         {
@@ -642,7 +648,7 @@ namespace TabbedExplorer
             else return null;                                  // file://server/… 之类：不猜，交给地址栏
             s = Uri.UnescapeDataString(s);
             s = s.Replace('/', '\\').TrimEnd('\\');
-            return (s.Length >= 3 && s[1] == ':') ? s : null;  // 必须是 D:\ 这种盘符开头
+            return (s.Length >= 2 && s[1] == ':') ? s : null;  // 盘符开头（`D:` 这种根目录也算）
         }
 
         // ==================================================================

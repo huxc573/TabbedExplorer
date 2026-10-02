@@ -23,6 +23,7 @@ namespace TabbedExplorer
     ///   vpanealpha = 60 ~ 100               侧边栏盖在内容上那一下的不透明度（%，100 = 不透明）
     ///   autopreload = 1 | 0                 预加载：程序起来后**没开窗口也**先把本桌面记着的标签在后台起出来
     ///   autosleep  = 1 | 0                  非激活标签自动休眠（切走的标签停留够久就收回它的驻留内存）
+    ///   winepc     = 1 | 0                  Win+E 时顺手开一个「此电脑」标签（默认关：只把窗口唤到前面，现有标签一个都不动）
     ///   debug      = 1 | 0                  是否把详细过程写进 data\log.txt（默认关，见 Diag）
     ///
     /// ⚠ 用 JSON 而不是 `key=value`（用户要求「配置项文件用 json 格式」）：
@@ -185,6 +186,21 @@ namespace TabbedExplorer
         /// 实时生效：`NextTabIndex` 每次新建时现读。
         /// </summary>
         public static bool NewTabBeside = false;
+        /// <summary>
+        /// Win+E 时**顺手开一个「此电脑」标签**（默认**关**）。
+        ///
+        /// 关（默认）：Win+E 只把窗口唤到最前面 —— **一个标签都不动**，原来停在哪个标签就还是哪个。
+        ///   想开新页直接 `Ctrl+T`，不打断手上这条。
+        /// 开：跟老行为一样，唤窗口的同时开一个「此电脑」（已经开着就切过去）。
+        ///
+        /// ⚠ 跟这个开关**无关**的两处：「第一次 Win+E」（窗口还空着、也没有记忆）照样会给一个
+        ///   「此电脑」，那是 `EmbedForm.EnsureFirstTab` 的兜底 —— 不然窗口空着没法用；
+        ///   托盘 / 双击的那条路也照旧。
+        ///
+        /// 用户：「把关闭我们程序窗口后按 Win+E 打开新的『此电脑』做成可选项，默认关闭 ——
+        ///   Win+E 唤醒后直接 Ctrl+T 更方便，还不影响原来激活的标签页，转移注意力。」
+        /// </summary>
+        public static bool WinENewPc = false;
         /// <summary>书签栏是否显示（Ctrl+Shift+B）。</summary>
         public static bool FavBar = false;
         /// <summary>
@@ -340,6 +356,7 @@ namespace TabbedExplorer
                     SleepDelaySec = ClampSleepSec(Json.GetInt(json, "sleepdelay", SleepDelaySec));
                     QLPreview    = Json.GetBool(json, "qlpreview", true);
                     NewTabBeside = Json.GetBool(json, "newtabbeside", false);
+                    WinENewPc    = Json.GetBool(json, "winepc", false);
                     // ⚠ Debug 得**先**读 —— 下面通知那四类的默认值要看它（用户：「Debug 模式默认
                     //   开启全部，非 Debug 模式只默认开启重要的部分」），不能等到底下那一行。
                     bool dbg = Json.GetBool(json, "debug", false);
@@ -437,6 +454,7 @@ namespace TabbedExplorer
                     case "sleepdelay":  SleepDelaySec = ClampSleepSec(ParseInt(v, SleepDelaySec)); break;
                     case "qlpreview":   QLPreview = ParseBool(v, true); break;
                     case "newtabbeside": NewTabBeside = ParseBool(v, false); break;
+                    case "winepc":      WinENewPc = ParseBool(v, false); break;
                     case "notify":      Notify = ParseBool(v, true); break;
                     case "notifyover":  LoadNotifyOver(v); break;
                     case "notifysec":   NotifySec = ClampNotifySec(ParseInt(v, NotifySec)); break;
@@ -484,7 +502,7 @@ namespace TabbedExplorer
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
                         FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
-                        AutoPreload, AutoSleep, Notify, QLPreview, NewTabBeside;
+                        AutoPreload, AutoSleep, Notify, QLPreview, NewTabBeside, WinENewPc;
             public int TabWidth, VPaneAlpha, FavBandHeight, SleepDelaySec, NotifySec;
             /// <summary>逐条覆盖表的一份拷贝（`Snap` 抄一份出来、`ApplySnapshot` 抄回去）。</summary>
             public readonly Dictionary<string, bool> NotifyOver =
@@ -505,6 +523,7 @@ namespace TabbedExplorer
             s.NotifySec = NotifySec;
             foreach (KeyValuePair<string, bool> kv in NotifyOver) s.NotifyOver[kv.Key] = kv.Value;
             s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit; s.NewTabBeside = NewTabBeside;
+            s.WinENewPc = WinENewPc;
             s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
             s.Debug = Debug; s.TabWidth = TabWidth; s.VPaneAlpha = VPaneAlpha;
@@ -533,6 +552,7 @@ namespace TabbedExplorer
             NotifyOver.Clear();
             foreach (KeyValuePair<string, bool> kv in s.NotifyOver) NotifyOver[kv.Key] = kv.Value;
             TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit; NewTabBeside = s.NewTabBeside;
+            WinENewPc = s.WinENewPc;
             FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
             Debug = s.Debug; TabWidth = s.TabWidth; VPaneAlpha = s.VPaneAlpha;
@@ -568,6 +588,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_sleepdelay\": \"非激活标签停留多少秒之后才收它那个 explorer 进程的驻留内存，1 ~ 300；调大 = 来回切标签更顺，调小 = 更省内存\",\r\n");
                 sb.Append("  \"_qlpreview\": \"true = 在标签里按空格调 QuickLook 预览选中的文件（需已安装并常驻 QuickLook）；false = 空格照旧落在文件列表上。Ctrl/Alt/Shift+空格 一律不管\",\r\n");
                 sb.Append("  \"_newtabbeside\": \"true = 新建的标签开在**当前标签旁边**（插到它右边）；false = 一律开在最末尾（默认）。只管新开的，「恢复关闭的标签页」永远回它原来的位置\",\r\n");
+                sb.Append("  \"_winepc\": \"true = Win+E 时顺手开一个「此电脑」标签（已经开着就切过去）；false = 只把窗口唤到最前面、一个标签都不动（默认）。想开新页直接 Ctrl+T。跟「第一次 Win+E / 窗口还空着」的兜底无关，那种情况照样给一个「此电脑」\",\r\n");
                 sb.Append("  \"_notify\": \"true = 操作反馈弹一条右下角气泡（已复制 / 留一个 / 还在后台 这类）；false = 一个都不弹（功能一件不少）\",\r\n");
                 sb.Append("  \"_notifyover\": \"逐条通知开关的覆盖表，格式 id=1 / id=0 用逗号隔开；**只写用户改过的那些**，没写到的 = 跟随默认（debug 全开，平时只开「出错与失败」和「启动与后台状态」里那几条）。条目 id 见设置窗口「通知管理」页或代码里的 NotifyItems\",\r\n");
                 sb.Append("  \"_notifysec\": \"一条气泡停留多少秒后自己收（默认 4，1 ~ 30）。调大 = 看得更清楚，调小 = 少挡视线\",\r\n");
@@ -594,6 +615,7 @@ namespace TabbedExplorer
                 sb.Append("  \"tabautowiden\": ").Append(TabAutoWiden ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"tabautofit\": ").Append(TabAutoFit ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"newtabbeside\": ").Append(NewTabBeside ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"winepc\": ").Append(WinENewPc ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureshell\": ").Append(CaptureShell ? "true" : "false").Append(",\r\n");
@@ -647,12 +669,12 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} favbandh={15} debug={16} hotkeys={17} autopreload={18} autosleep={19} sleepdelay={20} notify={21} notifyover={22} notifysec={23} qlpreview={24} newtabbeside={25}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} favbandh={15} debug={16} hotkeys={17} autopreload={18} autosleep={19} sleepdelay={20} notify={21} notifyover={22} notifysec={23} qlpreview={24} newtabbeside={25} winepc={26}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, FavBandHeight, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0,
-                NotifyOver.Count, NotifySec, QLPreview ? 1 : 0, NewTabBeside ? 1 : 0);
+                NotifyOver.Count, NotifySec, QLPreview ? 1 : 0, NewTabBeside ? 1 : 0, WinENewPc ? 1 : 0);
         }
 
         // ==================================================================
@@ -884,6 +906,8 @@ namespace TabbedExplorer
         public static void SetTabAutoFit(bool on) { TabAutoFit = on; Save(); }
         /// <summary>新建标签开在当前标签旁边（`true`）/ 开在最末尾（`false`，默认）。新建时现读，无需刷新。</summary>
         public static void SetNewTabBeside(bool on) { NewTabBeside = on; Save(); }
+        /// <summary>Win+E 时顺手开一个「此电脑」标签（`true`）/ 只把窗口唤到最前面（`false`，默认）。唤窗时现读。</summary>
+        public static void SetWinENewPc(bool on) { WinENewPc = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }

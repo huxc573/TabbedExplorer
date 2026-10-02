@@ -469,6 +469,29 @@ namespace TabbedExplorer
             favBar.MouseEnter += delegate { PaneMouseMoved(true); };
             favBar.MouseLeave += delegate { PaneMouseMoved(false); };
 
+            // ★ 折叠窗格时，「从别处往左边拖东西」（文件 / 文件夹 —— 比如从内嵌的文件列表里拖）
+            //   **不会**触发上面那两个 MouseEnter：发起拖拽的那个进程（explorer.exe）攥着鼠标捕获，
+            //   我们只在成为「落点」时才会收到 OLE 的 DragEnter / DragOver。
+            //   少了这一条，折叠态下根本够不着书签段 —— 收着的时候它整段不显示（见 DoLayout 里
+            //   `band = 0` 那一段），而这正是用户报的
+            //   「垂直标签栏无法拖动到书签（到左侧没有临时展开标签栏）」。
+            //   拖拽一进窗格这条窄缝就把窗格临时摊开（跟鼠标悬停同一个效果、走同一个 `paneHover`），
+            //   离开 / 拖完再按**光标实际位置**收回去（`PaneMouseMoved` 自己会核矩形，见那边的注释）。
+            // ⚠ 别把这一条并进 `vPane.MouseEnter` —— 那是「鼠标在控件上」的意思，OLE 拖拽期间压根不发；
+            //   `AllowDrop` 注册的 IDropTarget 才是拖拽期间唯一收得到消息的那条路。
+            vPane.AllowDrop = true;
+            vPane.DragEnter += delegate(object s, DragEventArgs e) { PaneMouseMoved(true); };
+            vPane.DragOver += delegate(object s, DragEventArgs e)
+            {
+                // 拖动中每动一下都来一发 —— 摊开之后这里会立刻早退（`paneHover` 没变），不折腾。
+                PaneMouseMoved(true);
+                // ⚠ 窗格本体**不是**落点（落点是盖在它上面的书签段，见 `FavBar.AllowDrop` / `OnDragDrop`），
+                //   但不能把 Effect 一关就完事：拖拽得**继续**收 DragOver，摊开那一下才有意义。
+                //   光标只要再动一像素、压到书签段上，OLE 就会把落点转给 `favBar`（那边报 Copy）。
+                if (e != null) e.Effect = DragDropEffects.None;
+            };
+            vPane.DragLeave += delegate { PaneMouseMoved(false); };
+
             content = new Panel();
             content.BackColor = Theme.Chrome;
 

@@ -315,6 +315,11 @@ namespace TabbedExplorer
             n.Add(WinOnly(Leaf("新标签开在当前标签旁边（关 = 开在最末尾）",
                        () => Settings.NewTabBeside,
                        () => hub.SetNewTabBeside(!Settings.NewTabBeside))));
+            // ⑤″ Win+E 时开不开「此电脑」（用户要的：**默认关** —— 「Win+E 唤醒后直接 Ctrl+T 更方便，
+            //     还不影响原来激活的标签页」）。老行为是一唤窗口就开一个「此电脑」并切过去。
+            n.Add(WinOnly(Leaf("Win+E 时开一个「此电脑」标签（关 = 只唤回窗口，标签不动）",
+                       () => Settings.WinENewPc,
+                       () => hub.SetWinENewPc(!Settings.WinENewPc))));
             n.Add(Sep());
 
             // ⑥ 书签栏（Ctrl+Shift+B）

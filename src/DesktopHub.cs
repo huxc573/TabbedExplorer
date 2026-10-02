@@ -1705,7 +1705,9 @@ namespace TabbedExplorer
             Diag.Step("Hub: Win+E，当前桌面=" + Short(d));
             EmbedForm f = EnsureForm(d);
             if (f == null) return;
-            f.ShowForUser(true);
+            // 顺手开不开一个「此电脑」看设置（默认**不开**，见 Settings.WinENewPc）：
+            // 关了就是「只把窗口唤到最前面，一个标签都不动」—— 想开新页自己 Ctrl+T。
+            f.ShowForUser(Settings.WinENewPc);
         }
 
         /// <summary>
@@ -2320,6 +2322,18 @@ namespace TabbedExplorer
             Diag.Step("Hub: 新标签位置 -> " + (on ? "当前标签旁边" : "最末尾"));
         }
 
+        /// <summary>
+        /// Win+E 时开不开一个「此电脑」标签（默认**关**，见 `Settings.WinENewPc`）。
+        /// 没有副作用要补 —— `OnWinE` 每次唤窗口时现读这个值，所以改了立刻生效。
+        /// </summary>
+        public void SetWinENewPc(bool on)
+        {
+            if (Settings.WinENewPc == on) return;
+            Settings.SetWinENewPc(on);
+            RefreshTrayMenu();
+            Diag.Step("Hub: Win+E 开「此电脑」-> " + (on ? "开" : "关（只唤回窗口）"));
+        }
+
         private void RetabAll()
         {
             foreach (EmbedForm f in AllForms())
@@ -2529,6 +2543,7 @@ namespace TabbedExplorer
             //   「没恢复」和「恢复了但没打印」，索性一起补上。
             SetQLPreview(s.QLPreview);
             SetNewTabBeside(s.NewTabBeside);
+            SetWinENewPc(s.WinENewPc);
             SetNotify(s.Notify);
             // ⚠ 通知的**逐条开关表**在这儿**不用**管（以前这里有四行 `SetNotifyPart`）：
             //   它是纯数据、没有副作用（不像捕获方式会搬记忆、休眠要重排定时器），

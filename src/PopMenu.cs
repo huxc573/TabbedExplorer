@@ -13,6 +13,12 @@ namespace TabbedExplorer
         public bool On;        // 打勾（勾选列）
         public bool IsSep;     // 分隔线
         public PopItem[] Kids; // 子菜单（非 null 就是一层下拉）
+        /// <summary>
+        /// 悬停浮窗提示（两行：显示名 \r\n 完整路径 / 项数）。
+        /// 菜单里的项原来没有任何提示（用户：「手动展开后也没有浮窗信息，只有在书签栏图标上才有」）。
+        /// 空 = 不提示。
+        /// </summary>
+        public string Tip;
     }
 
     /// <summary>
@@ -49,6 +55,22 @@ namespace TabbedExplorer
         // ------------------------------------------------------------------
         // 规格
         // ------------------------------------------------------------------
+
+        /// <summary>现在有没有一摞菜单开着（书签栏的「悬停展开」靠它判断菜单生死）。</summary>
+        internal static bool IsOpen { get { return PopMenuWindow.HasOpen; } }
+
+        /// <summary>
+        /// 鼠标挪回了**锚控件**上（在菜单外面）——「悬停展开」的菜单抓着鼠标捕获，
+        /// 锚控件收不到 MouseMove，得把这次移动转发回去（栏上换目标 = 换菜单 / 收起）。
+        /// 参数 = （锚控件，屏幕坐标）。
+        /// </summary>
+        internal static Action<Control, Point> OwnerHover;
+
+        /// <summary>
+        /// 悬停菜单开着时用户在锚控件上**按下**了 —— 转发给栏自己判（点同一个文件夹 = 钉住，
+        /// 点别处 = 收掉吞掉）。不转发的话这一下会被当「点在菜单外」吞掉，用户感觉点了空。
+        /// </summary>
+        internal static Action<Control, Point> OwnerClick;
 
         public static PopItem It(string text, Action a) { return It(text, a, false); }
 
@@ -101,6 +123,9 @@ namespace TabbedExplorer
         ///   以后新增调用点不必再各自记这条规矩。
         /// </summary>
         public static void Show(PopItem[] items, Control owner, Point at, string what)
+        { Show(items, owner, at, what, false); }
+
+        public static void Show(PopItem[] items, Control owner, Point at, string what, bool hoverManaged)
         {
             if (owner == null || items == null || items.Length == 0) return;
 
@@ -112,17 +137,18 @@ namespace TabbedExplorer
                     Control o = owner;
                     Point p = at;
                     string w = what;
-                    owner.BeginInvoke((MethodInvoker)delegate { ShowNow(its, o, p, w); });
+                    bool m = hoverManaged;
+                    owner.BeginInvoke((MethodInvoker)delegate { ShowNow(its, o, p, w, m); });
                     return;
                 }
             }
             catch (Exception ex) { Diag.Log("菜单: Defer 失败 " + what + " " + ex.Message); }
 
-            ShowNow(items, owner, at, what);   // 拿不到窗口句柄（理论上不该走到）就同步弹，别干脆不弹
+            ShowNow(items, owner, at, what, hoverManaged);   // 拿不到窗口句柄（理论上不该走到）就同步弹，别干脆不弹
         }
 
         /// <summary>真正弹出来。只在 `Show` 里被调 —— 那里已经把「推后一轮」这步做完了。</summary>
-        private static void ShowNow(PopItem[] items, Control owner, Point at, string what)
+        private static void ShowNow(PopItem[] items, Control owner, Point at, string what, bool hoverManaged)
         {
             try
             {
@@ -130,7 +156,7 @@ namespace TabbedExplorer
                 Point screen;
                 try { screen = owner.PointToScreen(at); }
                 catch { screen = new Point(at.X, at.Y); }
-                PopMenuWindow.Open(items, owner, screen, what);
+                PopMenuWindow.Open(items, owner, screen, what, hoverManaged);
             }
             catch (Exception ex)
             {
@@ -178,11 +204,20 @@ namespace TabbedExplorer
 
         // ---- 全局（同时只允许一份菜单）----
         private static PopMenuWindow root;
+        /// <summary>现在有没有一摞菜单开着（书签栏的悬停展开靠它判断生死）。</summary>
+        internal static bool HasOpen { get { return root != null; } }
         private static string openWhat;
         private static Action pending;
 
         private readonly PopItem[] items;
         private readonly string what;
+        /// <summary>锚控件（谁把我弹出来的）。悬停展开的菜单拿它判「鼠标是不是挪回了栏上」。</summary>
+        private readonly Control anchor;
+        /// <summary>
+        /// **悬停展开**模式（书签栏文件夹）：鼠标出了「菜单 + 锚控件」两头就自动收摊、
+        /// 挪回锚控件上就把移动转发回去（`PopMenu.OwnerHover`）。点击开的菜单不管 —— 手动的照旧等点击。
+        /// </summary>
+        private readonly bool managed;
         private readonly int[] rowTop;
         private readonly int[] rowH;
         private readonly Font font;
@@ -207,10 +242,12 @@ namespace TabbedExplorer
             }
         }
 
-        private PopMenuWindow(PopItem[] items, string what)
+        private PopMenuWindow(PopItem[] items, string what, Control anchor, bool managed)
         {
             this.items = items;
             this.what = what;
+            this.anchor = anchor;
+            this.managed = managed;
 
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -278,10 +315,13 @@ namespace TabbedExplorer
 
         /// <summary>弹一份菜单。`atScreen` 是屏幕坐标。</summary>
         public static void Open(PopItem[] items, Control anchor, Point atScreen, string what)
+        { Open(items, anchor, atScreen, what, false); }
+
+        public static void Open(PopItem[] items, Control anchor, Point atScreen, string what, bool hoverManaged)
         {
             CloseAll(false);      // 防御：上一份还开着就先收掉（别叠两层）
 
-            PopMenuWindow w = new PopMenuWindow(items, what);
+            PopMenuWindow w = new PopMenuWindow(items, what, anchor, hoverManaged);
             w.PlaceAt(atScreen);
             openWhat = what;
 
@@ -367,7 +407,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>屏幕坐标是不是落在这一摞菜单的任意一层里。</summary>
-        private static bool ContainsScreen(Point p)
+        internal static bool ContainsScreen(Point p)
         {
             for (PopMenuWindow w = root; w != null; w = w.child)
             {
@@ -377,7 +417,7 @@ namespace TabbedExplorer
         }
 
         /// <summary>关掉整摞菜单。<paramref name="runPending"/> = 关完要不要执行选中那项的动作。</summary>
-        private static void CloseAll(bool runPending)
+        internal static void CloseAll(bool runPending)
         {
             PopMenuWindow r = root;
             root = null;
@@ -396,12 +436,51 @@ namespace TabbedExplorer
         }
 
         /// <summary>自己 + 所有更深层的窗体一起关掉（深的先关）。</summary>
+        // ---- 悬停模式的「出了两头」延迟收摊 ----
+        // 立即收的話跨栏→菜单那 1px 缝时（鼠标两头都不在）菜单会在用户眼前闪没。
+        private Timer leaveTimer;
+
+        private void DelayClose()
+        {
+            if (leaveTimer != null) return;          // 已经在倒计时
+            Timer t = new Timer();
+            leaveTimer = t;
+            t.Interval = 250;
+            t.Tick += delegate
+            {
+                t.Stop();
+                try { t.Dispose(); } catch { }
+                if (leaveTimer == t) leaveTimer = null;
+                if (root != this) return;            // 别的菜单已经接管
+                Point m = Cursor.Position;
+                if (ContainsScreen(m)) return;       // 又回菜单里了
+                try
+                {
+                    if (anchor != null && anchor.RectangleToScreen(anchor.ClientRectangle).Contains(m)) return;
+                }
+                catch { }
+                CloseAll(false);
+            };
+            t.Start();
+        }
+
+        private void CancelDelayClose()
+        {
+            if (leaveTimer == null) return;
+            Timer t = leaveTimer;
+            leaveTimer = null;
+            try { t.Stop(); t.Dispose(); } catch { }
+        }
+
         private void CloseChain()
         {
             PopMenuWindow c = child;
             child = null; childOwner = -1;
             if (c != null) c.CloseChain();
             try { if (watch != null) { watch.Stop(); watch.Dispose(); watch = null; } } catch { }
+            CancelDelayClose();
+            if (tips != null) { try { tips.Hide(this); } catch { } }
+            if (tipRow >= 0) tipRow = -1;
             try { Capture = false; } catch { }
             try { Close(); } catch { }
         }
@@ -419,6 +498,7 @@ namespace TabbedExplorer
         {
             try { if (font != null) font.Dispose(); } catch { }
             try { if (glyph != null) glyph.Dispose(); } catch { }
+            try { if (tips != null) { tips.Dispose(); tips = null; } } catch { }
             base.OnFormClosed(e);
         }
 
@@ -426,13 +506,14 @@ namespace TabbedExplorer
         // 子菜单
         // ==================================================================
 
-        private void OpenChild(int index)
+        /// <summary>开下一层。返回是不是**真的开了**（同一项已经开着就什么都不做，返 false）。</summary>
+        private bool OpenChild(int index)
         {
-            if (child != null && childOwner == index) return;
+            if (child != null && childOwner == index) return false;
             CloseDeeper();
 
             PopItem it = items[index];
-            PopMenuWindow c = new PopMenuWindow(it.Kids, what + " ▸ " + it.Text);
+            PopMenuWindow c = new PopMenuWindow(it.Kids, what + " ▸ " + it.Text, null, false);
             Point p = new Point(Right - Px(3), Top + rowTop[index]);
             Screen scr;
             try { scr = Screen.FromPoint(p); } catch { scr = Screen.PrimaryScreen; }
@@ -442,6 +523,7 @@ namespace TabbedExplorer
             c.PlaceAt(p);
             c.Show(this);               // 挂在**这一层**名下（z 序 / 生命周期跟着走）
             child = c; childOwner = index;
+            return true;
         }
 
         // ==================================================================
@@ -480,10 +562,49 @@ namespace TabbedExplorer
 
             if (target == null)
             {
-                // 点在整摞菜单外面：关掉，并且**吞掉这一下**（跟原生菜单一样，不算点到别处）
-                if (down) CloseAll(false);
+                bool inAnchor = false;
+                if (managed && anchor != null)
+                {
+                    try { inAnchor = anchor.RectangleToScreen(anchor.ClientRectangle).Contains(screen); }
+                    catch { }
+                }
+
+                if (down)
+                {
+                    // 悬停菜单开着时在栏上**按下**：菜单抓着捕获，这一下本来会被当「点在菜单外」
+                    // 吞掉（菜单一关，用户感觉点了空 = 「手动点击没有固定展开」）。转发给栏自己判：
+                    // 点在同一个文件夹上 = 把菜单**钉住**（转手动）；点别处 = 收掉吞掉（跟原生菜单一致）。
+                    if (inAnchor)
+                    {
+                        Action<Control, Point> h = PopMenu.OwnerClick;
+                        if (h != null) { CancelDelayClose(); h(anchor, screen); return; }
+                    }
+                    CloseAll(false);
+                    return;
+                }
+
+                // 悬停展开的菜单（书签栏文件夹）：
+                //   · 鼠标挪回了锚控件（栏）上 —— 菜单抓着捕获，栏收不到 MouseMove，
+                //     把这次移动转发回去（栏上换目标 = 换菜单 / 收起，见 `FavBar.OnFlyOwnerHover`）；
+                //   · 挪出了「栏 + 菜单」两头 —— **延迟**收摊（「移出后自动收起」就靠这条）。
+                //     不立即收是因为栏和菜单之间有缝（菜单比栏顶下沿低 1px 起），
+                //     跨缝那几帧鼠标两头都不在 —— 立即收 = 菜单永远够不着。点击开的菜单（managed=false）
+                //     不动，照旧等点击 / 看门狗。
+                if (managed && anchor != null)
+                {
+                    if (inAnchor)
+                    {
+                        CancelDelayClose();
+                        Action<Control, Point> h = PopMenu.OwnerHover;
+                        if (h != null) h(anchor, screen);
+                        return;
+                    }
+                    DelayClose();
+                }
                 return;
             }
+
+            CancelDelayClose();       // 回到菜单里了：倒计时作废
 
             if (idx < 0) { target.CloseDeeper(); target.SetHover(-1); return; }
             PopItem it = target.items[idx];
@@ -498,7 +619,9 @@ namespace TabbedExplorer
                 //   MouseMove，先关再开 = 每移动一次就**销毁并重建**一个子菜单窗体 ——
                 //   表现就是「移到有子项的子文件夹上卡顿」+「有时子项根本不出现」（刚建好又被下一步关掉）。
                 //   该不该关交给 `OpenChild` 自己判（是同一项开的就原样留着，什么都不做）。
-                target.OpenChild(idx);
+                // ⚠ 开子菜单那一下会把刚挂的浮窗提示收掉 —— 只在**真开了**的那一次补挂（同位置同文本，
+                //   看不出闪）；千万别每次移动都补：原生 Show 同参反复挂 = 川看到的「一闪一闪」。
+                if (target.OpenChild(idx)) target.ShowTip(idx);
                 return;
             }
 
@@ -532,6 +655,41 @@ namespace TabbedExplorer
             if (hover == i) return;
             hover = i;
             Invalidate();
+            ShowTip(i);
+        }
+
+        // ---- 悬停浮窗提示（菜单里的项原来什么提示都没有）----
+        // 用 `ToolTip.Show` 手动弹（跟书签栏自己那套一个路数），不用 SetToolTip ——
+        // 项是我们自己画的，ToolTip 的自动命中认不出它们。
+        private ToolTip tips;
+        private int tipRow = -1;
+
+        private void ShowTip(int i)
+        {
+            if (tips == null)
+            {
+                tips = new ToolTip();
+                tips.InitialDelay = 0;
+                tips.ReshowDelay = 0;
+                tips.ShowAlways = true;
+                Theme.StyleTip(tips);
+            }
+            bool valid = i >= 0 && i < items.Length && items[i] != null && !items[i].IsSep
+                         && !string.IsNullOrEmpty(items[i].Tip);
+            if (!valid)
+            {
+                if (tipRow >= 0) { try { tips.Hide(this); } catch { } tipRow = -1; }
+                return;
+            }
+            if (tipRow >= 0 && tipRow != i) { try { tips.Hide(this); } catch { } }
+            try
+            {
+                // 同一项重复 Show 是故意的：开子菜单那一下会把原生的提示收掉，
+                // 每次移动都重新挂一遍（位置 / 文本不变，看不出闪）才留得住。
+                tips.Show(items[i].Tip, this, Px(10), rowTop[i] + rowH[i] + Px(2), 5000);
+                tipRow = i;
+            }
+            catch { }
         }
 
         // ==================================================================

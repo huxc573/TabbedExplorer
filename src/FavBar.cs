@@ -113,6 +113,16 @@ namespace TabbedExplorer
         private bool vertical;
         private string tipKey;
 
+        // ---- 横排：悬停在文件夹图标上自动弹出它的子菜单（用户：「能不能自动展开？
+        //      移出后自动收起，就像垂直侧边栏那样」）----
+        // 定时器用 WinForms 的没问题：这不是热路径上的短周期等待，只是悬停 UX（不跑的话
+        // 顶多少弹一次，不会有正确性后果），而且鼠标悬停时消息队列是空的，饿不死。
+        private Timer flyTimer;              // 悬停计时（默认 450ms）
+        private int flyIndex = -1;           // 计时盯着的那一行；挪到别的行就重挂
+        private bool flyManaged;             // 现在开着的飞出菜单是「悬停开的」（生死归我们管；点击开的不算）
+        private FavNode flyOpenNode;         // 悬停开的菜单是哪个文件夹的 —— 防止「菜单→栏→菜单」一圈回来后
+                                             // 把同一个菜单关了重开（川看到的「反复切换」就是这个）
+
         /// <summary>
         /// 竖排（垂直侧边栏那个左栏里的一截）。
         /// ⚠ 竖排时 `scrollX` 当**纵向**滚动量用 —— 两种排法不可能同时出现，
@@ -128,6 +138,8 @@ namespace TabbedExplorer
                 scrollX = 0;
                 tips.Hide(this);
                 tipKey = null;
+                StopFly();
+                if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);   // 换排法，悬停菜单别带着飞
                 Invalidate();
             }
         }
@@ -274,6 +286,12 @@ namespace TabbedExplorer
             tips.AutoPopDelay = 8000;
             tips.ShowAlways = true;      // 窗口没激活也照弹（跟标签条一个理由）
             Theme.StyleTip(tips);        // 背景 / 字体跟着颜色模式
+            // 悬停展开：菜单抓着捕获时栏收不到 MouseMove，菜单会把挪回栏上的移动/按下转发到这儿
+            PopMenu.OwnerHover = OnFlyOwnerHover;
+            PopMenu.OwnerClick = OnFlyOwnerClick;
+            flyTimer = new Timer();
+            flyTimer.Interval = 450;
+            flyTimer.Tick += delegate { OnFlyTimer(); };
             Theme.Changed += delegate
             {
                 BackColor = TheBack;
@@ -309,6 +327,9 @@ namespace TabbedExplorer
             rows.Clear();
             hoverIndex = -1;
             scrollX = 0;
+            // 行集整个重建：悬停展开盯着的行号已经不可信，连同悬停菜单一起收掉
+            StopFly();
+            if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
             try
             {
                 foreach (FavNode n in FavStore.BarItems) items.Add(n);
@@ -746,14 +767,26 @@ namespace TabbedExplorer
                 }
             }
 
+            // ---- 悬停高亮 / 浮窗提示 / 悬停展开的调度（菜单抓捕时由 OnFlyOwnerHover 转发到这儿）----
+            HoverMove(e.Location);
+        }
+
+        /// <summary>
+        /// 鼠标在栏上挪动的公共段：竖排的分割条 / 滚动条热区、行高亮、浮窗提示、
+        /// 以及**横排悬停展开**的调度。两条路进这：(1) 本控件的 `OnMouseMove`；
+        /// (2) 悬停菜单抓着捕获、鼠标挪回栏上时由菜单转发过来的 `OnFlyOwnerHover` ——
+        /// 不合到一起的话两边的命中 / 高亮会各说各话。
+        /// </summary>
+        private void HoverMove(Point p)
+        {
             // ---- 竖排：顶上那根分割条 / 右侧那根滚动条 —— 光标形状 + 悬停点亮 ----
             // ⚠ 这一段必须排在 `HitTest` **前面**：分割条压在标题行上、滚动条压在书签行右边，
             //   不先判它们的话鼠标形状和命中都会落到书签项上去。
             EnsureLayout();
-            bool hot = OnDividerHot(e.Location);
+            bool hot = OnDividerHot(p);
             Rectangle trk = VTrack();
             Rectangle thb = trk.IsEmpty ? Rectangle.Empty : VThumb();
-            bool overBar = !trk.IsEmpty && (trk.Contains(e.Location) || thb.Contains(e.Location));
+            bool overBar = !trk.IsEmpty && (trk.Contains(p) || thb.Contains(p));
             if (hot != hoverResize) { hoverResize = hot; Invalidate(); }
             Cursor want = (hot || overBar) ? Cursors.SizeNS : Cursors.Default;
             if (Cursor != want) Cursor = want;
@@ -763,16 +796,53 @@ namespace TabbedExplorer
                 hoverLead = false;
                 tips.Hide(this);
                 tipKey = null;
+                StopFly();
+                if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
                 return;
             }
 
-            int i = HitTest(e.Location);
+            int i = HitTest(p);
             bool hl = (i == -2);
             if (hl != hoverLead) { hoverLead = hl; Invalidate(); }
             if (i != hoverIndex) { hoverIndex = i; Invalidate(); }
 
+            // ---- 悬停展开的调度：停在文件夹上才起表，挪走就撤销 / 收菜单 ----
+            // 横排弹下方、竖排弹右侧（`ShowSubMenu` 自己分）—— 都是**飞出**，不原地：
+            // 原地跟着鼠标一收一放会让行在光标底下跳；竖排的原地摊开仍归点击。
+            // 竖排里已经原地摊开的文件夹不再弹飞出（孩子就在眼前，重复了）。
+            {
+                bool flyable = (i >= 0 && rows[i].IsFolder && rows[i].Node.Kids.Count > 0
+                                && (!vertical || !rows[i].Expanded));
+                if (flyable)
+                {
+                    // 这个文件夹的悬停菜单已经开着：千万别再把计时挂上去 ——
+                    // 鼠标在「菜单↔栏」之间走一圈（栏这边 OnMouseLeave 会把 flyIndex 清掉），
+                    // 回来重挂到点就会把同一个菜单关了重开 = 川看到的「反复切换」。
+                    bool alreadyShown = (PopMenu.IsOpen && flyManaged && flyOpenNode == rows[i].Node);
+                    if (!alreadyShown && flyIndex != i) { StopFly(); flyIndex = i; flyTimer.Start(); }
+                }
+                else
+                {
+                    StopFly();
+                    // 只在真的挪到**别的项 / 星标**上才收 —— i<0（踩在行的边距 / 栏的空白上）不算：
+                    // 菜单顶边比项下缘低 1px，中间有条缝，往下挪进菜单必然扫过它，
+                    // 算的话菜单永远够不着（川：「一下移到展开内容，它又缩回去了」）。
+                    if (flyManaged && PopMenu.IsOpen && (hl || i >= 0)) PopMenuWindow.CloseAll(false);
+                }
+            }
+
             string key = i >= 0 ? ("fav:" + i) : (hl ? "fav:lead" : null);
-            if (!string.Equals(key, tipKey, StringComparison.Ordinal))
+            // 悬停菜单开着 / 横排文件夹**且弹得出来**（非空）：栏上的浮窗一律不出 ——
+            // 它弹的位置就是菜单的位置，两个叠在一起来回抢就是川看到的「冲突」。
+            // 弹不出来的（空文件夹）照常出提示，不然悬停上去什么都不给（川点名的）。
+            bool flyWillOpen = (i >= 0 && rows[i].IsFolder && rows[i].Node.Kids.Count > 0
+                                && (!vertical || !rows[i].Expanded));
+            if (PopMenu.IsOpen || flyWillOpen)
+            {
+                tipKey = key;
+                tips.Hide(this);
+            }
+            else if (!string.Equals(key, tipKey, StringComparison.Ordinal))
             {
                 tipKey = key;
                 if (i < 0 && !hl) tips.Hide(this);
@@ -798,16 +868,86 @@ namespace TabbedExplorer
                     string body;
                     if (rows[i].IsFolder)
                     {
-                        body = "文件夹，里面有 " + rows[i].Node.Kids.Count + " 项";
+                        body = rows[i].Node.Kids.Count == 0
+                            ? "文件夹，里面还没有书签"
+                            : "文件夹，里面有 " + rows[i].Node.Kids.Count + " 项";
                         // 竖排里点文件夹 = **原地摊开 / 收起**（用户：「书签里面的文件和文件夹
                         // 就可以直接在原地展开了，这样使用起来比较方便」）；
-                        // 横排那条只有 30 像素高，摊不下，还是弹飞到旁边的子菜单。
+                        // 横排那条只有 30 像素高，摊不下，还是弹飞到旁边的子菜单（现在悬停也会自动弹）。
                         if (vertical) body += rows[i].Expanded ? "（点一下收起）" : "（点一下原地展开）";
+                        else if (rows[i].Node.Kids.Count > 0) body += "（停一下自动展开）";
                     }
                     else body = rows[i].Node.Path;
                     tips.Show(rows[i].Name + "\r\n" + body, this, x, y, 8000);
                 }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // 横排悬停展开：停在文件夹图标上约 450ms 自动弹出子菜单；挪走 / 移出栏自动收起。
+        // 菜单窗抓着鼠标捕获，所以「挪回栏上」的移动是菜单转发过来的（OnFlyOwnerHover）。
+        // ------------------------------------------------------------------
+
+        /// <summary>撒销悬停计时（目标变了 / 鼠标离开了）。</summary>
+        private void StopFly()
+        {
+            flyIndex = -1;
+            if (flyTimer != null && flyTimer.Enabled) flyTimer.Stop();
+        }
+
+        /// <summary>悬停计时到点：再核一遍鼠标还停在原地，才真弹（快速划过的不算）。</summary>
+        private void OnFlyTimer()
+        {
+            flyTimer.Stop();
+            int i = flyIndex;
+            flyIndex = -1;
+            if (i < 0 || i >= rows.Count) return;
+            if (PopMenu.IsOpen && !flyManaged) return;        // 点击开的菜单还开着：别用悬停去抢；
+                                                              // 悬停开的照常换（Open 里会先把旧的收掉）
+            if (dragIndex >= 0) return;                       // 正拖着（内部拖动）不弹
+            // 空文件夹弹了也是一句「还没有书签」，悬停就别吵；
+            // 竖排已原地摊开的不弹飞出（孩子就在眼前）。
+            if (!rows[i].IsFolder || rows[i].Node.Kids.Count == 0) return;
+            if (vertical && rows[i].Expanded) return;
+            Point c;
+            try { c = PointToClient(Cursor.Position); }
+            catch { return; }
+            if (HitTest(c) != i) return;                      // 到点时鼠标已经不在那项上了
+            flyManaged = true;
+            flyOpenNode = rows[i].Node;
+            ShowSubMenu(i, true);
+        }
+
+        /// <summary>
+        /// 悬停菜单开着时用户在栏上**按下**了（菜单转发过来的，见 `PopMenu.OwnerClick`）。
+        /// 点的还是文件夹 = 把菜单**钉住**（关掉悬停这份、重开一份手动的 —— 手动的等点击才收）；
+        /// 点在别处 = 收掉吞掉这一下（跟原生菜单一致，再点一下才按普通点击走）。
+        /// </summary>
+        private void OnFlyOwnerClick(Control c, Point screen)
+        {
+            if (c != this) return;
+            Point p;
+            try { p = PointToClient(screen); }
+            catch { PopMenuWindow.CloseAll(false); return; }
+            int i = HitTest(p);
+            bool onFolder = (i >= 0 && i < rows.Count && rows[i].IsFolder);
+            flyManaged = false;
+            StopFly();
+            PopMenuWindow.CloseAll(false);
+            if (onFolder) ShowSubMenu(i);          // 钉住：转手动那份
+        }
+
+        /// <summary>
+        /// 悬停菜单抓着捕获，鼠标挪回栏上时由菜单转发到这儿（见 `PopMenu.OwnerHover`）。
+        /// 只接自己那一份（别的窗口的栏不接）。
+        /// </summary>
+        private void OnFlyOwnerHover(Control c, Point screen)
+        {
+            if (c != this) return;
+            Point p;
+            try { p = PointToClient(screen); }
+            catch { return; }
+            HoverMove(p);
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -821,6 +961,10 @@ namespace TabbedExplorer
             if (hoverResize) hoverResize = false;
             Cursor = Cursors.Default;
             tips.Hide(this);
+            StopFly();
+            // 悬停开的子菜单：收摊**全交给菜单自己**（它抓着捕获，鼠标去哪儿它都知道）——
+            // 挪进菜单 = 菜单接着管；挪出「栏 + 菜单」两头 = 菜单延迟收摊（DelayClose，给跨缝留余地）。
+            // 这儿不主动收：栏下沿和菜单之间有 1px 缝，鼠标经过时如果在这儿收，菜单永远够不着。
             Invalidate();
         }
 
@@ -851,6 +995,10 @@ namespace TabbedExplorer
         protected override void OnDragEnter(DragEventArgs e)
         {
             base.OnDragEnter(e);
+            // 拖文件进来：悬停菜单 / 悬停计时都收掉 —— 拖拽期间鼠标移动不走 MouseMove，
+            // 菜单留着只会挡在路上（而且它没登记拖放落点，拖到它上面光标会变「不可放」）。
+            StopFly();
+            if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
             e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
         }
 
@@ -922,6 +1070,7 @@ namespace TabbedExplorer
             dropIndex = -1;
             dropInto = -1;
             dropAfter = false;
+            StopFly();                        // 按下了：悬停展开的计时撒销（点击路径自己会弹）
 
             EnsureLayout();
 
@@ -986,6 +1135,7 @@ namespace TabbedExplorer
             if (row.IsFolder)
             {
                 if (vertical) { ToggleExpand(row.Node); return; }
+                flyManaged = false;           // 点击开的不归悬停管（否则陈旧的 managed 标记会让悬停把它抢掉）
                 ShowSubMenu(i);
                 return;
             }
@@ -1177,6 +1327,11 @@ namespace TabbedExplorer
 
         /// <summary>把子文件夹里的东西列出来（支持继续往下嵌套）。</summary>
         private void ShowSubMenu(int index)
+        { ShowSubMenu(index, false); }
+
+        /// <param name="hoverManaged">是不是「悬停开的」：悬停开的菜单生死归栏管（挪走就收）；
+        /// 点击开的照旧，等点击 / 看门狗。</param>
+        private void ShowSubMenu(int index, bool hoverManaged)
         {
             if (index < 0 || index >= rows.Count) return;
             FavNode nd = rows[index].Node;
@@ -1188,7 +1343,7 @@ namespace TabbedExplorer
             string what = "书签子文件夹 " + nd.Display;
             // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（用户报的「点书签栏文件夹，
             //   里面的子项点不动」的根就在那儿）—— 这里不用自己 Defer。
-            PopMenu.Show(kids, this, at, what);
+            PopMenu.Show(kids, this, at, what, hoverManaged);
         }
 
         /// <summary>把一个节点的孩子变成菜单项（文件夹继续往下嵌套一层）。</summary>
@@ -1198,11 +1353,16 @@ namespace TabbedExplorer
             for (int i = 0; i < folder.Kids.Count; i++)
             {
                 FavNode k = folder.Kids[i];
-                if (k.IsFolder) r.Add(PopMenu.Sub(k.Display, ItemsOf(k)));
+                if (k.IsFolder)
+                {
+                    PopItem s = PopMenu.Sub(k.Display, ItemsOf(k));
+                    s.Tip = k.Display + "\r\n文件夹，里面有 " + k.Kids.Count + " 项";
+                    r.Add(s);
+                }
                 else
                 {
                     string p = k.Path;
-                    r.Add(PopMenu.It(k.Display, delegate
+                    PopItem it = PopMenu.It(k.Display, delegate
                     {
                         if (FavStore.IsFolder(p)) { if (ItemClicked != null) ItemClicked(k); }
                         else
@@ -1210,7 +1370,9 @@ namespace TabbedExplorer
                             try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
                             catch (Exception ex) { Toast.Show(NotifyItems.FavOpenFail, "打不开", ex.Message); }
                         }
-                    }));
+                    });
+                    it.Tip = k.Display + "\r\n" + p;      // 子项的浮窗信息（用户：「手动展开后也没有浮窗信息」）
+                    r.Add(it);
                 }
             }
             return r.ToArray();
@@ -1321,6 +1483,7 @@ namespace TabbedExplorer
             {
                 if (tips != null) tips.Dispose();
                 if (font != null) font.Dispose();
+                if (flyTimer != null) { try { flyTimer.Stop(); flyTimer.Dispose(); } catch { } flyTimer = null; }
             }
             base.Dispose(disposing);
         }

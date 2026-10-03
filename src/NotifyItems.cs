@@ -88,6 +88,8 @@ namespace TabbedExplorer
         // ==================================================================
         public static readonly NotifyItem FavAdded =
             N("fav-added", ToastKind.Ok, false, "已加入书签");
+        public static readonly NotifyItem FavMerged =
+            N("fav-merged", ToastKind.Ok, false, "书签：合并重复书签的结果（合掉了几项 / 没有重复）");
         public static readonly NotifyItem CopyDone =
             N("copy-done", ToastKind.Ok, false, "已复制路径 / 名称 / 文件夹名");
         public static readonly NotifyItem HistCopy =
@@ -115,7 +117,7 @@ namespace TabbedExplorer
             OpenOtherVd, OpenNoPath, CopyNoPath, FavMarkNoPath, FavAddFail, FavAddNoPath,
             FavOpenFail, MgrAddFail, MgrOpenFail, HistOpenFail, RestartFail, AutoStartFail,
             BgRunning,
-            FavAdded, CopyDone, HistCopy, FavBarSwitch,
+            FavAdded, FavMerged, CopyDone, HistCopy, FavBarSwitch,
             NoUndo, KeepOne, FavDup, FavEmptyFolder, FavBarRootDel,
         };
 

@@ -218,6 +218,16 @@ namespace TabbedExplorer
         /// <summary>书签栏是否显示（Ctrl+Shift+B）。</summary>
         public static bool FavBar = false;
         /// <summary>
+        /// 书签**允许重复**（默认**开**）。
+        ///
+        /// 关掉 = 老行为：拖进来的路径已经在栏上（含子树任何一处）就忽略，只提示「已经在里面了」。
+        /// 开着 = 同一个路径可以出现多次（同一层里想要两个一样的也能加）。
+        /// 用户：「书签默认允许重复，设置增加可选项」。
+        /// ⚠ 加书签时的去重是**按整条栏含子树**算的，跟「合并重复书签」的**同层**口径不同 ——
+        ///   后者只在同一层里合并（见 `FavStore.MergeDuplicates`）。
+        /// </summary>
+        public static bool FavAllowDup = true;
+        /// <summary>
         /// 是否捕获**所有**打开的文件夹窗口（不只是 Win+E）。
         /// 开：从开始菜单 / 桌面双击打开的文件夹也会被收成标签（浏览器行为）。
         /// 关：只接管 Win+E，其他照旧开原生窗口。
@@ -390,6 +400,7 @@ namespace TabbedExplorer
                     TabAutoFit   = Json.GetBool(json, "tabautofit", true);
                     TabAutoWiden = Json.GetBool(json, "tabautowiden", true);
                     FavBar       = Json.GetBool(json, "favbar", false);
+                    FavAllowDup  = Json.GetBool(json, "favdup", true);
                     CaptureAll   = Json.GetBool(json, "captureall", true);
                     CaptureShell = Json.GetBool(json, "captureshell", true);
                     WindowSize   = Json.GetBool(json, "winsize", true);
@@ -483,6 +494,7 @@ namespace TabbedExplorer
                     case "tabautofit":   TabAutoFit = ParseBool(v, true); break;
                     case "tabautowiden": TabAutoWiden = ParseBool(v, true); break;
                     case "favbar":       FavBar = ParseBool(v, false); break;
+                    case "favdup":       FavAllowDup = ParseBool(v, true); break;
                     case "captureall":   CaptureAll = ParseBool(v, true); break;
                     case "captureshell": CaptureShell = ParseBool(v, true); break;
                     case "winsize":      WindowSize = ParseBool(v, true); break;
@@ -517,7 +529,7 @@ namespace TabbedExplorer
         {
             public CaptureMode Capture; public ColorMode Color;
             public bool KeepTabs, LazyTabs, ParallelLaunch, TabAutoWiden, TabAutoFit,
-                        FavBar, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
+                        FavBar, FavAllowDup, CaptureAll, CaptureShell, WindowSize, VTabs, VTabsCollapse, Debug,
                         AutoPreload, AutoSleep, Notify, QLPreview, NewTabBeside, WinENewPc, StartOpenWindow;
             public int TabWidth, VPaneAlpha, FavBandHeight, SleepDelaySec, NotifySec;
             /// <summary>逐条覆盖表的一份拷贝（`Snap` 抄一份出来、`ApplySnapshot` 抄回去）。</summary>
@@ -541,7 +553,7 @@ namespace TabbedExplorer
             s.TabAutoWiden = TabAutoWiden; s.TabAutoFit = TabAutoFit; s.NewTabBeside = NewTabBeside;
             s.WinENewPc = WinENewPc;
             s.StartOpenWindow = StartOpenWindow;
-            s.FavBar = FavBar; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
+            s.FavBar = FavBar; s.FavAllowDup = FavAllowDup; s.CaptureAll = CaptureAll; s.CaptureShell = CaptureShell;
             s.WindowSize = WindowSize; s.VTabs = VTabs; s.VTabsCollapse = VTabsCollapse;
             s.Debug = Debug; s.TabWidth = TabWidth; s.VPaneAlpha = VPaneAlpha;
             s.FavBandHeight = FavBandHeight;
@@ -571,7 +583,7 @@ namespace TabbedExplorer
             TabAutoWiden = s.TabAutoWiden; TabAutoFit = s.TabAutoFit; NewTabBeside = s.NewTabBeside;
             WinENewPc = s.WinENewPc;
             StartOpenWindow = s.StartOpenWindow;
-            FavBar = s.FavBar; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
+            FavBar = s.FavBar; FavAllowDup = s.FavAllowDup; CaptureAll = s.CaptureAll; CaptureShell = s.CaptureShell;
             WindowSize = s.WindowSize; VTabs = s.VTabs; VTabsCollapse = s.VTabsCollapse;
             Debug = s.Debug; TabWidth = s.TabWidth; VPaneAlpha = s.VPaneAlpha;
             FavBandHeight = s.FavBandHeight;
@@ -617,6 +629,7 @@ namespace TabbedExplorer
                 sb.Append("  \"_hotkeys\": \"程序自己的快捷键，格式 Ctrl+Shift+T / Alt+F4 这样；留空或删掉这一行 = 用默认。Ctrl+1..9 跳标签是固定的、不在这里。\",\r\n");
                 sb.Append("  \"_vpanealpha\": \"侧边栏摊开盖在内容上那一下的不透明度，%，0 ~ 100；100 = 完全不透明，0 = 完全透明（只在折叠窗格开着、鼠标移进去盖住内容时生效）\",\r\n");
                 sb.Append("  \"_favbandheight\": \"垂直侧边栏里书签段的高度，逻辑像素；0 = 自动（按书签条数算，最多占窗格高的三分之一）。在标签区和书签段之间那根横条上拖一下就会写在这里\",\r\n");
+                sb.Append("  \"_favdup\": \"true = 书签允许重复（同一路径可以加多次，默认）；false = 重复的路径会被忽略并提示已经加过。注意：加书签时的去重按整条栏含子树算；「合并重复书签」是同一层的口径\",\r\n");
                 sb.Append("  \"_startopen\": \"双击图标 / 重启本程序时要不要直接把主窗口打开；默认 true。关了就只驻托盘（第一次 Win+E 才出窗口）。开机自启不受它管 —— 那条固定带 --tray，永远不会弹窗\",\r\n");
                 sb.Append("  \"capture\": \"").Append(Text(Capture)).Append("\",\r\n");
                 sb.Append("  \"keeptabs\": ").Append(KeepTabs ? "true" : "false").Append(",\r\n");
@@ -637,6 +650,7 @@ namespace TabbedExplorer
                 sb.Append("  \"winepc\": ").Append(WinENewPc ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"startopen\": ").Append(StartOpenWindow ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"favbar\": ").Append(FavBar ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"favdup\": ").Append(FavAllowDup ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureall\": ").Append(CaptureAll ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"captureshell\": ").Append(CaptureShell ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"winsize\": ").Append(WindowSize ? "true" : "false").Append(",\r\n");
@@ -689,13 +703,13 @@ namespace TabbedExplorer
 
         public static string Describe()
         {
-            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} favbandh={15} debug={16} hotkeys={17} autopreload={18} autosleep={19} sleepdelay={20} notify={21} notifyover={22} notifysec={23} qlpreview={24} newtabbeside={25} winepc={26} startopen={27}",
+            return string.Format("capture={0} keeptabs={1} lazytabs={2} parallel={3} theme={4} tabwidth={5} autowiden={6} autofit={7} favbar={8} favdup={28} captureall={9} captureshell={10} winsize={11} vtabs={12} vtabsfold={13} vpanealpha={14} favbandh={15} debug={16} hotkeys={17} autopreload={18} autosleep={19} sleepdelay={20} notify={21} notifyover={22} notifysec={23} qlpreview={24} newtabbeside={25} winepc={26} startopen={27}",
                 Text(Capture), KeepTabs ? 1 : 0, LazyTabs ? 1 : 0, ParallelLaunch ? 1 : 0, Text(Color), TabWidth,
                 TabAutoWiden ? 1 : 0, TabAutoFit ? 1 : 0, FavBar ? 1 : 0, CaptureAll ? 1 : 0,
                 CaptureShell ? 1 : 0, WindowSize ? 1 : 0, VTabs ? 1 : 0, VTabsCollapse ? 1 : 0,
                 VPaneAlpha, FavBandHeight, Debug ? 1 : 0, hotkeys.Count, AutoPreload ? 1 : 0, AutoSleep ? 1 : 0, SleepDelaySec, Notify ? 1 : 0,
                 NotifyOver.Count, NotifySec, QLPreview ? 1 : 0, NewTabBeside ? 1 : 0, WinENewPc ? 1 : 0,
-                StartOpenWindow ? 1 : 0);
+                StartOpenWindow ? 1 : 0, FavAllowDup ? 1 : 0);
         }
 
         // ==================================================================
@@ -933,6 +947,8 @@ namespace TabbedExplorer
         public static void SetStartOpenWindow(bool on) { StartOpenWindow = on; Save(); }
         public static void SetTabAutoWiden(bool on) { TabAutoWiden = on; Save(); }
         public static void SetFavBar(bool on) { FavBar = on; Save(); }
+        /// <summary>书签是否允许重复（默认开）。`FavStore.Add` 每次都现读这个开关，改完立刻生效。</summary>
+        public static void SetFavAllowDup(bool on) { FavAllowDup = on; Save(); }
         public static void SetCaptureAll(bool on) { CaptureAll = on; Save(); }
         public static void SetCaptureShell(bool on) { CaptureShell = on; Save(); }
         public static void SetWindowSize(bool on) { WindowSize = on; Save(); }

@@ -326,6 +326,12 @@ namespace TabbedExplorer
             n.Add(Leaf("显示书签栏（Ctrl+Shift+B）",
                        () => Settings.FavBar,
                        () => hub.SetFavBar(!Settings.FavBar)));
+            // ⑥′ 书签允许重复（用户：「书签默认允许重复，设置增加可选项」）。
+            //     关掉 = 拖进来的路径已经在栏上（含子树任何一处）就忽略，只提示「已经在里面了」。
+            //     配套的收拾工具是书签栏右键那份菜单里的「合并重复书签…」。
+            n.Add(Leaf("书签允许重复（关 = 重复的路径会被忽略）",
+                       () => Settings.FavAllowDup,
+                       () => hub.SetFavAllowDup(!Settings.FavAllowDup)));
             // 用户：原来这条是「打开书签栏数据目录」，改成**管理书签** ——
             // 数据目录在他眼里只是个 json 文件，改不动也看不懂；给他一扇仿浏览器的管理窗更实用
             // （树 + 搜索 + 重命名 + 嵌套 + 「设为书签栏」）。窗口里那个「打开 json」按钮仍然直达文件。

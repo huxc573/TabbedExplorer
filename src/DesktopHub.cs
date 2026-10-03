@@ -2594,6 +2594,17 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 书签是否允许重复（默认开）。改完**立刻生效**、不用刷任何窗口 ——
+        /// `FavStore.Add` 每加一项都现读这个开关。
+        /// </summary>
+        public void SetFavAllowDup(bool on)
+        {
+            if (Settings.FavAllowDup == on) return;
+            Settings.SetFavAllowDup(on);
+            RefreshTrayMenu();        // 设置菜单里那一项要跟着打勾
+        }
+
+        /// <summary>
         /// 是否捕获**所有**打开的文件夹（Bug 1 要的那个行为）。
         /// 监听一直是装着的（见 SetupCapture），这里只是改一个开关 —— `TryCapture` 每次都会看它，
         /// 所以开关是立刻生效的，不用装/卸钩子。
@@ -2783,6 +2794,7 @@ namespace TabbedExplorer
             SetTabAutoWiden(s.TabAutoWiden);
             SetTabAutoFit(s.TabAutoFit);
             SetFavBar(s.FavBar);
+            SetFavAllowDup(s.FavAllowDup);
             SetCaptureAll(s.CaptureAll);
             SetCaptureShell(s.CaptureShell);
             SetWindowSize(s.WindowSize);

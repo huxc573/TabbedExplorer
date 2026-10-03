@@ -116,6 +116,12 @@ namespace TabbedExplorer
             get { lock (gate) { return BarFolder.Kids.ToArray(); } }
         }
 
+        /// <summary>栏根那一层的**列表本体**（要按下标插项时用；`BarItems` 是快照，插不进去）。</summary>
+        internal static List<FavNode> BarKids
+        {
+            get { lock (gate) { return BarFolder.Kids; } }
+        }
+
         private static void EnsureLoaded()
         {
             if (roots != null) return;
@@ -219,6 +225,21 @@ namespace TabbedExplorer
         /// （空字符串表示这个位置根本不能加进书签：没有真实路径）。
         /// </summary>
         public static bool Add(string path, out string name)
+        { return Add(path, null, -1, out name); }
+
+        /// <summary>
+        /// 加一项到书签栏；`into` 非空且是**栏内**的文件夹 = 加进它里面，否则加在栏根。
+        /// 去重照旧按整条栏（含子树）算：这一路径已经在别处，也算「已经有了」。
+        /// </summary>
+        public static bool Add(string path, FavNode into, out string name)
+        { return Add(path, into, -1, out name); }
+
+        /// <param name="index">
+        /// 插到目标那一层的第几位（负 / 越界 = 追加到末尾）。
+        /// ⚠ 拖文件到栏上「两个书签中间」就得靠它 —— 只追加的话新项永远跑到最后
+        ///   （用户：「根目录书签还是在最后」）。
+        /// </param>
+        public static bool Add(string path, FavNode into, int index, out string name)
         {
             name = null;
             string p = NormalizePath(path);
@@ -231,13 +252,71 @@ namespace TabbedExplorer
                 EnsureLoaded();
                 FavNode bar = BarFolder;
                 if (bar == null) return;
-                if (FindItem(bar.Kids, p) != null) return;      // 已经有了
+                // ⚠ 去重是**按整条栏含子树**算的，而且是**可关**的（默认允许重复，见 `Settings.FavAllowDup`）。
+                if (!Settings.FavAllowDup && FindItem(bar.Kids, p) != null) return;   // 已经有了
+                // 落点文件夹必须还挂在栏上：拖动期间树可能被别处刷过，句柄会失效 → 退回栏根
+                FavNode dest = (into != null && into.IsFolder && InSubtree(into, bar)) ? into : bar;
                 FavNode it = new FavNode();
                 it.Path = p;
-                bar.Kids.Add(it);
+                int at = (index < 0 || index > dest.Kids.Count) ? dest.Kids.Count : index;
+                dest.Kids.Insert(at, it);
                 added = true;
             });
             return added;
+        }
+
+        /// <summary>
+        /// 合并重复书签 —— **只合并同一层**里路径相同的（同一父下）：
+        ///   · 留**先出现的那一份**（位置不动），后面的删掉；
+        ///   · 两份都是文件夹的话，把后一份的孩子**并进**前一份（不丢东西，孩子自己那层还要再过一遍）；
+        ///   · 递归下到每一层，各层各去各的重。
+        /// 用户问的「合并后怎么保留」 = 保留第一处；「只合并同一层？」 = 是（不跨层删，免得把父子两处的安排弄乱）。
+        /// 返回去掉的条数。
+        /// </summary>
+        public static int MergeDuplicates()
+        {
+            int removed = 0;
+            Edit(delegate(List<FavNode> l)
+            {
+                EnsureLoaded();
+                FavNode bar = BarFolder;
+                if (bar == null) return;
+                removed = MergeDupeLayer(bar.Kids);
+            });
+            return removed;
+        }
+
+        /// <summary>一层里合并重复（递归）。返回删掉的条数。</summary>
+        private static int MergeDupeLayer(List<FavNode> kids)
+        {
+            int removed = 0;
+            Dictionary<string, FavNode> seen =
+                new Dictionary<string, FavNode>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < kids.Count; )
+            {
+                FavNode n = kids[i];
+                string p = (n == null) ? null : n.Path;
+                if (n == null || string.IsNullOrEmpty(p)) { i++; continue; }
+                FavNode first;
+                if (seen.TryGetValue(p, out first))
+                {
+                    // 两份同路径的文件夹 = 同一个文件夹：把后一份的孩子并进先那一份（直接删就把里面的书签弄丢了）
+                    if (first.IsFolder && n.IsFolder)
+                    {
+                        for (int k = 0; k < n.Kids.Count; k++) first.Kids.Add(n.Kids[k]);
+                        n.Kids.Clear();
+                    }
+                    kids.RemoveAt(i);
+                    removed++;
+                    continue;
+                }
+                seen[p] = n;
+                i++;
+            }
+            // 递归：每一层各去各的重（刚并进来的孩子也要过一遍）
+            for (int i = 0; i < kids.Count; i++)
+                if (kids[i] != null && kids[i].IsFolder) removed += MergeDupeLayer(kids[i].Kids);
+            return removed;
         }
 
         /// <summary>移除第一处匹配的书签项（只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**）。</summary>

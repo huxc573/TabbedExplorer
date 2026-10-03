@@ -89,12 +89,14 @@ namespace TabbedExplorer
         private Row pressed;                 // 双击判定用
         private string filter = "";
 
-        // ---- 多选（用户：「管理器没有多选功能」）----
-        // 只作用于**右列**（左树选中哪个文件夹是另一件事，`sel`）。
+        // ---- 多选（用户：「管理器没有多选功能」；后来：「我说的是左边」）----
+        // 左树和右列**共用**这一份 `multi`：Shift 连选的顺序 / 删除作用对象按「你最后点的那一列」（`multiScopeTree`）。
         // 统一走 `FavNode` 引用比（树上的节点本来就是同一批对象，不像历史那边存路径）。
         private readonly List<FavNode> multi = new List<FavNode>();
         /// <summary>Shift 选范围的锚点。</summary>
         private FavNode anchorNode;
+        /// <summary>当前多选是在**左树**里选的（false = 右列）—— 决定 Shift 按哪一列的顺序连选、删除作用对象、计数画哪边。</summary>
+        private bool multiScopeTree;
 
         // ---- 拖动（用户：管理器和书签栏都要能拖）----
         // 跟书签栏一套做法：按下只记状态，MouseMove 超阈值才算拖动，MouseUp 才真改数据。
@@ -371,13 +373,9 @@ namespace TabbedExplorer
             {
                 for (int i = multi.Count - 1; i >= 0; i--)
                 {
-                    bool found = false;
-                    for (int k = 0; k < listRows.Count; k++)
-                    {
-                        if (listRows[k].Node != multi[i]) continue;
-                        found = true; break;
-                    }
-                    if (!found) multi.RemoveAt(i);
+                    // 左树选的：只要还在书签树里就留着；右列选的：不在当前这一列里就清掉（老规矩）
+                    bool keep = multiScopeTree ? InTree(multi[i]) : InList(multi[i]);
+                    if (!keep) multi.RemoveAt(i);
                 }
             }
 
@@ -432,6 +430,13 @@ namespace TabbedExplorer
             return null;
         }
 
+        /// <summary>这一项现在还在**右列**里吗（不在就把多选里的它清掉）。</summary>
+        private bool InList(FavNode n)
+        {
+            for (int i = 0; i < listRows.Count; i++) if (listRows[i].Node == n) return true;
+            return false;
+        }
+
         // ==================================================================
         // 画
         // ==================================================================
@@ -451,11 +456,11 @@ namespace TabbedExplorer
             }
 
             // 左树 / 右列的标题
-            DrawCaption(g, "书签", Px(12), TopH + Px(3));
+            DrawCaption(g, "书签" + (multiScopeTree && multi.Count > 0 ? ("　·　已选 " + multi.Count) : ""), Px(12), TopH + Px(3));
             string right = filter.Length > 0
-                ? ("搜索结果（" + listRows.Count + "）" + (multi.Count > 1 ? ("　·　已选 " + multi.Count) : ""))
+                ? ("搜索结果（" + listRows.Count + "）" + (!multiScopeTree && multi.Count > 0 ? ("　·　已选 " + multi.Count) : ""))
                 : (sel != null ? FavStore.NameOf(sel) + "（" + listRows.Count + " 项）"
-                                        + (multi.Count > 1 ? ("　·　已选 " + multi.Count) : "")
+                                        + (!multiScopeTree && multi.Count > 0 ? ("　·　已选 " + multi.Count) : "")
                                : "");
             DrawCaption(g, right, LeftW + Px(12), TopH + Px(3), true);
 
@@ -495,20 +500,21 @@ namespace TabbedExplorer
             if (!multi.Remove(n)) multi.Add(n);
         }
 
-        /// <summary>把从 anchorNode 到 n 这一段（按右列的顺序）加进多选。</summary>
-        private void AddRangeTo(FavNode n)
+        /// <summary>把从 anchorNode 到 n 这一段（按所在那一列的顺序）加进多选。</summary>
+        private void AddRangeTo(FavNode n, bool inTree)
         {
+            List<Row> rows = inTree ? treeRows : listRows;
             int from = -1, to = -1;
-            for (int i = 0; i < listRows.Count; i++)
+            for (int i = 0; i < rows.Count; i++)
             {
-                if (listRows[i].Node == anchorNode) from = i;
-                if (listRows[i].Node == n) to = i;
+                if (rows[i].Node == anchorNode) from = i;
+                if (rows[i].Node == n) to = i;
             }
             if (to < 0) return;
             if (from < 0) { from = to; anchorNode = n; }
             int a = Math.Min(from, to), b = Math.Max(from, to);
-            for (int i = a; i <= b && i < listRows.Count; i++)
-                if (!multi.Contains(listRows[i].Node)) multi.Add(listRows[i].Node);
+            for (int i = a; i <= b && i < rows.Count; i++)
+                if (!multi.Contains(rows[i].Node)) multi.Add(rows[i].Node);
         }
 
         private void SelectAllList()
@@ -591,7 +597,15 @@ namespace TabbedExplorer
         {
             bool isSel = (r.Node == sel);
             bool hov = (r.Node == hoverTree);
-            if (isSel) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+            // 多选中的一行：整行罩强调色 + 左边实心竖条（跟「选中打开的那个文件夹」的灰底区分开）
+            if (IsMulti(r.Node))
+            {
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(48, Theme.Accent))) g.FillRectangle(b, r.Rect);
+                using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    g.FillRectangle(b, new Rectangle(r.Rect.Left - Px(6), r.Rect.Top,
+                        Math.Max(3, Px(3)), r.Rect.Height));
+            }
+            else if (isSel) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
             else if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
 
             int x = r.Rect.Left + Px(2);
@@ -626,16 +640,17 @@ namespace TabbedExplorer
         private void DrawListRow(Graphics g, Row r)
         {
             bool hov = (r.Node == hoverList);
-            if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
 
-            // 多选中的一行：左边一条强调色短竖条（底色跟悬停一样用 Hover，靠竖条区分）
+            // 选中的一行：整行罩一层强调色 + 左边一条实心强调竖条（跟「悬停」的灰底明显区分开）
+            // ⚠ 原来只用 Px(3) 的小竖条 + 跟悬停同一个灰底 ⇒ 看不出选中（用户：「选中会有标识区分」）。
             if (IsMulti(r.Node))
             {
-                g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(48, Theme.Accent))) g.FillRectangle(b, r.Rect);
                 using (SolidBrush b = new SolidBrush(Theme.Accent))
-                    g.FillRectangle(b, new Rectangle(r.Rect.Left - Px(2), r.Rect.Top + Px(3),
-                        Math.Max(2, Px(3)), Math.Max(1, r.Rect.Height - Px(6))));
+                    g.FillRectangle(b, new Rectangle(r.Rect.Left - Px(6), r.Rect.Top,
+                        Math.Max(3, Px(3)), r.Rect.Height));
             }
+            else if (hov) g.FillRectangle(new SolidBrush(Theme.Hover), r.Rect);
 
             Image ic;
             if (r.Node.IsFolder) ic = ShellIcon.FavFolderIcon(Px(16));
@@ -767,6 +782,14 @@ namespace TabbedExplorer
                     Invalidate();
                     return;
                 }
+                // 左树也能多选（Ctrl 逐个加 / 减、Shift 连选一段、光点 = 选中它自己）——
+                // 跟右列共用 `multi`，只是顺序按左树、删除也作用于它（川：「我说的是左边」）。
+                Keys tmod = Control.ModifierKeys;
+                multiScopeTree = true;
+                if ((tmod & Keys.Shift) != 0 && anchorNode != null) AddRangeTo(r.Node, true);
+                else if ((tmod & Keys.Control) != 0) { ToggleMulti(r.Node); anchorNode = r.Node; }
+                else { multi.Clear(); multi.Add(r.Node); anchorNode = r.Node; }
+
                 sel = r.Node.IsFolder ? r.Node : sel;
                 pressed = r;
                 dragNode = r.Node;
@@ -782,11 +805,14 @@ namespace TabbedExplorer
                 pressed = r;
                 if (CloseRect(r.Rect).Contains(e.Location)) { DeleteOne(r.Node); return; }
 
-                // ---- 多选：Ctrl 加减、Shift 选一段、光点只选它自己 ----
+                // ---- 多选：Ctrl 逐个加 / 减、Shift 连选一段、光点 = 选中它自己 ----
+                // ⚠ 原来光点是 `multi.Clear()`：**一个选中态都不留**，用户看不出选了谁 ⇒ 以为「不能多选」。
+                //   现在光点 = 把选择收成它自己（看得见）；Ctrl 在这基础上加减、Shift 从锚点连一段。
                 Keys mod = Control.ModifierKeys;
-                if ((mod & Keys.Shift) != 0 && anchorNode != null) AddRangeTo(r.Node);
+                multiScopeTree = false;
+                if ((mod & Keys.Shift) != 0 && anchorNode != null) AddRangeTo(r.Node, false);
                 else if ((mod & Keys.Control) != 0) { ToggleMulti(r.Node); anchorNode = r.Node; }
-                else { multi.Clear(); anchorNode = r.Node; }
+                else { multi.Clear(); multi.Add(r.Node); anchorNode = r.Node; }
 
                 dragNode = r.Node;
                 dragStart = e.Location;
@@ -973,14 +999,17 @@ namespace TabbedExplorer
             if (r == null) return;
 
             // 右键落在一条**没在多选里**的项上 = 把选择收成只有它（跟资源管理器一样）；
-            // 落在已选中的项上 = 保留整份多选，菜单动作作用于全部。
-            if (listRows.Contains(r) && !IsMulti(r.Node))
+            // 落在已选中的项上 = 保留整份多选，菜单动作作用于全部。左树同样管。
+            bool inTreeRow = treeRows.Contains(r);
+            bool inListRow = listRows.Contains(r);
+            if ((inTreeRow || inListRow) && !IsMulti(r.Node))
             {
                 multi.Clear();
                 multi.Add(r.Node);
                 anchorNode = r.Node;
+                multiScopeTree = inTreeRow;
             }
-            else if (listRows.Contains(r))
+            else if (inTreeRow || inListRow)
             {
                 anchorNode = r.Node;
             }

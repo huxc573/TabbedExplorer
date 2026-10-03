@@ -70,6 +70,12 @@ namespace TabbedExplorer
             public int TopIndex;
             /// <summary>竖排：这个文件夹现在是不是原地摊开着。</summary>
             public bool Expanded;
+            /// <summary>
+            /// 这一行的父亲（顶层行是 null = 栏根）。
+            /// ⚠ 拖文件进来要「按位置插进**它所在那一层**」—— 父亲和它在父亲里的下标都反查不出来
+            ///   （`TopIndex` 只给顶层下标），建行时顺手存上。
+            /// </summary>
+            public FavNode Parent;
             /// <summary>不是文件而是文件夹 —— 点它就是「摊开 / 收起」，右边要画一个三角。</summary>
             public bool IsFolder { get { return Node != null && Node.IsFolder; } }
             public string Name { get { return Node == null ? "" : FavStore.NameOf(Node); } }
@@ -117,11 +123,12 @@ namespace TabbedExplorer
         //      移出后自动收起，就像垂直侧边栏那样」）----
         // 定时器用 WinForms 的没问题：这不是热路径上的短周期等待，只是悬停 UX（不跑的话
         // 顶多少弹一次，不会有正确性后果），而且鼠标悬停时消息队列是空的，饿不死。
-        private Timer flyTimer;              // 悬停计时（默认 450ms）
+        private Timer flyTimer;              // 悬停计时（默认 150ms）
         private int flyIndex = -1;           // 计时盯着的那一行；挪到别的行就重挂
         private bool flyManaged;             // 现在开着的飞出菜单是「悬停开的」（生死归我们管；点击开的不算）
         private FavNode flyOpenNode;         // 悬停开的菜单是哪个文件夹的 —— 防止「菜单→栏→菜单」一圈回来后
                                              // 把同一个菜单关了重开（川看到的「反复切换」就是这个）
+        private Timer dragFlyTimer;          // 拖拽中悬停计时（默认 600ms）→ 弹子菜单当落点
 
         /// <summary>
         /// 竖排（垂直侧边栏那个左栏里的一截）。
@@ -228,6 +235,8 @@ namespace TabbedExplorer
         private int dropIndex = -1;          // 插到第几**行**之前（= rows.Count 表示插到末尾）
         private bool dropAfter;              // `dropIndex` 那行的**下半 / 右半** = 插到它后面
         private int dropInto = -1;           // 放进第几行（那一行必须是文件夹）
+        private int dragFlyIndex = -1;       // 拖拽中悬停计时中的那一行（到点弹子菜单当落点）
+        private FavNode menuDragNode;        // 正**从子菜单里往外拖**的那一项（它不在 `rows` 里）
 
         private readonly Font font;
         private static Bitmap folderFallback;
@@ -289,9 +298,28 @@ namespace TabbedExplorer
             // 悬停展开：菜单抓着捕获时栏收不到 MouseMove，菜单会把挪回栏上的移动/按下转发到这儿
             PopMenu.OwnerHover = OnFlyOwnerHover;
             PopMenu.OwnerClick = OnFlyOwnerClick;
+            // 拖文件到「子菜单里的文件夹」上松手 —— 菜单不认识书签，把那一项交回来我们自己落地
+            PopMenu.FilesDropped = OnMenuFilesDropped;
+            // 落地之后菜单**留着不收**（鼠标移开才收），但列表要跟着刷新 —— 菜单不知道书签，
+            // 由我们按它的 `dropFolder` 重新生成一层项（见 PopMenuWindow.ReplaceItems）
+            PopMenu.ItemsFor = delegate(object folder)
+            {
+                FavNode nd = folder as FavNode;
+                return nd == null ? null : ItemsOf(nd);
+            };
+            // 子菜单里的项也要能右键（删 / 改名 / 打开）和拖到栏上换位置 —— 菜单抓着捕获、
+            // 栏收不到鼠标事件，所以同样由菜单把事件转发回来（见 PopMenu 那几个钩子的注释）
+            PopMenu.ItemMenuFor = OnMenuItemMenu;
+            PopMenu.OwnerItemDragBegin = OnMenuDragBegin;
             flyTimer = new Timer();
-            flyTimer.Interval = 450;
+            flyTimer.Interval = 150;    // ⚠ 川：「打开1级子文件夹太慢，要和2级一个标准」——2级是悬停即开(0ms)；
+                                        //   1级在栏上横向扫过会沿路乱弹，故压到 150ms（几乎察觉不到又不吵）
             flyTimer.Tick += delegate { OnFlyTimer(); };
+            // 拖拽中悬停在文件夹上 → 过一会儿把它的子菜单**弹出来当落点**（拖拽期间没有 MouseMove，
+            // 所以不能走上面那条悬停展开的路；而且「只能拖到 1 级文件夹」就是缺了这一下）
+            dragFlyTimer = new Timer();
+            dragFlyTimer.Interval = 600;
+            dragFlyTimer.Tick += delegate { OnDragFlyTimer(); };
             Theme.Changed += delegate
             {
                 BackColor = TheBack;
@@ -327,9 +355,12 @@ namespace TabbedExplorer
             rows.Clear();
             hoverIndex = -1;
             scrollX = 0;
-            // 行集整个重建：悬停展开盯着的行号已经不可信，连同悬停菜单一起收掉
+            // 行集整个重建：悬停展开盯着的行号已经不可信（`StopFly` 把计时 / 盯梢都撤了）
+            // ⚠ 开着的菜单**不收了**，改成原地刷新列表 —— 用户要的是「鼠标移开才收」：
+            //   加书签 / 删书签 / 改名都会走到这儿（`FavStore.Changed` → `Reload`），
+            //   以前那句 `CloseAll` 就是「拖进去后窗口收起」「删除后展开收起」的真凶。
             StopFly();
-            if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
+            PopMenuWindow.RefreshOpen();
             try
             {
                 foreach (FavNode n in FavStore.BarItems) items.Add(n);
@@ -359,7 +390,7 @@ namespace TabbedExplorer
         {
             // 先把行摊平（横排 = 顶层那一排；竖排 = 按 `expanded` 展开的树）
             rows.Clear();
-            for (int i = 0; i < items.Count; i++) AddRow(items[i], 0, i);
+            for (int i = 0; i < items.Count; i++) AddRow(items[i], 0, i, null);
 
             if (vertical)
             {
@@ -380,17 +411,18 @@ namespace TabbedExplorer
         }
 
         /// <summary>把一个节点按当前展开状态摊进 `rows`（摊开的文件夹递归往下）。</summary>
-        private void AddRow(FavNode n, int depth, int topIndex)
+        private void AddRow(FavNode n, int depth, int topIndex, FavNode parent)
         {
             if (n == null) return;
             Row r = new Row();
             r.Node = n;
             r.Depth = depth;
             r.TopIndex = topIndex;
+            r.Parent = parent;
             r.Expanded = n.IsFolder && expanded.Contains(n);
             rows.Add(r);
             if (r.Expanded)
-                for (int i = 0; i < n.Kids.Count; i++) AddRow(n.Kids[i], depth + 1, topIndex);
+                for (int i = 0; i < n.Kids.Count; i++) AddRow(n.Kids[i], depth + 1, topIndex, n);
         }
 
         /// <summary>
@@ -750,17 +782,17 @@ namespace TabbedExplorer
             // ⚠ 这里必须问 `Control.MouseButtons`（现读物理按键状态），**不能用 `e.Button`** ——
             //   WinForms 的 `MouseMove` 事件里那个字段经常是 `None`（它只对 Down/Up 才填得准），
             //   拿它判「左键还按着没」会一直判成「没按」，拖动就永远触发不了。
-            if (dragIndex >= 0 && dragIndex < rows.Count && (Control.MouseButtons & MouseButtons.Left) != 0)
+            if ((dragIndex >= 0 || menuDragNode != null) && (Control.MouseButtons & MouseButtons.Left) != 0)
             {
                 if (!dragging &&
                     (Math.Abs(e.X - dragStart.X) > Px(4) || Math.Abs(e.Y - dragStart.Y) > Px(4)))
                 {
                     dragging = true;
-                    Diag.Step("书签栏: 开始拖动「" + rows[dragIndex].Name + "」");
+                    Diag.Step("书签栏: 开始拖动「" + DragPayloadName() + "」");
                 }
                 if (dragging)
                 {
-                    UpdateDrop(e.Location);
+                    UpdateDrop(e.Location, menuDragNode, false);
                     tips.Hide(this);          // 拖着的时候别弹提示挡视线
                     tipKey = null;
                     return;
@@ -884,7 +916,7 @@ namespace TabbedExplorer
         }
 
         // ------------------------------------------------------------------
-        // 横排悬停展开：停在文件夹图标上约 450ms 自动弹出子菜单；挪走 / 移出栏自动收起。
+        // 横排悬停展开：停在文件夹图标上约 150ms 自动弹出子菜单；挪走 / 移出栏自动收起。
         // 菜单窗抓着鼠标捕获，所以「挪回栏上」的移动是菜单转发过来的（OnFlyOwnerHover）。
         // ------------------------------------------------------------------
 
@@ -893,6 +925,39 @@ namespace TabbedExplorer
         {
             flyIndex = -1;
             if (flyTimer != null && flyTimer.Enabled) flyTimer.Stop();
+            StopDragFly();
+        }
+
+        /// <summary>
+        /// 拖拽停在文件夹上到点：把它的子菜单**弹出来当落点** —— 用户「拖动到文件夹，没临时展开，
+        /// 相当于只能拖到 1 级文件夹」说的就是缺这一下。
+        ///
+        /// ⚠ 这份菜单是 `dropMode`：不抢鼠标捕获（拖拽循环在人家进程手里，抢过来就把拖动打断了），
+        ///   高亮 / 再往下展开 / 松手落地全由拖放消息驱动（见 `PopMenuWindow` 那段）。
+        /// </summary>
+        private void OnDragFlyTimer()
+        {
+            dragFlyTimer.Stop();
+            int i = dragFlyIndex;
+            dragFlyIndex = -1;
+            if (i < 0 || i >= rows.Count) return;
+            Row r = rows[i];
+            if (!r.IsFolder || r.Node.Kids.Count == 0) return;
+            if (vertical && r.Expanded) return;
+            Point c;
+            try { c = PointToClient(Cursor.Position); }
+            catch { return; }
+            if (HitTest(c) != i) return;                      // 到点时鼠标已经不在那项上了
+            if (PopMenu.IsOpen) PopMenuWindow.CloseAll(false); // 换目标：旧那份先收（拖到别的文件夹上了）
+            flyManaged = true;
+            flyOpenNode = r.Node;
+            ShowSubMenu(i, true, true);
+        }
+
+        private void StopDragFly()
+        {
+            dragFlyIndex = -1;
+            if (dragFlyTimer != null) dragFlyTimer.Stop();
         }
 
         /// <summary>悬停计时到点：再核一遍鼠标还停在原地，才真弹（快速划过的不算）。</summary>
@@ -998,20 +1063,78 @@ namespace TabbedExplorer
             // 拖文件进来：悬停菜单 / 悬停计时都收掉 —— 拖拽期间鼠标移动不走 MouseMove，
             // 菜单留着只会挡在路上（而且它没登记拖放落点，拖到它上面光标会变「不可放」）。
             StopFly();
-            if (flyManaged && PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
+            StopDragFly();
+            // 同上：拖拽期间的落点菜单（dropMode）别收 —— 拖回栏上再拖回去还得用它
+            if (flyManaged && PopMenu.IsOpen && !PopMenu.DropModeOpen) PopMenuWindow.CloseAll(false);
             e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
         }
 
         protected override void OnDragOver(DragEventArgs e)
         {
             base.OnDragOver(e);
-            e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+            bool files = HasFiles(e);
+            e.Effect = files ? DragDropEffects.Copy : DragDropEffects.None;
+            if (!files) return;
+
+            // 落点整套照**栏内拖动**来（高亮 / 缝上的插入线都一样）—— 区别只在落地动作是
+            // 「加一个书签」而不是「挪一个书签」。用户：「不能按书签栏拖动的逻辑来做吗？
+            // 只是动作变成增加书签」。
+            Point cp = DragClientPoint(e);
+            UpdateDrop(cp, null, true);
+
+            // 停在这个文件夹上别动 → 把它的子菜单弹出来当落点（能放进更里面一层；
+            // 拖拽期间没有 MouseMove，所以这条不能走悬停展开那条路）
+            int into = dropInto;
+            bool canOpen = into >= 0 && rows[into].IsFolder
+                           && rows[into].Node.Kids.Count > 0
+                           && !(vertical && rows[into].Expanded);   // 竖排里已经原地摊开的，子项就在栏上
+            if (canOpen)
+            {
+                if (dragFlyIndex != into) { StopDragFly(); dragFlyIndex = into; dragFlyTimer.Start(); }
+            }
+            else StopDragFly();
+        }
+
+        protected override void OnDragLeave(EventArgs e)
+        {
+            base.OnDragLeave(e);
+            StopDragFly();
+            if (dropInto != -1 || dropIndex != -1)
+            {
+                dropInto = -1;
+                dropIndex = -1;
+                dropAfter = false;
+                Invalidate();
+            }
+            // 拖走的那份菜单：延迟复核着收（鼠标挪进菜单里就不收 —— 栏和菜单是两扇窗，
+            // 拖过去必然先在这一头触发一次 DragLeave）
+            PopMenuWindow.DelayedClose();
         }
 
         private static bool HasFiles(DragEventArgs e)
         {
             try { return e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop); }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// `DragEventArgs.X/Y` 官方口径是**屏幕坐标**，但不同容器上实测常直接就是客户区坐标。
+        /// 两头都认：先当客户区试一次，出界了再当屏幕坐标转。
+        /// </summary>
+        /// <summary>
+        /// `DragEventArgs.X/Y` 官方口径是**屏幕坐标**，但不同容器实测常直接就是客户区坐标。
+        /// 两头都认，但**优先按屏幕坐标转**（官方那样）：转出来不在客户区里再当客户区使。
+        /// ⚠ 竖排时不能反过来先试客户区 —— 栏就贴在屏幕左边，屏幕坐标 (100,500) 往往也“在”客户区矩形里
+        ///   （尺寸差不多），会被当成客户区坐标、纵坐标差一整栏的高度，高亮全错。
+        /// </summary>
+        private Point DragClientPoint(DragEventArgs e)
+        {
+            Point raw = new Point(e.X, e.Y);
+            Point conv;
+            try { conv = PointToClient(raw); } catch { return raw; }
+            if (ClientRectangle.Contains(conv)) return conv;
+            if (ClientRectangle.Contains(raw)) return raw;
+            return conv;
         }
 
         protected override void OnDragDrop(DragEventArgs e)
@@ -1022,35 +1145,144 @@ namespace TabbedExplorer
                 string[] paths = (string[])e.Data.GetData(DataFormats.FileDrop);
                 if (paths == null || paths.Length == 0) return;
 
-                int added = 0, dup = 0, bad = 0;
-                string last = null;
-                foreach (string p in paths)
+                // 落点三选一（都跟栏内拖动同一套判定）：
+                //   · 文件夹那一行 → 进那个文件夹（追加）
+                //   · 别的项 / 缝上 → 插到它旁边（**同一层**：顶层项就是栏根，展开的子项就是它所在的文件夹）
+                //   · 最后一项右边那块空白 → 栏根末尾
+                int into = dropInto, at = dropIndex;
+                bool after = dropAfter;
+                dropInto = -1;
+                dropIndex = -1;
+                dropAfter = false;
+                StopDragFly();
+                if (PopMenu.IsOpen && !PopMenu.DropModeOpen) PopMenuWindow.CloseAll(false);   // 拖回来放在栏上：那份当落点的子菜单收掉（落点菜单除外 —— 它归「移开才收」）
+                Invalidate();
+
+                FavNode dest;
+                int index = -1;                                      // 负 = 追加到那一层末尾
+                if (into >= 0 && into < rows.Count)                  // 落在文件夹上
                 {
-                    string name;
-                    if (FavStore.Add(p, out name)) { added++; last = name; }
-                    else if (string.IsNullOrEmpty(name)) bad++;
-                    else dup++;
+                    dest = rows[into].Node;
                 }
-                Diag.Step(string.Format("书签栏: 拖入 {0} 项 -> 新增 {1} / 重复 {2} / 收不了 {3}",
-                    paths.Length, added, dup, bad));
-                if (added > 0)
+                else if (at >= 0 && at < rows.Count)                 // 落在某一项的左/右半
                 {
-                    Reload();
-                    // 收起态时这个控件只剩顶上那行标题，不加这一句就成了「拖进来了却什么都看不见」。
-                    // 竖排里 LeadClicked 的含义就是「摊开 / 收起书签段」（见 EmbedForm 的接线）。
-                    if (vertical && !sectionOpen && LeadClicked != null) LeadClicked(this, EventArgs.Empty);
-                    // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
-                    // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
-                    // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
+                    dest = rows[at].Parent;                          // null = 栏根
+                    index = KidsIndexOf(dest, rows[at].Node) + (after ? 1 : 0);
                 }
-                else if (dup > 0 && bad == 0) Toast.Show(NotifyItems.FavDup, "书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
-                else Toast.Show(NotifyItems.FavMarkNoPath, "书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
+                else dest = null;                                    // 落在末尾 / 栏空白：栏根尾巴
+                if (at >= rows.Count) index = int.MaxValue;          // 「挪到最末尾」那一档
+
+                AddFiles(paths, dest, index);
             }
             catch (Exception ex)
             {
                 Diag.Log("书签栏: 拖放失败 " + ex.Message);
                 Toast.Show(NotifyItems.FavAddFail, "书签", "加入失败：" + ex.Message);
             }
+        }
+
+        /// <summary>某一项在它父亲（`null` = 栏根）里的下标；找不到返回 -1。</summary>
+        private static int KidsIndexOf(FavNode parent, FavNode node)
+        {
+            if (node == null) return -1;
+            List<FavNode> kids = (parent == null) ? FavStore.BarKids : parent.Kids;
+            if (kids == null) return -1;
+            for (int i = 0; i < kids.Count; i++) if (kids[i] == node) return i;
+            return -1;
+        }
+
+        /// <summary>
+        /// 把拖进来的文件 / 文件夹加进书签栏。
+        /// `dest` 非空 = 加进那个文件夹，否则栏根；`index` = 加进那一层的第几位（负 = 末尾）。
+        /// 栏上拖放 / 子菜单里拖放两条路共用。
+        /// </summary>
+        private void AddFiles(string[] paths, FavNode dest, int index)
+        {
+            int added = 0, dup = 0, bad = 0;
+            string last = null;
+            foreach (string p in paths)
+            {
+                string name;
+                if (FavStore.Add(p, dest, index, out name))
+                {
+                    added++; last = name;
+                    if (index >= 0 && index < int.MaxValue) index++;   // 多选拖入：顺次插在它后面
+                }
+                else if (string.IsNullOrEmpty(name)) bad++;
+                else dup++;
+            }
+            Diag.Step(string.Format("书签栏: 拖入 {0} 项 -> 加进 {1}{2}：新增 {3} / 重复 {4} / 收不了 {5}",
+                paths.Length,
+                dest != null ? ("「" + FavStore.NameOf(dest) + "」") : "栏根",
+                index >= 0 ? ("第 " + index + " 位") : "",
+                added, dup, bad));
+            if (added > 0)
+            {
+                Reload();
+                // 收起态时这个控件只剩顶上那行标题，不加这一句就成了「拖进来了却什么都看不见」。
+                // 竖排里 LeadClicked 的含义就是「摊开 / 收起书签段」（见 EmbedForm 的接线）。
+                if (vertical && !sectionOpen && LeadClicked != null) LeadClicked(this, EventArgs.Empty);
+                // 用户：「像已加入书签这种页面直接有反馈的，也不用右下角通知」——
+                // 新项**立刻出现在这条栏上**，那就是反馈，不再弹气泡。
+                // 下面两条「重复 / 收不了」是**真的什么都没发生**，不说一句就成了「点了没反应」。
+            }
+            else if (dup > 0 && bad == 0) Toast.Show(NotifyItems.FavDup, "书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
+            else Toast.Show(NotifyItems.FavMarkNoPath, "书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
+        }
+
+        /// <summary>
+        /// 文件被拖到**子菜单**上松手了（`PopMenu.FilesDropped`）——
+        /// `node` 是菜单解析好的落点（文件夹项 = 那一项自己；文件项 = 这个菜单代表的那个文件夹），
+        /// `index` 是插到那一层的第几位（负 = 末尾）。落点口径跟栏上那份完全一样。
+        /// </summary>
+        private void OnMenuFilesDropped(object node, string[] paths, int index)
+        {
+            FavNode dest = node as FavNode;
+            Diag.Step("书签栏: 子菜单落点 -> " + (dest != null ? ("「" + FavStore.NameOf(dest) + "」") : "（认不出落点，退回栏根）")
+                     + (index >= 0 ? (" 第 " + index + " 位") : "（末尾）"));
+            AddFiles(paths, dest, index);
+        }
+
+        // ------------------------------------------------------------------
+        // 子菜单里的**书签项**（右键 / 拖出去换位置）
+        // 菜单抓着鼠标捕获、栏收不到鼠标事件，这三个都由菜单转发回来（见 `PopMenu.OwnerItem*`）。
+        // ------------------------------------------------------------------
+
+        /// <summary>在子菜单的某一项上右键 —— 给出它自己的右键菜单（栏上那一套同样的动作）。</summary>
+        private PopItem[] OnMenuItemMenu(Control c, object tag)
+        {
+            if (c != this) return null;
+            FavNode nd = tag as FavNode;
+            if (nd == null) return null;
+            return ItemActions(nd, false, -1).ToArray();
+        }
+
+        /// <summary>
+        /// 子菜单里某一项**真开始拖**了 —— 这时候拖动权交给栏：收掉那摞菜单、自己抢捕获，
+        /// 之后完全走栏内拖动那条路（`OnMouseMove` 的拖动段 + `UpdateDrop` 高亮 + `OnMouseUp` 落地）。
+        /// 用户要的就是这个：「不能按书签栏拖动的逻辑来做吗？只是动作变成增加书签」。
+        /// ⚠ 顺序不能反：**先**收菜单（它会把捕获放掉），**再**自己抢 —— 反了会被菜单那下 `Capture = false` 顺手收走。
+        /// </summary>
+        private void OnMenuDragBegin(Control c, Point screen, object tag)
+        {
+            if (c != this) return;
+            FavNode nd = tag as FavNode;
+            if (nd == null || nd.Bar) return;
+
+            StopFly();                                        // 悬停展开 / 拖入落点的计时都别再来插一脚
+            if (PopMenu.IsOpen) PopMenuWindow.CloseAll(false);
+            menuDragNode = nd;
+            dragIndex = -1;                                   // 这一项不在栏上那行列表里
+            dragging = true;                                  // 已经越阈值了，不用再等
+            dropIndex = -1;
+            dropInto = -1;
+            dropAfter = false;
+            try { Capture = true; } catch { }                 // 捕获拿在自己手里：鼠标在哪儿移动都收得到
+            Point p;
+            try { p = PointToClient(screen); } catch { p = new Point(int.MinValue, int.MinValue); }
+            UpdateDrop(p, nd, false);
+            Invalidate();
+            Diag.Step("书签栏: 接过子菜单拖来的「" + FavStore.NameOf(nd) + "」，按栏内拖动落地");
         }
 
         // ------------------------------------------------------------------
@@ -1067,6 +1299,7 @@ namespace TabbedExplorer
             // 不在前面清的话会留下一份**上次的** dragIndex，松手就点错项）。
             dragIndex = -1;
             dragging = false;
+            menuDragNode = null;
             dropIndex = -1;
             dropInto = -1;
             dropAfter = false;
@@ -1202,8 +1435,21 @@ namespace TabbedExplorer
         /// 只改状态 + 重画，**不动数据** —— 真挪动在 MouseUp 里做一次。
         /// </summary>
         private void UpdateDrop(Point p)
+        { UpdateDrop(p, null, false); }
+
+        /// <param name="dragged">
+        /// 正被拖的那个节点：栏上拖动传 null（拖的是哪一行由 `dragIndex` 认）；
+        /// **从子菜单往外拖**时传那一项（它不在 `rows` 里，只能靠它认「拖回自己身上」）。
+        /// </param>
+        /// <param name="external">
+        /// 拖的是**外面的文件**（不是栏上已有的书签）：这类拖动落在「文件夹行」上是进那个文件夹，
+        /// 落在别的行上 = 插到它旁边那一层（= 栏内拖动那套标识，动作换成「加一个书签」）。
+        /// </param>
+        private void UpdateDrop(Point p, FavNode dragged, bool external)
         {
             EnsureLayout();
+            FavNode self = (dragged != null) ? dragged
+                         : ((dragIndex >= 0 && dragIndex < rows.Count) ? rows[dragIndex].Node : null);
             int ni = -1, nInto = -1;
             bool nAfter = false;
             bool overItem = false;
@@ -1213,7 +1459,7 @@ namespace TabbedExplorer
                 Rectangle r = BoundsOf(i);
                 if (!r.Contains(p)) continue;
                 overItem = true;
-                if (i == dragIndex) break;                     // 拖回自己身上：什么也不提示
+                if (rows[i].Node == self) break;               // 拖回自己身上：什么也不提示
                 if (rows[i].IsFolder)
                     nInto = i;                                 // 落点在文件夹上（哪一层都行）= 放进它里面
                 else
@@ -1225,8 +1471,8 @@ namespace TabbedExplorer
                 break;
             }
 
-            // 落在最后一行外面那块空白里 = 挪到最末尾
-            if (!overItem && rows.Count > 0 && dragIndex >= 0)
+            // 落在最后一行外面那块空白里 = 挪到最末尾（外面的文件拖进来也算：追加到最后）
+            if (!overItem && rows.Count > 0 && (external || self != null))
             {
                 Rectangle last = BoundsOf(rows.Count - 1);
                 if (vertical) { if (p.Y >= last.Bottom) { ni = rows.Count; nAfter = false; } }
@@ -1240,6 +1486,14 @@ namespace TabbedExplorer
                 dropAfter = nAfter;
                 Invalidate();
             }
+        }
+
+        /// <summary>正被拖的那个东西叫什么（日志用）：栏上的行 / 从子菜单拖来的那一项。</summary>
+        private string DragPayloadName()
+        {
+            if (menuDragNode != null) return FavStore.NameOf(menuDragNode);
+            if (dragIndex >= 0 && dragIndex < rows.Count) return rows[dragIndex].Name;
+            return "?";
         }
 
         /// <summary>
@@ -1284,10 +1538,12 @@ namespace TabbedExplorer
 
                 int di = dragIndex;
                 bool wasDrag = dragging;
+                FavNode payload = menuDragNode;      // 从子菜单拖出来的那一项（栏内拖动是 null）
                 int into = dropInto, at = dropIndex;
                 bool after = dropAfter;
                 dragIndex = -1;
                 dragging = false;
+                menuDragNode = null;
                 dropInto = -1;
                 dropIndex = -1;
                 dropAfter = false;
@@ -1295,7 +1551,9 @@ namespace TabbedExplorer
                 if (wasDrag)
                 {
                     Invalidate();
-                    FavNode node = (di >= 0 && di < rows.Count) ? rows[di].Node : null;
+                    if (payload != null) { try { Capture = false; } catch { } }   // 外来拖动时捕获是我们抢的，得还回去
+                    FavNode node = (payload != null) ? payload
+                                : ((di >= 0 && di < rows.Count) ? rows[di].Node : null);
                     bool ok = false;
                     if (node != null)
                     {
@@ -1332,6 +1590,12 @@ namespace TabbedExplorer
         /// <param name="hoverManaged">是不是「悬停开的」：悬停开的菜单生死归栏管（挪走就收）；
         /// 点击开的照旧，等点击 / 看门狗。</param>
         private void ShowSubMenu(int index, bool hoverManaged)
+        { ShowSubMenu(index, hoverManaged, false); }
+
+        /// <param name="dropMode">
+        /// 拖文件时开的：不抢鼠标捕获，条目当拖放落点用（见 `OnDragFlyTimer`）。
+        /// </param>
+        private void ShowSubMenu(int index, bool hoverManaged, bool dropMode)
         {
             if (index < 0 || index >= rows.Count) return;
             FavNode nd = rows[index].Node;
@@ -1343,7 +1607,8 @@ namespace TabbedExplorer
             string what = "书签子文件夹 " + nd.Display;
             // ⚠ 「推后一轮再弹」这一步现在收在 `PopMenu.Show` 里（用户报的「点书签栏文件夹，
             //   里面的子项点不动」的根就在那儿）—— 这里不用自己 Defer。
-            PopMenu.Show(kids, this, at, what, hoverManaged);
+            //   末尾那个参数 = 这层菜单代表的文件夹：拖文件落到这一层（不是子文件夹那一行）上就进它。
+            PopMenu.Show(kids, this, at, what, hoverManaged, dropMode, nd);
         }
 
         /// <summary>把一个节点的孩子变成菜单项（文件夹继续往下嵌套一层）。</summary>
@@ -1357,6 +1622,8 @@ namespace TabbedExplorer
                 {
                     PopItem s = PopMenu.Sub(k.Display, ItemsOf(k));
                     s.Tip = k.Display + "\r\n文件夹，里面有 " + k.Kids.Count + " 项";
+                    // 拖文件到这一项上松手 = 加进这个文件夹（菜单把 Tag 原封不动交回来，见 PopMenu.FilesDropped）
+                    s.Tag = k;
                     r.Add(s);
                 }
                 else
@@ -1372,10 +1639,75 @@ namespace TabbedExplorer
                         }
                     });
                     it.Tip = k.Display + "\r\n" + p;      // 子项的浮窗信息（用户：「手动展开后也没有浮窗信息」）
+                    // ⚠ 文件项也要挂 `Tag`：右键菜单和「拖出菜单」两条路都靠它认这一项是哪个书签
+                    //   （只在文件夹项上挂过 ⇒ 用户报「文件夹有，其它书签怎么没有」）
+                    it.Tag = k;
                     r.Add(it);
                 }
             }
             return r.ToArray();
+        }
+
+        /// <summary>
+        /// 一个书签项的动作清单（栏上右键 / **子菜单里右键** 共用一套）。
+        /// </summary>
+        /// <param name="onBar">在栏的那一行上：多两项「展开这一层」（子菜单里的项没有「在栏上展开」这回事）。</param>
+        /// <param name="rowIndex">栏上的行号（`onBar` 时才用得上）。</param>
+        private List<PopItem> ItemActions(FavNode node, bool onBar, int rowIndex)
+        {
+            List<PopItem> m = new List<PopItem>();
+            if (node == null) return m;
+            string p = node.Path;
+            if (node.IsFolder)
+            {
+                // 用户：文件夹（含它下面的子文件夹）能「全部打开」，超过 7 项先问一句
+                m.Add(FavActions.OpenAllItem(this, node, delegate(FavNode f)
+                {
+                    if (OpenAllRequested != null) OpenAllRequested(f);
+                }));
+                // 竖排里这一层是**原地**摊开的（跟左键一样），横排那条只有 30 像素高，
+                // 摊不下，还是弹飞到旁边的子菜单。
+                if (onBar)
+                {
+                    bool expandedHere = rowIndex >= 0 && rowIndex < rows.Count && rows[rowIndex].Expanded;
+                    if (vertical)
+                        m.Add(PopMenu.It(expandedHere ? "收起这一层" : "原地展开这一层",
+                            delegate { ToggleExpand(node); }));
+                    else
+                        m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(rowIndex); }));
+                }
+                m.Add(PopMenu.It("重命名…", delegate { Rename(node); }));
+                m.Add(PopMenu.Split());
+            }
+            else
+            {
+                if (FavStore.IsFolder(p))
+                    m.Add(PopMenu.It("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(node); }));
+                else
+                    m.Add(PopMenu.It("用默认程序打开", delegate
+                    {
+                        try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
+                        catch (Exception ex) { Toast.Show(NotifyItems.FavOpenFail, "打不开", ex.Message); }
+                    }));
+                m.Add(PopMenu.It("复制完整路径", delegate
+                {
+                    try { Clipboard.SetText(p); }
+                    catch (Exception ex) { Diag.Log("书签栏: 复制失败 " + ex.Message); }
+                }));
+                // 用户要的：项能改名（改的是**我们自己这份 json 里记的显示名**，
+                // 磁盘上那个文件夹/文件一个字节都不动）
+                m.Add(PopMenu.It("重命名…", delegate { Rename(node); }));
+                m.Add(PopMenu.Split());
+            }
+
+            m.Add(PopMenu.It("从书签移除", delegate
+            {
+                // 只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**
+                FavStore.Edit(delegate(List<FavNode> l) { RemoveFrom(l, node); });
+                Diag.Step("书签栏: 移除 " + FavStore.NameOf(node));
+            }));
+            m.Add(PopMenu.Split());
+            return m;
         }
 
         /// <summary>
@@ -1390,55 +1722,7 @@ namespace TabbedExplorer
             if (i >= 0)
             {
                 Row it = rows[i];
-                string p = it.Node.Path;
-                if (it.IsFolder)
-                {
-                    FavNode nd = it.Node;
-                    // 用户：文件夹（含它下面的子文件夹）能「全部打开」，超过 7 项先问一句
-                    m.Add(FavActions.OpenAllItem(this, nd, delegate(FavNode f)
-                    {
-                        if (OpenAllRequested != null) OpenAllRequested(f);
-                    }));
-                    // 竖排里这一层是**原地**摊开的（跟左键一样），横排那条只有 30 像素高，
-                    // 摊不下，还是弹飞到旁边的子菜单。
-                    if (vertical)
-                        m.Add(PopMenu.It(it.Expanded ? "收起这一层" : "原地展开这一层",
-                            delegate { ToggleExpand(nd); }));
-                    else
-                        m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(i); }));
-                    m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));
-                    m.Add(PopMenu.Split());
-                }
-                else
-                {
-                    if (FavStore.IsFolder(p))
-                        m.Add(PopMenu.It("在新标签页打开", delegate { if (ItemClicked != null) ItemClicked(it.Node); }));
-                    else
-                        m.Add(PopMenu.It("用默认程序打开", delegate
-                        {
-                            try { Process.Start(new ProcessStartInfo(p) { UseShellExecute = true }); }
-                            catch (Exception ex) { Toast.Show(NotifyItems.FavOpenFail, "打不开", ex.Message); }
-                        }));
-                    m.Add(PopMenu.It("复制完整路径", delegate
-                    {
-                        try { Clipboard.SetText(p); }
-                        catch (Exception ex) { Diag.Log("书签栏: 复制失败 " + ex.Message); }
-                    }));
-                    // 用户要的：栏上的项能改名（改的是**我们自己这份 json 里记的显示名**，
-                    // 磁盘上那个文件夹/文件一个字节都不动）
-                    FavNode nd = it.Node;
-                    m.Add(PopMenu.It("重命名…", delegate { Rename(nd); }));
-                    m.Add(PopMenu.Split());
-                }
-
-                FavNode node = it.Node;
-                m.Add(PopMenu.It("从书签移除", delegate
-                {
-                    // 只从我们这份 json 里去掉，**不动磁盘上那个文件/文件夹**
-                    FavStore.Edit(delegate(List<FavNode> l) { RemoveFrom(l, node); });
-                    Diag.Step("书签栏: 移除 " + FavStore.NameOf(node));
-                }));
-                m.Add(PopMenu.Split());
+                m.AddRange(ItemActions(it.Node, true, i));
             }
 
             m.Add(PopMenu.It("刷新书签栏", delegate { Reload(); }));
@@ -1446,6 +1730,8 @@ namespace TabbedExplorer
             {
                 if (ManageRequested != null) ManageRequested(this, EventArgs.Empty);
             }));
+            // 用户要的工具：「书签默认允许重复」开着时栏上会攒出重复项，给一个收拾的入口。
+            m.Add(PopMenu.It("合并重复书签…", delegate { MergeDupes(); }));
             m.Add(PopMenu.Split());
             // 快捷键文本跟着设置走（可自定义，别写死）
             m.Add(PopMenu.It("隐藏书签栏（" + Hotkeys.Combo("favbar") + "）",
@@ -1455,6 +1741,24 @@ namespace TabbedExplorer
             string title = i >= 0 ? ("书签项右键 " + rows[i].Name) : "书签栏右键";
             PopMenu.Show(menu, this, at, title);   // 「推后一轮」在 PopMenu.Show 里做
         }
+        /// <summary>
+        /// 合并**同一层**里重复的书签（用户要的工具 —— 「书签允许重复」开着时栏上会攒出重复项）。
+        /// 规则见 `FavStore.MergeDuplicates`：同层同路径留**最先出现**的那一份（位置不动），
+        /// 两份同名文件夹把孩子并到一起（不丢东西）。删之前先问一句。
+        /// </summary>
+        private void MergeDupes()
+        {
+            if (!Confirm.Ask(this, "合并重复书签",
+                    "把同一层里路径相同的书签并成一份：留最先出现的那一份（位置不动），后面的删掉。\r\n" +
+                    "两份同名文件夹会把里面的书签并到一起，不会丢东西。磁盘上的文件 / 文件夹一个都不动。\r\n" +
+                    "不同层里的重复不动 —— 免得把你分层的安排弄乱。\r\n\r\n要合并吗？", "合并"))
+                return;
+            int n = FavStore.MergeDuplicates();
+            Diag.Step("书签栏: 合并重复 -> 去掉 " + n + " 项");
+            if (n > 0) Toast.Show(NotifyItems.FavMerged, "书签", "已合并 " + n + " 项重复书签。");
+            else Toast.Show(NotifyItems.FavMerged, "书签", "没有发现同一层里的重复书签。");
+        }
+
         /// <summary>按节点删除（文件夹连里面的东西一起删，磁盘上不动）。</summary>
         private static void RemoveFrom(List<FavNode> l, FavNode node)
         {
@@ -1484,6 +1788,7 @@ namespace TabbedExplorer
                 if (tips != null) tips.Dispose();
                 if (font != null) font.Dispose();
                 if (flyTimer != null) { try { flyTimer.Stop(); flyTimer.Dispose(); } catch { } flyTimer = null; }
+                if (dragFlyTimer != null) { try { dragFlyTimer.Stop(); dragFlyTimer.Dispose(); } catch { } dragFlyTimer = null; }
             }
             base.Dispose(disposing);
         }

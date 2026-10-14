@@ -237,6 +237,9 @@ namespace TabbedExplorer
         private int dropInto = -1;           // 放进第几行（那一行必须是文件夹）
         private int dragFlyIndex = -1;       // 拖拽中悬停计时中的那一行（到点弹子菜单当落点）
         private FavNode menuDragNode;        // 正**从子菜单里往外拖**的那一项（它不在 `rows` 里）
+        private bool dragPortable;           // 拖进来的是便携设备（手机 / 相机）—— 只有 Shell IDList，没 FileDrop
+        private bool dragPortableOk;         // 便携设备这次**能**收（当前标签就在便携设备目录里，能拼出路径）
+        private string[] dragPortablePaths;  // Enter 时就算好拼出来的 MTP 路径 —— Drop 时直接拿来用
 
         private readonly Font font;
         private static Bitmap folderFallback;
@@ -510,6 +513,7 @@ namespace TabbedExplorer
             EnsureLayout();
             Graphics g = e.Graphics;
             g.FillRectangle(new SolidBrush(TheBack), ClientRectangle);
+            DrawPortableDropBanner(g);   // 拖的是手机 / 相机时，栏内标一行「收不了」
 
             // ---- 左边那枚固定的「书签」图标（用户要的）----
             Rectangle lead = LeadBounds();
@@ -605,6 +609,7 @@ namespace TabbedExplorer
             EnsureLayout();
             Graphics g = e.Graphics;
             GlassPaint.Backdrop(g, this, Glass, TheBack);
+            DrawPortableDropBanner(g);   // 拖的是手机 / 相机时，栏内标一行「收不了」
 
             // ---- 顶上那行：星标 + 「书签」（点星标开管理器）----
             Rectangle lead = LeadBounds();
@@ -1067,21 +1072,77 @@ namespace TabbedExplorer
         protected override void OnDragEnter(DragEventArgs e)
         {
             base.OnDragEnter(e);
+            // 手机 / 相机（WPD 便携设备）拖进来的东西**没有真实路径**（只有 Shell IDList / 虚拟文件流），
+            // 系统资源管理器能收是因为它肯把文件内容真拷一份；我们书签存的是路径。
+            // ⇒ 唯一的正路：拿**当前激活标签的路径**（它就在那个文件夹里）+ 拖入物的**文件名**拼出来。
+            //   拼出来了 = 跟普通文件**一模一样**处理（不特判、不额外提示）。
+            // ⚠ 拖拽期间一律**不许弹 Toast**（抢前台会打断拖放）。
+            dragPortable = HasPortableDeviceDrag(e);
+            dragPortablePaths = dragPortable ? PortableTargets(e) : null;
+            dragPortableOk = dragPortablePaths != null;
+            if (dragPortable && !dragPortableOk) Invalidate();   // 收不了 -> 画那条「没路径」的横幅
             // 拖文件进来：悬停菜单 / 悬停计时都收掉 —— 拖拽期间鼠标移动不走 MouseMove，
             // 菜单留着只会挡在路上（而且它没登记拖放落点，拖到它上面光标会变「不可放」）。
             StopFly();
             StopDragFly();
             // 同上：拖拽期间的落点菜单（dropMode）别收 —— 拖回栏上再拖回去还得用它
             if (flyManaged && PopMenu.IsOpen && !PopMenu.DropModeOpen) PopMenuWindow.CloseAll(false);
-            e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Effect = Draggable(e) ? DragDropEffects.Copy : DragDropEffects.None;
         }
+
+        /// <summary>这次拖入能不能收 —— 普通文件（`FileDrop`）或便携设备拼得出路径，都算能。</summary>
+        private bool Draggable(DragEventArgs e)
+        {
+            return HasFiles(e) || dragPortableOk;
+        }
+
+        /// <summary>
+        /// 便携设备拖入时，按「当前标签所在的便携设备目录 + 拖入的文件名」拼出可存的书签路径。
+        /// 拼不出来（当前标签不在便携设备上 / 拿不到名字）返回 null ⇒ 光标维持「禁止」。
+        ///
+        /// ⚠ 为什么敢这么拼：拖拽发起时鼠标必然压在**发起的那扇窗**上（就是当前激活标签），
+        ///   所以「当前标签的路径」就是这些拖入物的所在目录。这是唯一能拿到 MTP 路径的路子 ——
+        ///   拖放本身只给内容流、不给路径（见 `HasPortableDeviceDrag` 的注释）。
+        /// </summary>
+        private string[] PortableTargets(DragEventArgs e)
+        {
+            string[] names = NamesFromFileGroup(e);
+            if (names == null || names.Length == 0) return null;
+            string cur = null;
+            try { if (CurrentPathProvider != null) cur = CurrentPathProvider(); }
+            catch { }
+            if (string.IsNullOrEmpty(cur)) return null;
+            if (!PathRules.IsPortableDevicePath(cur)) return null;
+            var list = new List<string>();
+            foreach (string nm in names)
+            {
+                if (string.IsNullOrEmpty(nm)) continue;
+                string full = cur.TrimEnd('\\') + "\\" + nm.TrimStart('\\');
+                if (PathRules.IsPortableDevicePath(full)) list.Add(full);
+            }
+            // ⚠ 安全闸：一次拖放正常不会超过几个。拼出超过 `MaxPortableDrop` 个 = 判据失效
+            //   （`FileGroupDescriptorW` 给的是整棵树，`cidl` 截断没生效），宁可**不收**，
+            //   也不能再往用户书签栏里灌一坨（2026-10-14 曾一次灌 125 项）。
+            if (list.Count > MaxPortableDrop)
+            {
+                Diag.Step("书签栏: 便携拖入拼出 " + list.Count + " 项 > 上限 " + MaxPortableDrop
+                          + " -> 判据失效，不收（names=" + names.Length + ", cidl 截断没生效？）");
+                return null;
+            }
+            Diag.Step("书签栏: 便携拖入 -> 拼出 " + list.Count + " 项：" + string.Join(" | ", list.ToArray()));
+            return list.Count > 0 ? list.ToArray() : null;
+        }
+
+        /// <summary>便携设备拖入时，一次最多允许多少项（超过就判定「判据失效」、一律不收）。</summary>
+        private const int MaxPortableDrop = 3;
 
         protected override void OnDragOver(DragEventArgs e)
         {
             base.OnDragOver(e);
-            bool files = HasFiles(e);
-            e.Effect = files ? DragDropEffects.Copy : DragDropEffects.None;
-            if (!files) return;
+            // 能收就是能收 —— 手机 / 相机拼得出路径时跟普通文件**走完全一样这条路**
+            //（用户：「能拖进书签，为什么还要额外的提示？为什么还要和原本电脑路径拖入的分开？」）
+            if (!Draggable(e)) { e.Effect = DragDropEffects.None; return; }
+            e.Effect = DragDropEffects.Copy;
 
             // 落点整套照**栏内拖动**来（高亮 / 缝上的插入线都一样）—— 区别只在落地动作是
             // 「加一个书签」而不是「挪一个书签」。用户：「不能按书签栏拖动的逻辑来做吗？
@@ -1106,6 +1167,10 @@ namespace TabbedExplorer
         {
             base.OnDragLeave(e);
             StopDragFly();
+            bool repaint = dragPortable || dragPortableOk;
+            dragPortable = false;
+            dragPortableOk = false;
+            dragPortablePaths = null;
             if (dropInto != -1 || dropIndex != -1)
             {
                 dropInto = -1;
@@ -1113,6 +1178,7 @@ namespace TabbedExplorer
                 dropAfter = false;
                 Invalidate();
             }
+            else if (repaint) Invalidate();   // 收掉「手机的东西收不了」那条横幅
             // 拖走的那份菜单：延迟复核着收（鼠标挪进菜单里就不收 —— 栏和菜单是两扇窗，
             // 拖过去必然先在这一头触发一次 DragLeave）
             PopMenuWindow.DelayedClose();
@@ -1122,6 +1188,116 @@ namespace TabbedExplorer
         {
             try { return e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop); }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// 拖进来的东西是不是**便携设备**（手机 / 相机 —— WPD 那套）。
+        ///
+        /// 判据：既没有 `FileDrop`（所以 `HasFiles` 判 false、光标变禁止），
+        /// 又带 `Shell IDList Array`（壳层拖放的通用载体，`WPD NSE*` 那些是 WPD 私有的）。
+        /// ⚠ 别只看 `Shell IDList Array` 就下结论 —— 内嵌 explorer 拖普通文件也带它，
+        ///   那种是**能收**的（`FileDrop` 同时也在）。两头一起看才准。
+        /// </summary>
+        private static bool HasPortableDeviceDrag(DragEventArgs e)
+        {
+            try
+            {
+                if (e == null || e.Data == null) return false;
+                if (e.Data.GetDataPresent(DataFormats.FileDrop)) return false;
+                return e.Data.GetDataPresent("Shell IDList Array")
+                    || e.Data.GetDataPresent("WPD NSE")
+                    || e.Data.GetDataPresent("WPD NSE PnPDevicePath");
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 从 WPD 拖入物里取**真正选中的那些文件名**。
+        ///
+        /// ⚠ 坑：`FileGroupDescriptorW` 给的是**整棵可见目录树**（实测 125 项 —— 用户拖 1 个
+        ///   却加了 125 个书签），不是「选中的那几个」。真正选中的数量只有 `Shell IDList Array`
+        ///   的 `cidl` 那个头字段说（实测 `cidl=1`）。两者顺序一致 ⇒ 取前 `cidl` 个名字。
+        ///
+        /// 结构（`FileGroupDescriptorW`）：`uint cItems` + cItems 个 `FILEDESCRIPTORW`
+        ///（x64 每项 **592 字节**，`cFileName` 在项内偏移 **0x48**，WCHAR 260）。
+        /// </summary>
+        private static string[] NamesFromFileGroup(DragEventArgs e)
+        {
+            try
+            {
+                object o = e.Data.GetData("FileGroupDescriptorW");
+                System.IO.MemoryStream ms = o as System.IO.MemoryStream;
+                if (ms == null) return null;
+                byte[] b = ms.ToArray();
+                if (b.Length < 4) return null;
+                int n = BitConverter.ToInt32(b, 0);
+                const int ITEM = 592;      // x64 FILEDESCRIPTORW
+                const int NAMEOFF = 0x48;  // cFileName 在项内的偏移
+                if (n <= 0 || n > 5000) return null;
+
+                // 真选中的个数（cidl）：只认这个数，别把整棵树都当选中
+                int want = PidlCount(e);
+                if (want <= 0) want = 1;   // 拿不到 cidl 时保守取第一个
+
+                var list = new List<string>();
+                for (int i = 0; i < n && list.Count < want; i++)
+                {
+                    int baseOff = 4 + i * ITEM;
+                    if (baseOff + NAMEOFF + 2 > b.Length) break;
+                    string nm = System.Text.Encoding.Unicode.GetString(b, baseOff + NAMEOFF, 520);
+                    int z = nm.IndexOf('\0');
+                    if (z >= 0) nm = nm.Substring(0, z);
+                    nm = nm.Trim();
+                    if (nm.Length > 0) list.Add(nm);
+                }
+                return list.Count > 0 ? list.ToArray() : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// `Shell IDList Array`（CIDA）头里的 `cidl` —— **真正选中的项数**。
+        /// 拿不到返回 0（调用方保守处理）。读的是字节流前 4 字节，不解 PIDL，够用。
+        /// </summary>
+        private static int PidlCount(DragEventArgs e)
+        {
+            try
+            {
+                object o = e.Data.GetData("Shell IDList Array");
+                System.IO.MemoryStream ms = o as System.IO.MemoryStream;
+                if (ms == null) return 0;
+                byte[] b = ms.ToArray();
+                if (b.Length < 4) return 0;
+                int c = BitConverter.ToInt32(b, 0);
+                return (c > 0 && c < 5000) ? c : 0;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// 拖的是便携设备（手机 / 相机）时，在栏的**下半截**叠一条提示：
+        /// 「手机里的东西没有路径，拖不进来 —— 用右键『添加当前路径为书签』」。
+        /// 纯自绘、不弹窗、不抢前台、不动鼠标 —— 拖拽期间唯一安全的提示方式。
+        /// ⚠ 只在「便携设备**且拼不出路径**（收不了）」时画 —— 能收就跟普通文件一样，一个字都不画
+        ///   （用户：「能拖进书签，为什么还要额外的提示？为什么还要和原本电脑路径拖入的分开？」）。
+        /// </summary>
+        private void DrawPortableDropBanner(Graphics g)
+        {
+            // 只在「确实是便携设备、但拼不出路径（收不了）」时才提示 —— 能收就跟普通文件一样，
+            // 一个字都不画（用户：「能拖进书签，为什么还要额外的提示？」）。
+            if (!dragPortable || dragPortableOk) return;
+            bool v = vertical;
+            Rectangle r = v
+                ? new Rectangle(Px(3), Math.Max(VHeadH, Height - Px(38)), Math.Max(1, Width - Px(6)), Px(34))
+                : new Rectangle(Px(4), Math.Max(0, Height - Px(24)), Math.Max(1, Width - Px(8)), Px(22));
+            using (SolidBrush b = new SolidBrush(BG(Theme.Hover)))
+                g.FillRectangle(b, r);
+            using (Pen p = new Pen(Theme.Border))
+                g.DrawRectangle(p, r.Left, r.Top, r.Width - 1, r.Height - 1);
+            string text = v ? "手机：没路径，收不了" : "手机 / 相机里的东西没有路径，收不了 —— 用右键「添加当前路径为书签」";
+            TextRenderer.DrawText(g, text, font, r, Theme.TextDim,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
         }
 
         /// <summary>
@@ -1150,7 +1326,14 @@ namespace TabbedExplorer
             try
             {
                 string[] paths = (string[])e.Data.GetData(DataFormats.FileDrop);
-                if (paths == null || paths.Length == 0) return;
+                if (paths == null || paths.Length == 0)
+                {
+                    // 便携设备（手机 / 相机）：没有 FileDrop 路径，用 Enter 时就算好的那串（别在 Drop 里
+                    // 重解 —— 拖放已结束、data object 可能已经取不到了）。
+                    if (dragPortableOk && dragPortablePaths != null && dragPortablePaths.Length > 0)
+                        paths = dragPortablePaths;
+                    if (paths == null || paths.Length == 0) return;
+                }
 
                 // 落点三选一（都跟栏内拖动同一套判定）：
                 //   · 文件夹那一行 → 进那个文件夹（追加）
@@ -1185,6 +1368,19 @@ namespace TabbedExplorer
             {
                 Diag.Log("书签栏: 拖放失败 " + ex.Message);
                 Toast.Show(NotifyItems.FavAddFail, "书签", "加入失败：" + ex.Message);
+            }
+            finally
+            {
+                // ⚠ 松手后**必须**清掉便携拖放状态 —— `OnDragLeave` 在成功 Drop 后**不会**再来，
+                //   不清的话那条「松手加到书签」横幅会一直赖在栏上（2026-10-14 用户报「拖完都有书签了，
+                //   为什么还有提示占用着」）。
+                if (dragPortable || dragPortableOk)
+                {
+                    dragPortable = false;
+                    dragPortableOk = false;
+                    dragPortablePaths = null;
+                    Invalidate();
+                }
             }
         }
 

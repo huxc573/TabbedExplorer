@@ -1,0 +1,10 @@
+{
+  "_note": "TabbedExplorer 按虚拟桌面记住的标签页。id = 那张桌面的 GUID（换桌面/重排都不会变）；active = 当时选中的那个标签；bounds = 当时窗口的位置和大小，格式 x,y,w,h，删掉就回到默认尺寸。",
+  "_hint": "开不了的项（库 / 别处删掉的目录）启动时会自动跳过，不用手改。整个 data 文件夹拷走就把记忆带走了。",
+  "desktops": [
+    { "id": "090efe42-4b8d-43dd-a242-8da4fcf9ab96", "active": "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta", "tabs": ["此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta\\projects\\los-enhance", "D:\\Dev\\Workspaces\\WorkBuddy\\WorkBuddySkills\\tools", "D:\\Dev\\Workspaces\\WorkBuddy\\WorkBuddySkills", "D:\\Shortcut", "D:\\Users\\a\\AppData\\Local\\Temp", "此电脑\\motorola edge 20 pro\\内部共享存储空间", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta\\projects\\los-enhance\\refs\\official-rom", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta\\projects\\los-enhance\\refs\\official-rom", "此电脑\\motorola edge 20 pro\\内部共享存储空间\\!573\\APPS\\Eta\\projects", "此电脑\\motorola edge 20 pro"], "bounds": "286,374,2400,1350" },
+    { "id": "abf524ea-b551-4cba-ae3b-2a6783c390d2", "active": "D:\\Life\\Game\\Local\\CreatorChronicles", "tabs": ["D:\\Life\\Game\\Local\\CreatorChronicles"], "bounds": "540,353,1800,1140" },
+    { "id": "ec74f739-8113-4d96-a1a6-a543865c8dcd", "active": "视频", "tabs": ["视频"] },
+    { "id": "unknown", "active": "D:\\Life\\Game\\Local\\MH\\画迹\\【画迹2】内测版\\!Tools\\V2.201-Offline-Server", "tabs": ["D:\\Life\\Game\\Local\\MH\\画迹\\【画迹2】内测版\\!Tools\\V2.201-Offline-Server", "D:\\Life\\Game\\Local\\MH\\画迹\\【画迹2】内测版\\!Tools\\V2.201-Offline-Server\\tools", "D:\\Life\\Game\\Local\\MH\\画迹\\【画迹2】内测版\\!Tools\\V2.201-Offline-Server\\data", "C:\\Users\\a\\Documents"], "bounds": "240,248,2400,1350" }
+  ]
+}

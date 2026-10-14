@@ -2954,6 +2954,84 @@ namespace TabbedExplorer
             return memory.Find(key);
         }
 
+        /// <summary>
+        /// 「记忆还原」那一遍的账：把恢复时摆出来的每一项先记成**未落定**，等它真开出路径来再划掉。
+        /// 保存记忆时**账里还挂着的那几项**才算「该留住」，窗口里没有的其余旧项一律算用户关的、删掉。
+        /// ⚠ 判据绝不能写成「不在窗口里的旧项都留」（2026-10-14 川报「关掉只剩 1 个，重启又回来一堆」，
+        ///   日志铁证 `Hub: 记忆里留住了 22 个这次没开出来的项`）—— 那样**关掉的标签永远删不掉**。
+        /// </summary>
+        private sealed class RestoreNote { public readonly List<string> Pending = new List<string>(); }
+
+        private readonly Dictionary<string, RestoreNote> restoreNotes =
+            new Dictionary<string, RestoreNote>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 恢复时摆出来的这一项**先记成未落定**（原串，跟记忆文件里的一样）。
+        /// 之后它真开出来了（<see cref="NoteRestoreDone"/>）就划掉；一直挂着 = 这次没开成 ⇒ 留住。
+        /// </summary>
+        internal void NoteRestorePending(string key, string rawPath)
+        {
+            if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(rawPath)) return;
+            RestoreNote n;
+            if (!restoreNotes.TryGetValue(key, out n)) { n = new RestoreNote(); restoreNotes[key] = n; }
+            n.Pending.Add(rawPath);
+        }
+
+        /// <summary>
+        /// 某个标签**真的开出路径来了**（导航就绪，见 `EmbedForm.OnHostPathChanged`）。
+        /// 账里跟它同一条的（`Store` 后 `Same`）划掉 —— 说明记忆里那一项这次成功还原了，别再算「没开成」。
+        /// </summary>
+        internal void NoteRestoreDone(string key, string livePath)
+        {
+            RestoreNote n;
+            if (string.IsNullOrEmpty(livePath) || !restoreNotes.TryGetValue(key, out n)) return;
+            string live = PathRules.Store(livePath);
+            for (int i = n.Pending.Count - 1; i >= 0; i--)
+                if (PathRules.Same(PathRules.Store(n.Pending[i]), live)) n.Pending.RemoveAt(i);
+        }
+
+        /// <summary>这个旧项这次**没开成**（手机拔线 / 目录已删 / 落在别处）吗？⚠ 只有它为真才留住。</summary>
+        private bool WasRestorePending(string key, string rawPath)
+        {
+            RestoreNote n;
+            if (rawPath == null || !restoreNotes.TryGetValue(key, out n)) return false;
+            for (int i = 0; i < n.Pending.Count; i++)
+                if (string.Equals(n.Pending[i], rawPath, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 便携设备（手机 / 相机）**这次会话里到底露过面没有**（2026-10-14 川定）。
+        ///
+        /// 背景：便携设备路径**换个设备就不成立**（`\\?\usb#vid_…&pid_…` 是硬件指纹；就算同一部手机，
+        /// USB 口 / 数据线变了那串也变）。所以「没插时留着」这条规则只在**此刻**有意义：
+        ///   · 同一部手机还插着、只是这次没恢复 —— 留着，下次插回来能还原（这是原意）。
+        ///   · 手机拔了 / 换成别的设备 —— 那些路径**永远开不出来**了，留着只是往记忆里堆死条目。
+        ///
+        /// 判据用「这次会话里有没有真开出过便携设备的路径」当**在线**的证据：
+        /// 我们只会为了**开记忆里那条**才去枚举设备（`PortableDeviceShellForm` 换不出真形式就跳过），
+        /// 所以「冒出过一条便携设备路径」⇒ 设备在 ⇒ 它上面**没开成的那几条**才有留的意义。
+        /// 一条都没冒出过 ⇒ 设备离线 ⇒ 记忆里那些便携设备项**当场删干净**，
+        /// 免得换手机后开机弹一排「打开失败」，或者一堆死路径躺在记忆里。
+        /// </summary>
+        private bool portableSeenThisRun;
+
+        /// <summary>这次会话里真开出过便携设备的路径（`EmbedForm.OnHostPathChanged` 调）。</summary>
+        internal void NotePortableDeviceSeen(string livePath)
+        {
+            if (portableSeenThisRun) return;
+            if (!PathRules.IsPortableDevicePath(PathRules.Store(livePath) ?? livePath)) return;
+            portableSeenThisRun = true;
+            Diag.Step("Hub: 这次会话见过便携设备（在线）-> 记忆里没开成的便携设备项才留住");
+        }
+
+        /// <summary>这条旧项是不是便携设备路径（离线 ⇒ 直接删）。</summary>
+        private static bool IsPortableOld(string rawPath)
+        {
+            string s = PathRules.Store(rawPath) ?? rawPath;
+            return PathRules.IsPortableDevicePath(s);
+        }
+
         /// <summary>标签有变动（开/关/导航/切换）—— 攒 800ms 再写盘，免得一路点进去写十几次。</summary>
         public void MarkDirty()
         {
@@ -2997,6 +3075,34 @@ namespace TabbedExplorer
                     if (mine.Count == 0) { live++; continue; }
 
                     DesktopMemory.Bucket b = memory.Ensure(f.DesktopKey);
+
+                    // ⭐ **只留「这次恢复没开成」的项**（2026-10-14 重定）。
+                    //    这两类旧项长得一样（上次记着、这次窗口里没有），必须分开：
+                    //      ① 恢复时没开成的（手机拔线 / 目录已删 / 开出来落在别处）—— 账里还挂着，留住。
+                    //      ② 用户自己关掉的 —— 它恢复时开出来了（账里已划掉）、之后被关，**必须删**。
+                    //    ⚠ 判据是 ①（`WasRestorePending`），**绝不是**「所有不在窗口里的旧项」：
+                    //      上一版就是这么写的，结果川「关掉其它只剩 1 个」⇒ 日志 `记忆里留住了 22 个` ⇒
+                    //      关掉的标签永远删不掉、重启又回来一堆。
+                    //    位置按原来的先后接在后面 —— 绝不是「什么都不清」。
+                    List<string> keep = new List<string>();
+                    foreach (string old in b.Paths)
+                    {
+                        bool stillHere = false;
+                        for (int i = 0; i < mine.Count; i++)
+                            if (PathRules.Same(mine[i], old)) { stillHere = true; break; }
+                        if (stillHere) continue;
+                        if (!WasRestorePending(f.DesktopKey, old)) continue;
+                        // ⭐ 便携设备项**只在设备这次真的在线时**才留住（2026-10-14 川定）。
+                        //    设备路径里带 vid/pid/序列号/USB 口，**换设备就是另一串** —— 离线时留着
+                        //    等于往记忆里堆永远开不出来的死条目（同一部手机拔了也一样）。
+                        if (IsPortableOld(old) && !portableSeenThisRun)
+                        {
+                            Diag.Step("Hub: 便携设备离线 -> 记忆里删掉对它那条残留「" + old + "」");
+                            continue;
+                        }
+                        keep.Add(old);
+                    }
+
                     b.Paths.Clear();
                     b.Active = null;
 
@@ -3006,6 +3112,23 @@ namespace TabbedExplorer
                         b.Paths.Add(mine[i]);
                         if (PathRules.Same(mine[i], active)) b.Active = mine[i];
                         tabs++;
+                    }
+                    // ⚠ 保留项只补「窗口里一个标签都没有」之外的情形 —— 窗口有标签说明用户确实在用它；
+                    //   补在末尾，下次启动时按原位重排（标签顺序不因它错乱）。
+                    if (keep.Count > 0)
+                    {
+                        int kept = 0;
+                        foreach (string k in keep)
+                        {
+                            bool dup = false;
+                            for (int i = 0; i < b.Paths.Count; i++)
+                                if (PathRules.Same(b.Paths[i], k)) { dup = true; break; }
+                            if (dup) continue;
+                            b.Paths.Add(k);
+                            kept++;
+                        }
+                        if (kept > 0)
+                            Diag.Step("Hub: 记忆里留住了 " + kept + " 个这次没开出来的项（如手机存储）");
                     }
                     // 窗口位置和大小（用户：完全退出后下次照原样打开）。
                     // ⚠ 只有「真给用户看过」的窗口才有值（空 = 不动记忆里那份）——

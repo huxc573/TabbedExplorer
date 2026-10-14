@@ -28,6 +28,18 @@ namespace TabbedExplorer
         [DllImport("user32.dll")]
         public static extern IntPtr SetParent(IntPtr child, IntPtr parent);
 
+        // ---- 老式文件拖放（WM_DROPFILES）----
+        // 只有外部程序拖进来的那一路会走到这里；**内嵌 explorer 拖出来的走不到**
+        // （OLE 拖放不喂 WM_DROPFILES，见 EmbedForm 的 OnFilesDropped）。
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "DragQueryFileW")]
+        public static extern uint DragQueryFile(IntPtr drop, uint index, StringBuilder buf, uint cch);
+
+        [DllImport("shell32.dll")]
+        public static extern void DragFinish(IntPtr drop);
+
+        [DllImport("shell32.dll")]
+        public static extern void DragAcceptFiles(IntPtr h, bool accept);
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SetWindowPos(IntPtr h, IntPtr after,
             int x, int y, int cx, int cy, uint flags);

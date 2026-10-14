@@ -41,6 +41,7 @@ namespace TabbedExplorer
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;      // Alt
         private const int VK_SPACE = 0x20;
+        private const int VK_CAPITAL = 0x14;   // CapsLock（改键工具的功能键，见 QLPreview 的 capsHeld）
         private const int VK_LMENU = 0xA4;     // 低级钩子报的是左右分开的那个
         private const int VK_RMENU = 0xA5;
         private const int VK_F10 = 0x79;
@@ -164,6 +165,9 @@ namespace TabbedExplorer
                                 // 松开只清标志（空格预览「这次已经处理过了」那个），**绝不吞键**
                                 int uvk = (int)st.vkCode;
                                 QLPreview.NoteKeyUp(uvk);
+                                // CapsLock 的按下 / 松开由我们自己记 —— 改键工具（MyKeymap 的 `*CapsLock`）
+                                // 会把它吞掉，系统按下位读不到（见 QLPreview.capsHeld）。**我们绝不吞这个键。**
+                                if (uvk == VK_CAPITAL) QLPreview.NoteCapsUp();
                                 if (uvk == VK_RETURN) altEnterDown = false;   // 见 Handle 里 Alt+Enter 那段
 
 
@@ -176,9 +180,14 @@ namespace TabbedExplorer
                                     if (nav != null) nav(uvk);
                                 }
                             }
-                            else if (Handle((int)st.vkCode))
+                            else
                             {
-                                return (IntPtr)1;
+                                int dvk = (int)st.vkCode;
+                                // ⚠ 必须在 `Handle` 之前记：CapsLock 是**改键工具的组合键前缀**，
+                                //   它自己的钩子会把 keydown 吞掉、系统按下位读不到（见 QLPreview.capsHeld）。
+                                //   我们比它装得晚 = 先被调用，所以这一下**只有我们能看见**。
+                                if (dvk == VK_CAPITAL) QLPreview.NoteCapsDown();
+                                if (Handle(dvk)) return (IntPtr)1;
                             }
                         }
                     }

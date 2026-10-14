@@ -107,6 +107,30 @@ namespace TabbedExplorer
         /// <summary>抓到的 `ShellWindows` 那一项 —— 备用窗口「换个目录再当标签用」全靠它。</summary>
         public object ShellTarget { get; private set; }
 
+        /// <summary>
+        /// 备用窗口被**导航复用**时（见 `EmbedForm.UseReserve`）记下「我要它去哪儿」。
+        ///
+        /// ⚠ 为什么不能没有它：导航是 explorer 那边的异步活，`NavigateTo` 返回成功只是 shell
+        ///   **收下了请求**。而收编那一刻 `CabMatches` 会拿地址栏内容跟 `TargetPath` 比 ——
+        ///   这一刻它**还停在「此电脑」**，`TargetPath` 却是新目录，比对失败 ⇒ 这扇窗被当成
+        ///   「别人开的窗」一直等到 12 秒宽限 ⇒ 用户点书签看到的就是「标签名对了、内容还是此电脑
+        ///   （或干脆空着）」。
+        ///   记在这里之后：`CabMatches` 认出「这就是我要的那扇窗」；地址栏真的报出新路径时
+        ///   由 `RefreshPath` 清掉（跟 `PendingPath` 同一个收口思路）。
+        /// </summary>
+        public string NavigateTarget { get; set; }
+
+        /// <summary>这扇窗现在还在往 <see cref="NavigateTarget"/> 去的路上吗。</summary>
+        public bool NavigatePending
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(NavigateTarget)) return false;
+                try { return !PathRules.Same(currentPath, NavigateTarget); }
+                catch { return true; }
+            }
+        }
+
         /// <summary>下一次「试抓」的时刻（清单里先出现的是幽灵项，得隔一会儿再来）。</summary>
         private DateTime grabAt = DateTime.MinValue;
         /// <summary>两次试抓之间隔多久 —— 抓一次要跨进程问一遍清单，别每 25ms 都来。</summary>
@@ -230,6 +254,14 @@ namespace TabbedExplorer
             EmbedApi.CollectCabs(cabsBefore);
 
             string arg = CommandLineTarget(path);
+            if (arg == null)
+            {
+                // 路径现在解析不出来（便携设备没插，见 `CommandLineTarget`）——**别起窗口**，
+                // 免得又掉到默认程序（浏览器）上去。给个明确失败，界面那边自己提示。
+                LastError = "这个位置现在打不开（便携设备没连接？）";
+                RaiseFailed();
+                return;
+            }
             try
             {
                 Diag.Step("Embed: 起 explorer " + arg);
@@ -351,10 +383,17 @@ namespace TabbedExplorer
         ///   · 读到的字符串翻译不成可比的路径（库/虚拟文件夹）：放行。
         /// 宁可偶尔嵌错（4 秒后会放宽），也不能因为比对不了就永远不开。
         /// </summary>
-        private static bool CabMatches(IntPtr cab, string wanted)
+        private bool CabMatches(IntPtr cab, string wanted)
         {
             if (string.IsNullOrEmpty(wanted)) return true;
             if (!PathRules.Restorable(wanted)) return true;
+            // 便携设备（手机 / 相机）：命令行只能先开「此电脑」，PIDL 导航是**之后**才发的 ——
+            // 还没导航过去时地址栏当然是「此电脑」，对不上是正常的，别把它当「扫错了窗口」。
+            // 到位没到位由 `OnPoll` 里那段自己等（最多 1.5 秒），这里一律放行。
+            if (PathRules.IsPortableDevicePath(wanted)) return true;
+            // 「导航复用」的备用窗口（见 `ExplorerHost.NavigateTarget`）：它是**我们自己的**那扇窗，
+            // 只是导航还没走完、地址栏还停在旧目录。按窗口找回来，认它就够了 —— 别拿地址栏内容比。
+            if (OwnPendingWindow(cab)) return true;
             try
             {
                 IntPtr ab = EmbedApi.FindAddressBand(cab);
@@ -367,13 +406,44 @@ namespace TabbedExplorer
             catch { return true; }
         }
 
+        /// <summary>
+        /// 这扇 cab 是不是我们**自己**正开着、当前就在等的那扇（还没嵌进来的备用窗口）。
+        ///
+        /// 用途只有一个：给「导航复用」那条路放行（见 <see cref="NavigateTarget"/>）——
+        /// 那一刻窗口还在往目标目录走的路上，地址栏对不上，但它确确实实是我们的窗。
+        /// ⚠ 只认「同一扇窗」：`cab` 得是这个 host 自己找到的那个句柄，别拿路径去猜，
+        ///   猜错就等于把别人开的窗抢过来（那正是老的「标签点开是空的」）。
+        /// </summary>
+        private bool OwnPendingWindow(IntPtr cab)
+        {
+            return pendingCab != IntPtr.Zero && cab == pendingCab
+                && !string.IsNullOrEmpty(NavigateTarget);
+        }
+
         /// <summary>把 shell 路径转成 explorer.exe 认的命令行形式。</summary>
-        private static string CommandLineTarget(string path)        {
+        private static string CommandLineTarget(string path)
+        {
             string t = path;
             if (string.IsNullOrEmpty(t) ||
                 string.Equals(t, ExplorerView.ThisPcPath, StringComparison.OrdinalIgnoreCase))
             {
                 t = "shell:MyComputerFolder";   // 「此电脑」
+            }
+            else if (PathRules.IsPortableDevicePath(t))
+            {
+                // 便携设备（手机 / 相机）：**显示名串不能直接交给 explorer**（实测
+                // `explorer.exe /n,/separate,"此电脑\设备\…"` 收下但落到默认程序 ⇒ 跳浏览器）。
+                // 换成设备那一段是**设备路径**（`\\?\usb#vid_…#{6ac27878-…}`）的形式 ——
+                // 这个 `SHParseDisplayName` 认、explorer 也认（2026-10-14 实测直达手机目录）。
+                // 换不出来（设备没插）就返回 null：调用方**别开这个窗口**，免得又掉到浏览器上。
+                string real = PathRules.PortableDeviceShellForm(t);
+                if (string.Equals(real, t, StringComparison.OrdinalIgnoreCase))
+                {
+                    Diag.Step("Embed: 便携设备「" + t + "」现在解析不出来（设备没插？），这个标签开不了");
+                    return null;
+                }
+                Diag.Step("Embed: 便携设备路径 -> " + real);
+                t = real;
             }
             return "/n,/separate,\"" + t + "\"";
         }
@@ -439,8 +509,13 @@ namespace TabbedExplorer
                 bool byPid;
                 // 并发起 explorer 时把「我要开哪个路径」交给扫描器，让它**只认地址栏对得上的那个窗口**
                 //（一次冒出好几个，不这么判就会抢到别人的窗口）；串行时传 null，走老路不判。
+                // 便携设备那种「命令行先开此电脑、之后再 PIDL 导航」的情况不能按地址栏内容匹配
+                // （窗口起来时地址栏是「此电脑」，跟 MTP 串对不上）⇒ 交给它按进程 / 通用扫法找。
+                string matchPath = TargetPath;
+                if (!string.IsNullOrEmpty(matchPath) && PathRules.IsPortableDevicePath(matchPath))
+                    matchPath = null;
                 IntPtr cab = EmbedApi.FindNewCab(cabsBefore, pidsBefore, relax,
-                    Settings.ParallelLaunch ? TargetPath : null, launchPids, out pid, out byPath, out byPid);
+                    Settings.ParallelLaunch ? matchPath : null, launchPids, out pid, out byPath, out byPid);
                 // `byPath` = 上面那一扇是**按地址栏内容**命中的：也就是说「它就是我要开的那扇窗」
                 // 已经有硬证据了（那份内容由后台线程读的，见 `EmbedApi.ProbePath`）。那就别再在这里
                 // 重读一遍地址栏 —— 这一下是跨进程 `SendMessage`，对方忙的时候要几百毫秒，
@@ -777,6 +852,8 @@ namespace TabbedExplorer
                 currentPath = s;
                 // 「导航复用」的目标已经换到位了 —— 以后路径以地址栏为准（见 PendingPath）
                 if (!string.IsNullOrEmpty(PendingPath) && PathRules.Same(s, PendingPath)) PendingPath = null;
+                // 同上的收口：导航复用的那一趟到站了，`NavigateTarget` 也该放下（见那个属性的说明）
+                if (!string.IsNullOrEmpty(NavigateTarget) && PathRules.Same(s, NavigateTarget)) NavigateTarget = null;
                 Diag.Step("Embed: 现在在 " + s);
                 EventHandler e = PathChanged;
                 if (e != null) e(this, EventArgs.Empty);

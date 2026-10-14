@@ -283,6 +283,13 @@ namespace TabbedExplorer
         /// <summary>那根横条拖完了 —— 宿主这时候才把高度写进设置、广播给其余窗口。</summary>
         public event Action BandResizeEnded;
 
+        /// <summary>
+        /// 「当前标签停在哪个文件夹」的取值器 —— 宿主（`EmbedForm`）接上它。
+        /// 给「添加当前路径为书签」用：栏自己不认识标签，问不出当前路径。
+        /// 拿不到（没标签 / 还没就绪）返回 null / 空串，那一项就灰着不给点。
+        /// </summary>
+        public Func<string> CurrentPathProvider;
+
         public FavBar()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
@@ -1181,6 +1188,37 @@ namespace TabbedExplorer
             }
         }
 
+        /// <summary>
+        /// 栏空白处右键「添加书签…」—— 手输一个路径加进栏根。
+        /// 用户：「我们书签栏也没右键新建书签的功能」；以前只有「拖进来」和管理器里输两条路。
+        /// 成功不弹提示（新项当场出现在栏上就是反馈），只有重复 / 收不下才说一句（跟拖入同规矩）。
+        /// </summary>
+        private void AddByInput()
+        {
+            string p = InputBox.Ask(this, "添加路径为书签",
+                "文件夹或文件的完整路径（手机 / 相机那种位置也可以直接粘）", "");
+            if (string.IsNullOrEmpty(p)) return;
+            AddOne(p, "手输加书签");
+        }
+
+        /// <summary>
+        /// 把一条路径加进书签栏根（「添加当前路径为书签」和手输那条共用）。
+        /// 收不收得下由 `FavStore.Add` 一道判 —— 它认便携设备（手机 / 相机）那种显示名串，
+        /// 见 `PathRules.IsPortableDevicePath`。
+        /// </summary>
+        private void AddOne(string path, string why)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            string name;
+            if (FavStore.Add(path, null, -1, out name))
+            {
+                Diag.Step("书签栏: " + why + " -> " + path);
+                return;
+            }
+            Toast.Show(NotifyItems.MgrAddFail, "加不了",
+                string.IsNullOrEmpty(name) ? "这个位置没有真实路径。" : ("「" + name + "」已经在书签里了。"));
+        }
+
         /// <summary>某一项在它父亲（`null` = 栏根）里的下标；找不到返回 -1。</summary>
         private static int KidsIndexOf(FavNode parent, FavNode node)
         {
@@ -1228,6 +1266,16 @@ namespace TabbedExplorer
             }
             else if (dup > 0 && bad == 0) Toast.Show(NotifyItems.FavDup, "书签", dup == 1 ? "这一项已经在里面了。" : "这些都已经在里面了。");
             else Toast.Show(NotifyItems.FavMarkNoPath, "书签", "这些位置没有真实路径（库 / 虚拟文件夹），收不了。");
+        }
+
+        /// <summary>
+        /// 从**外部**拖到窗口上的文件（`WM_DROPFILES`）加进栏里 —— `EmbedForm` 转发进来。
+        /// 落点口径跟栏上拖放一致（`dest` 非空 = 那一层，`index` 负 = 末尾）。
+        /// </summary>
+        internal void AddByDrop(string[] paths, object dest, int index)
+        {
+            if (paths == null || paths.Length == 0) return;
+            AddFiles(paths, dest as FavNode, index);
         }
 
         /// <summary>
@@ -1723,6 +1771,24 @@ namespace TabbedExplorer
             {
                 Row it = rows[i];
                 m.AddRange(ItemActions(it.Node, true, i));
+            }
+            else
+            {
+                // 栏空白处右键（用户 2026-10-14 要的那两条）：
+                //   ① 「添加当前路径为书签」—— 当前标签停在哪儿就加哪儿，不用手打；
+                //      拿不到当前路径（没标签 / 还没就绪）时 `Run` 给 null，菜单项自动灰着。
+                //   ② 「添加路径为书签…」—— 弹输入框自己粘。
+                string cur = null;
+                try { if (CurrentPathProvider != null) cur = CurrentPathProvider(); }
+                catch { cur = null; }
+                bool haveCur = !string.IsNullOrEmpty(cur);
+
+                m.Add(PopMenu.It("添加当前路径为书签",
+                    haveCur ? new Action(delegate { AddOne(cur, "添加当前路径为书签"); }) : null));
+
+                m.Add(PopMenu.It("添加路径为书签（输入）…",
+                    delegate { AddByInput(); }));
+                m.Add(PopMenu.Split());
             }
 
             m.Add(PopMenu.It("刷新书签栏", delegate { Reload(); }));

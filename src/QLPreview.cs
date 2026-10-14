@@ -153,6 +153,27 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// CapsLock **此刻是不是按着**（钩子线程写、UI 线程读，`volatile`）。
+        ///
+        /// ⚠ 为什么不能只靠 `GetAsyncKeyState(VK_CAPITAL)`：**改键工具会把 CapsLock 的 keydown 吞掉**。
+        /// 以 MyKeymap（AHK v2 的 `*CapsLock` 热键）为例，它在自己的钩子里返回 1 把 CapsLock 的按下吞了 ⇒
+        /// **系统层那个「按下位」永远不会被置起来**。探针实测（`probe/mod_state_probe.py`，按住 CapsLock 按空格）：
+        /// 那一刻读到的就是 `caps=0` ⇒ `HeldModifiers` 那道闸**形同虚设** ⇒ 我们把空格吞了 ⇒
+        /// 改键工具的 `*space` 再也收不到这一下 ⇒ 它的 `CapsLock+空格` 哑掉。
+        ///
+        /// 而低级键盘钩子是**后安装的先被调用**：我们启动得比它晚 ⇒ 我们**先看到** CapsLock 的
+        /// keydown / keyup（在它吞掉之前）。所以由 `WinEHook` 把这两个事件转发过来、自己记一份，
+        /// 与 `GetAsyncKeyState` 取或。**我们绝不吞 CapsLock 自己**（`Handle` 对它一律放行）。
+        /// </summary>
+        private static volatile bool capsHeld;
+
+        /// <summary>CapsLock 按下（**钩子线程**调，见 <see cref="capsHeld"/>）。</summary>
+        public static void NoteCapsDown() { capsHeld = true; }
+
+        /// <summary>CapsLock 松开（**钩子线程**调）。</summary>
+        public static void NoteCapsUp() { capsHeld = false; }
+
+        /// <summary>
         /// 这次空格该不该归我们管（**钩子线程**：只读字段 + 纯 Win32，不做 COM / IO）。
         /// 四条：开关开着、**没按着别的键**（见 `HeldModifiers` —— Ctrl+空格、Win+空格、
         /// CapsLock+空格 一个都不能抢）、这一次按下还没处理过、前台是我们某个宿主窗体
@@ -203,7 +224,12 @@ namespace TabbedExplorer
             if (!Settings.QLPreview) return false;
             for (int i = 0; i < HeldModifiers.Length; i++)
             {
-                if ((NativeMethods.GetAsyncKeyState(HeldModifiers[i]) & 0x8000) != 0) return false;
+                int vk = HeldModifiers[i];
+                bool held = (NativeMethods.GetAsyncKeyState(vk) & 0x8000) != 0;
+                // ⚠ CapsLock 有第二个来源：改键工具吞掉它的 keydown ⇒ 系统按下位读不到（见 capsHeld）。
+                //    两个来源**取或** —— 宁可少预览一次，也绝不能抢了改键工具的组合键。
+                if (vk == VK_CAPITAL && capsHeld) held = true;
+                if (held) return false;
             }
 
             IntPtr fg = NativeMethods.GetForegroundWindow();
@@ -367,7 +393,12 @@ namespace TabbedExplorer
             if (string.Equals(sel[0], lastNavPath, StringComparison.OrdinalIgnoreCase)) return;  // 选择没动，白跑一趟
             lastNavPath = sel[0];
 
-            if (Send(MsgSwitch, sel[0])) Diag.Step("QLPreview: 切换 " + sel[0]);
+            // ⚠ 预览窗「可见但被压在后面」时 `Switch` 同样白搭：`SwitchPreview` 第一行就是
+            //   `if (!_viewerWindow.IsVisible) return;` —— 而那扇僵尸窗的 IsVisible 是 true，
+            //   内容换了用户也看不见。先关掉，改成按「重开」发（见 ClearStalePreview）。
+            bool stale = ClearStalePreview();
+            if (Send(stale ? MsgToggle : MsgSwitch, sel[0]))
+                Diag.Step("QLPreview: " + (stale ? "预览 " : "切换 ") + sel[0]);
         }
 
         /// <summary>
@@ -417,6 +448,73 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// QuickLook 那扇预览窗**此刻是不是真在用户眼前**（而不是「API 说可见、其实被压在后面」）。
+        ///
+        /// ⚠ 为什么非要有这个判据（2026-10-14 川报「空格调出 QL 后切到别的程序，再回来按空格就调不出来」）：
+        /// QuickLook 的 `TogglePreview(path)` 判的是它**自己的** `_viewerWindow.IsVisible` —— 而那个 `IsVisible`
+        /// 在「切走再切回来」之后**仍然是 true**（它不随失焦隐藏）：窗还在，只是被我们的窗口压住了。
+        /// 这时发 `Toggle` 命中的是 `IsVisible && path == _invokedPath` 那一支 = **`ClosePreview()`** ——
+        /// 于是川看到的是「按空格没反应」，其实是我们悄悄关掉了一扇他看不见的窗。反过来，只要先把它关掉
+        /// （`IsVisible` 变 false），下一次 `Toggle` 就会走 `InvokePreview` → BeginShow → 真的 Show + 置前。
+        ///
+        /// 判据（两层，任一层成立就算「在眼前」）：
+        ///   ① 它就是前台窗口 —— QuickLook 露脸时自己 `Activate()` 过；
+        ///   ② 取它中心点问 `WindowFromPoint`，拿回来的顶层祖先是它自己 —— 没被别的窗压住。
+        /// ⚠ 判不出来一律返回 true（= 什么都不动）：宁可漏一次修正，也不能乱关用户的窗。
+        /// </summary>
+        private static bool PreviewInFront()
+        {
+            try
+            {
+                IntPtr fg = NativeMethods.GetForegroundWindow();
+                IntPtr fgRoot = fg == IntPtr.Zero ? IntPtr.Zero : NativeMethods.GetAncestor(fg, GA_ROOT);
+                bool front = false;
+                EmbedApi.EnumWindowsProc cb = null;
+                cb = delegate(IntPtr h, IntPtr l)
+                {
+                    if (!EmbedApi.IsWindowVisible(h)) return true;
+                    string c = EmbedApi.ClassOf(h);
+                    if (c == null || c.IndexOf(WindowClassMark, StringComparison.OrdinalIgnoreCase) < 0) return true;
+
+                    if (h == fg || h == fgRoot) { front = true; return false; }   // ① 它在前台
+
+                    WRECT r;
+                    if (EmbedApi.GetWindowRect(h, out r) && r.Width > 8 && r.Height > 8)   // ② 它没被压住
+                    {
+                        IntPtr hit = NativeMethods.WindowFromPoint(
+                            new POINT(r.Left + r.Width / 2, r.Top + r.Height / 2));
+                        if (hit != IntPtr.Zero)
+                        {
+                            IntPtr root = NativeMethods.GetAncestor(hit, GA_ROOT);
+                            if (root == IntPtr.Zero) root = hit;
+                            if (root == h) { front = true; return false; }
+                        }
+                    }
+                    return true;
+                };
+                EmbedApi.EnumWindows(cb, IntPtr.Zero);
+                GC.KeepAlive(cb);
+                return front;
+            }
+            catch { return true; }
+        }
+
+        /// <summary>
+        /// 发预览/换预览之前，先把「可见但被压在后面」那扇僵尸预览窗关掉（判据见 <see cref="PreviewInFront"/>）。
+        /// 返回**是不是真补了那一刀** —— 补过之后那扇窗就没了，调用方要改用 `Toggle`（`Switch` 在没窗时是空转，
+        /// 见 `ViewWindowManager.SwitchPreview` 的第一行）。
+        /// ⚠ 只在「可见 + 不在眼前」时动手；预览本来就好好摆在眼前、或者压根没开，一律不碰。
+        /// </summary>
+        private static bool ClearStalePreview()
+        {
+            if (!PreviewVisible()) return false;
+            if (PreviewInFront()) return false;
+            Send(MsgClose, "");
+            Diag.Step("QLPreview: 预览窗被压在后面 -> 先关掉再重开");
+            return true;
+        }
+
+        /// <summary>
         /// 让那个常驻的 QuickLook 预览一个路径。
         ///
         /// ⚠ **不走** `QuickLook.exe &lt;路径&gt;`（起第二实例）那条路：那是 QuickLook 官方支持的外部
@@ -433,6 +531,10 @@ namespace TabbedExplorer
         /// </summary>
         public static void Preview(string path)
         {
+            // ⚠ 顺序要紧：**先**把「可见但被压在后面」那扇僵尸窗关掉，**再**发 Toggle。
+            //   见 ClearStalePreview / PreviewInFront —— 不补这一刀，Toggle 会命中
+            //   `IsVisible && path == _invokedPath` 那一支（= 关掉），用户看到的是「按空格没反应」。
+            ClearStalePreview();
             Send(MsgToggle, path);
         }
 

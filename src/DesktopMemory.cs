@@ -188,9 +188,142 @@ namespace TabbedExplorer
             p = p.Trim();
             if (p.Length == 0) return false;
             if (p.StartsWith("::") || p.StartsWith("shell:", StringComparison.OrdinalIgnoreCase)) return true;
+            // 便携设备（MTP / 数码相机）：地址栏给的是「此电脑\设备名\…」这种**显示名串**，
+            // 它不对应任何文件系统路径（`Directory.Exists` 恒 false），但 explorer.exe 自己认、
+            // 也能一路点进去（实测：内嵌窗口点进手机目录后地址栏报的就是这串）。
+            // 这一条必须排在 `Path.IsPathRooted` 前面 —— 见 `IsPortableDevicePath`。
+            if (IsPortableDevicePath(p)) return true;
             // 只认**绝对且真实存在**的目录：相对路径会相对当前工作目录解析，那是撞运气。
             try { return Path.IsPathRooted(p) && Directory.Exists(p); }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// 把便携设备那串**显示名形式**（`此电脑\motorola edge 20 pro\内部共享存储空间\…`）
+        /// 换成 **explorer.exe 真正认的那种形式**。
+        ///
+        /// 2026-10-14 实测定案（`probe/mtp_enum_probe.py` / `mtp_devpath_probe.py` / `mtp_open_real.py`）：
+        ///   · 「此电脑\motorola edge 20 pro\…」（显示名串）→ `SHParseDisplayName` 报
+        ///     `0x80070002`(FILE_NOT_FOUND)，explorer.exe 命令行收下但落到默认程序 ⇒ 用户看到的
+        ///     「点书签跳浏览器」。**这条路彻底死**。
+        ///   · 真正能解析的是：**设备那一段用设备路径**
+        ///     `\\?\usb#vid_18d1&pid_4ee2&mi_00#7&2ebcb680&0&0000#{6ac27878-a6fa-4155-ba85-f98f491d4f33}`
+        ///     （形如 `\\?\...`，末尾是 WPD 的 namespace GUID `{6ac27878-…}`）——
+        ///     整条 `::{20D04FE0-…}\\\?\usb#…\内部共享存储空间\…` **`SHParseDisplayName` 认**，
+        ///     `explorer.exe /n,/separate,"…"` 也认（实测直达手机目录，日志见 `现在在 此电脑\motorola…`）。
+        ///
+        /// 设备路径怎么来：**枚举「此电脑」的子项**（`IShellFolder::EnumObjects`）——
+        /// 便携设备在那张表里（实测 `[07] motorola edge 20 pro`，相对 PIDL 428 字节），
+        /// 但**不在 `ParseDisplayName` 的名字表里**，所以只能枚举找。
+        /// 找到设备的绝对 PIDL 之后，`SHGetNameFromIDList(SIGDN_DESKTOPABSOLUTEPARSING)`
+        /// 就把设备路径文本吐出来了。
+        ///
+        /// 返回值：换不出来（设备没插 / 名字对不上）就返回**原串** —— 让调用方那条路照旧失败，
+        /// 别把好好的路径悄悄改坏。见 <see cref="PortableDeviceRoot"/>。
+        /// </summary>
+        public static string PortableDeviceShellForm(string p)
+        {
+            if (!IsPortableDevicePath(p)) return p;
+            p = p.Trim();
+            int i = p.IndexOf('\\');
+            if (i <= 0) return p;
+            string devName = p.Substring(i + 1);
+            int j = devName.IndexOf('\\');
+            if (j <= 0) return p;                                 // 只有设备名，没往下的段
+            devName = devName.Substring(0, j);
+            string rest = p.Substring(i + 1 + j);                 // 从设备名后的反斜杠起（含）
+
+            string root = PortableDeviceRoot(devName);
+            if (string.IsNullOrEmpty(root)) return p;             // 没插 / 找不到：原样交回去
+            // ⚠⚠ `root` 是**整条绝对串**（`::{20D04FE0-…}\\\?\usb#vid_…#{6ac27878-…}`），
+            //    它自己**已经带「此电脑」那一段**了 —— 千万别再拼 `ThisPcPath`。
+            //    2026-10-14 09:39 实测踩到：拼成 `::{GUID}\::{GUID}\\\?\usb#…`（此电脑重复两遍），
+            //    地址栏/explorer 都不认这串，落到默认程序 ⇒ 用户看到的「点书签跳浏览器」。
+            //    对齐「地址栏手动输入能开」那条路：地址栏里那串的**设备段**就是 `\\?\usb#…`，
+            //    前面只挂一个 `此电脑`。这里给的就是同一个东西。
+            return root + rest;
+        }
+
+        /// <summary>设备显示名 → 它的**绝对路径串**（`::{20D04FE0-…}\\\?\usb#…`）。没有返回 null。</summary>
+        public static string PortableDeviceRoot(string deviceDisplayName)
+        {
+            if (string.IsNullOrEmpty(deviceDisplayName)) return null;
+            string key = deviceDisplayName.Trim();
+            lock (deviceRootLock)
+            {
+                DeviceHit hit;
+                if (deviceRoots.TryGetValue(key, out hit))
+                {
+                    // ⚠ **负结果只缓存 10 秒**（正结果 5 分钟）：否则用户插上手机后**要重启本程序**才认得——
+                    //   记忆还原（`StageRememberedTabs`）与 `CommandLineTarget` 都读这张表。
+                    double age = (DateTime.UtcNow - hit.At).TotalSeconds;
+                    if (hit.Root != null ? age < 300 : age < 10) return hit.Root;
+                }
+            }
+            string got = null;
+            try { got = NativeMethods.PortableDevicePathOf(key); }
+            catch { got = null; }
+            lock (deviceRootLock)
+            {
+                // 记着（含「这次没找到」）——一次枚举 ~40ms，别在热路径上反复枚举。
+                deviceRoots[key] = new DeviceHit { Root = got, At = DateTime.UtcNow };
+            }
+            return got;
+        }
+
+        /// <summary>设备路径缓存里的一条（带时间，见 <see cref="PortableDeviceRoot"/> 的 TTL）。</summary>
+        private sealed class DeviceHit { public string Root; public DateTime At; }
+
+        private static readonly Dictionary<string, DeviceHit> deviceRoots =
+            new Dictionary<string, DeviceHit>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly object deviceRootLock = new object();
+
+        /// <summary>把设备路径的负缓存清掉（设备插拔时调用；调用方也可以直接清空全表）。</summary>
+        public static void ForgetPortableDevices()
+        {
+            lock (deviceRootLock) deviceRoots.Clear();
+        }
+
+
+        /// <summary>
+        /// 是不是**便携设备**（MTP / PTP：手机、相机、播放器）里的位置。
+        ///
+        /// 形态来自实测（`data/log.txt` 与 `probe/mtp_*`，2026-10-14）：
+        ///   · 地址栏给的是 `此电脑\motorola edge 20 pro\内部共享存储空间\!573\…`
+        ///     —— 首段是**本地化显示名**「此电脑」，后面逐级拼设备/存储/目录名，
+        ///     用反斜杠串起来。`ShellWindows.LocationURL` 对它给的不是 `file:///`，
+        ///     `SHGetPathFromIDList(FILESYSPATH)` 也是 E_INVALIDARG ⇒ **没有文件系统路径**。
+        ///   · explorer.exe 自己认得这串：`explorer.exe /n,"此电脑\设备\…"` 能开
+        ///     （对照：`::{20D04FE0-…}` 那条链在日志里确有「新窗的文件夹」记录）。
+        ///
+        /// 判据刻意取窄：只认「首段 == 此电脑的显示名」这一种。别的相对路径
+        ///（`a\b`、`..\x`）照样被拒 —— 「不拿相对路径撞运气」那条老规矩不动。
+        /// 首段名走 `VirtualNameOf(ThisPcPath)`（跟界面同源），中英文系统都对得上。
+        /// </summary>
+        public static bool IsPortableDevicePath(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return false;
+            p = p.Trim();
+            int i = p.IndexOf('\\');
+            if (i <= 0 || i >= p.Length - 1) return false;         // 「此电脑」光杆 / 无第二段：不算
+            string head = p.Substring(0, i);
+            if (head.IndexOf(':') >= 0) return false;              // `C:\…` 之类：走真路径那条
+            return string.Equals(head, VirtualNameOf(ExplorerView.ThisPcPath),
+                                 StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// 某个虚拟位置在**地址栏里显示的那个名字**（「此电脑」/「This PC」）。
+        /// `virtuals` 那张表两个方向都有条目，这里反查第一个键 —— 跟界面用的是同一份数据，
+        /// 不另写一份字面量（写死了英文系统就对不上）。
+        /// </summary>
+        private static string VirtualNameOf(string stored)
+        {
+            if (string.IsNullOrEmpty(stored)) return "";
+            foreach (KeyValuePair<string, string> kv in virtuals)
+                if (Same(kv.Value, stored)) return kv.Key;
+            return "";
         }
 
         /// <summary>比路径用：`c:\Users\a\` 和 `C:\Users\a` 必须算同一个。</summary>

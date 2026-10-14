@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 namespace TabbedExplorer
@@ -48,6 +49,7 @@ namespace TabbedExplorer
         private const int WM_NCACTIVATE = 0x0086;
         private const int WM_GETMINMAXINFO = 0x0024;
         private const int WM_SETTINGCHANGE = 0x001A;
+        private const int WM_DROPFILES = 0x0233;
         private const int HTCLIENT = 1;
         private const int HTLEFT = 10;
         private const int HTRIGHT = 11;
@@ -385,6 +387,14 @@ namespace TabbedExplorer
             };
             // 书签栏文件夹上右键「全部打开（N 书签）」（用户）
             favBar.OpenAllRequested += delegate(FavNode f) { OpenAllFromFavBar(f); };
+            // 「添加当前路径为书签」问的就是这个：当前激活标签**实际停在**哪个文件夹。
+            // 用 `LivePath`（不是 `TargetPath`）—— 用户一路点进去之后要去的是他眼下看的那个目录。
+            favBar.CurrentPathProvider = delegate
+            {
+                if (activeIndex < 0 || activeIndex >= hosts.Count) return null;
+                string p = LivePath(hosts[activeIndex]);
+                return string.IsNullOrEmpty(p) ? null : p;
+            };
             // 书签栏上右键「隐藏书签栏」：交给 Hub（它要同时改设置、刷托盘菜单、刷所有窗口）
             favBar.HideRequested += delegate
             {
@@ -1004,6 +1014,14 @@ namespace TabbedExplorer
                 // 激活 / 失活：把「未激活」状态发给自绘的标题栏和标签条。
                 // wParam 非 0 = 正在激活（-1 那种「不要重画」也算激活）。
                 SetInactive(m.WParam == IntPtr.Zero);
+            }
+            if (m.Msg == WM_DROPFILES)
+            {
+                IntPtr drop = m.WParam;
+                base.WndProc(ref m);
+                OnFilesDropped(drop);
+                try { EmbedApi.DragFinish(drop); } catch { }
+                return;
             }
             base.WndProc(ref m);
         }
@@ -1673,10 +1691,27 @@ namespace TabbedExplorer
             for (int i = 0; i < b.Paths.Count; i++)
             {
                 string p = PathRules.Store(b.Paths[i]);
+                // ★ 每一项**先记成「恢复未落定」**（`Hub.SaveNow` 只留账里还挂着的）：
+                //   之后它真开出路径来（`OnHostPathChanged`）就划掉；一直挂着 = 这次没开成 ⇒ 留住。
+                //   这样「手机拔线 / 目录已删」不会因为「窗口里没有」被当成「用户关掉了」而永久洗掉，
+                //   而**用户真关掉的**（恢复时开出来过、账里已划掉）照样会被删。
+                if (hub != null) hub.NoteRestorePending(DesktopKey, b.Paths[i]);
+
                 if (!PathRules.Restorable(p))
                 {
                     skipped++;
                     Diag.Step("记忆: 跳过开不了的项「" + b.Paths[i] + "」（可能是个库/虚拟文件夹，没有真实路径）");
+                    continue;
+                }
+                // ⭐ **便携设备（手机 / 相机）现在不在 ⇒ 别摆占位**（2026-10-14 川报「重启又恢复一堆」：
+                //    那"一堆"就是 8 个「打开失败」的僵尸标签 —— 手机没插，`CommandLineTarget` 换不出设备路径）。
+                //    账里那一笔**不划掉** ⇒ `SaveNow` 照样把它留在记忆里，手机插回来重启还是能恢复。
+                //    判据跟 `ExplorerHost.CommandLineTarget` 同源：换不出真形式 == 设备不在。
+                if (PathRules.IsPortableDevicePath(p) &&
+                    string.Equals(PathRules.PortableDeviceShellForm(p), p, StringComparison.OrdinalIgnoreCase))
+                {
+                    skipped++;
+                    Diag.Step("记忆: 便携设备「" + b.Paths[i] + "」现在不在（没插？）—— 不摆占位，记忆里留着");
                     continue;
                 }
                 // 同一个路径**已经开在窗口里**了就别再开一个（收编 / 转生那条路会先把用户那扇窗
@@ -2560,24 +2595,49 @@ namespace TabbedExplorer
 
             string stored = PathRules.Store(path) ?? "";
             bool isThisPc = PathRules.Same(stored, ExplorerView.ThisPcPath);
-            // 只有「真·文件夹」（`D:\…` 这种）才谈得上导航过去
-            bool realFolder = !isThisPc && PathRules.Restorable(stored)
+
+            // ★ 「同一个文件夹连开两次」的短路：这扇备用窗口现在**就在**那个目录上（比如用户
+            //   刚从它里面按的 Ctrl+T），那就别费事去「导航到它已经在的地方」——
+            //   explorer 收下这种请求之后**什么都不做**，我们等的是「地址栏报出目标路径」，
+            //   而它早就报过了 ⇒ `RefreshPath` 的 `s == currentPath` 直接 return，
+            //   那一刻永远不来 ⇒ 标签一直藏着等超时。用户报的「打开的还是文档 / 跟重启一样」
+            //   正是这一条（书签指的正是它此刻所在的那个目录）。
+            //   不去导航、也就无从判断「到没到位」——直接按「已经到位」走（`navigated` 仍为 false）。
+            bool alreadyThere = !isThisPc && PathRules.Same(stored, LivePath(h));
+            // 只有「真·文件夹」（`D:\…` 这种）才谈得上导航过去。
+            // ⚠ 便携设备（手机 / 相机）**必须排掉**：它的 `Store` 值是「此电脑\设备\…」这种
+            //   显示名串（不以 `::` / `shell:` 开头，上面两条拦不住），而 `Navigate2` 对它
+            //   **返回成功却什么都不做** —— 2026-10-14 09:48 实测：hr=0，但 LocationURL 三十拍
+            //   全是空，白白等到超时才露面（用户看到的「点书签还是旧内容 / 跳浏览器」）。
+            //   这条走 `CommandLineTarget` 那条（`explorer.exe /n,/separate,<设备路径串>`），
+            //   那串是实测能直达的（`probe/mtp_final_form.py` 里 ① 那条）。
+            bool realFolder = !isThisPc && !alreadyThere && PathRules.Restorable(stored)
+                && !PathRules.IsPortableDevicePath(stored)
                 && !stored.StartsWith("::", StringComparison.Ordinal)
                 && !stored.StartsWith("shell:", StringComparison.OrdinalIgnoreCase);
-            if (!isThisPc && !realFolder) return false;
+            // 便携设备也不走 alreadyThere 的短路：那扇备用窗口在「此电脑」上，
+            // 跟手机串永远不相等，这里不会误判；显式排掉只为读起来清楚。
+            if (!isThisPc && !realFolder && !(alreadyThere && !PathRules.IsPortableDevicePath(stored)))
+                return false;
 
             bool navigated = false;
             Stopwatch swR = Stopwatch.StartNew();
             if (realFolder)
             {
+                // ★ 先把「我要去哪儿」挂在这扇窗上**再**发导航 —— 反过来的话，收编那边可能已经
+                //   拿着地址栏内容跟 `TargetPath` 比过了、判它「不是我要的窗」，就得白等 12 秒。
+                //   见 `ExplorerHost.NavigateTarget` / `CabMatches`。
+                h.NavigateTarget = stored;
                 if (!ShellBrowserReg.NavigateTo(h.ShellTarget, stored))
                 {
                     // 导航这条路走不通（没抓到清单项 / shell 不收这个请求）：**别将它就**，
                     // 也别把这个备用窗口扔掉 —— 它对「此电脑」照样好用，留着。这一次照老路现起。
+                    h.NavigateTarget = null;
                     Diag.Step("EmbedForm: 备用窗口导航不了，照老路现起 explorer（备用窗口留着）");
                     return false;
                 }
                 navigated = true;
+                Diag.Step("EmbedForm: 备用窗口导航已发出");
             }
             long tNav = swR.ElapsedMilliseconds;
 
@@ -2596,7 +2656,8 @@ namespace TabbedExplorer
             string line = stored.Length > 0 ? stored : LivePath(h);
             tabStrip.SetPath(i, TabStrip.PathLine(line));
             History.Add(line);
-            Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i + (navigated ? "（导航复用）" : "（秒开）"));
+            Diag.Step("EmbedForm: 用掉预热好的备用标签 idx=" + i
+                + (navigated ? "（导航复用）" : (alreadyThere ? "（本来就在这个目录）" : "（秒开）")));
             if (navigated)
             {
                 // 导航是 explorer 那边的异步动作，立刻现身会先闪一下它原来那个目录（此电脑）。
@@ -2857,6 +2918,12 @@ namespace TabbedExplorer
                 string p = LivePath(h);
                 tabStrip.SetPath(i, TabStrip.PathLine(p));
                 History.Add(p);
+                // ★ 这扇窗真开出路径来了 ⇒ 记忆账里对应的那条**划掉**（它是「成功还原」，
+                //   不是「没开成」）—— 见 `Hub.NoteRestoreDone`。
+                if (hub != null) hub.NoteRestoreDone(DesktopKey, p);
+                // ★ 开出的是便携设备（手机/相机）路径 ⇒ 记「设备这次在线」，记忆里那些没开成的
+                //   便携设备项才留着；设备离线时它们会被删干净（见 `Hub.SaveNow`）。
+                if (hub != null) hub.NotePortableDeviceSeen(p);
             }
             MarkDirty();
         }
@@ -3786,6 +3853,39 @@ namespace TabbedExplorer
         {
             base.OnHandleCreated(e);
             Theme.ApplyTitleBar(Handle);
+            // 让**外部程序**（非内嵌 explorer）往窗口空白处拖文件也接得住 —— 见 WM_DROPFILES 那段。
+            // ⚠ 这条对**内嵌 explorer 拖出来的**没用：OLE 拖放喂不活 WM_DROPFILES，见下面注释。
+            EmbedApi.DragAcceptFiles(Handle, true);
+        }
+
+        /// <summary>
+        /// `WM_DROPFILES` —— 老式的「拖文件到窗口上」，壳子自己发的。
+        /// 只有**外部程序**（资源管理器 / 桌面 / 别的编辑器）拖来的才走这里；
+        /// 内嵌那个 explorer 拖出来的东西**只会进 OLE 拖放**（书签段 `AllowDrop` 那条路），
+        /// 因为它拖的是 explorer 内部的 `CF_HDROP`，投递不到这条老路上。
+        /// 落在窗口空白处（标签条 / 内容边缘）= 加进书签栏根。
+        /// </summary>
+        private void OnFilesDropped(IntPtr drop)
+        {
+            try
+            {
+                uint n = EmbedApi.DragQueryFile(drop, 0xFFFFFFFF, null, 0);
+                if (n == 0) return;
+                List<string> keep = new List<string>();
+                for (uint i = 0; i < n; i++)
+                {
+                    uint len = EmbedApi.DragQueryFile(drop, i, null, 0);
+                    if (len == 0) continue;
+                    StringBuilder sb = new StringBuilder((int)len + 2);
+                    if (EmbedApi.DragQueryFile(drop, i, sb, (uint)sb.Capacity) == 0) continue;
+                    string p = sb.ToString();
+                    if (!string.IsNullOrEmpty(p)) keep.Add(p);
+                }
+                if (keep.Count == 0) return;
+                Diag.Step("EmbedForm: WM_DROPFILES " + keep.Count + " 项 -> 加进书签栏根");
+                favBar.AddByDrop(keep.ToArray(), null, -1);
+            }
+            catch (Exception ex) { Diag.Log("EmbedForm: WM_DROPFILES 处理失败 " + ex.Message); }
         }
 
         protected override void OnShown(EventArgs e)

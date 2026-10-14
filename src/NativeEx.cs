@@ -142,6 +142,160 @@ namespace TabbedExplorer
 
         [DllImport("shell32.dll")]
         public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+
+        // ---- 便携设备（MTP：手机 / 相机）的 PIDL 解析（见 `PortableDevicePathOf`）----
+        [DllImport("shell32.dll")]
+        public static extern int SHGetDesktopFolder(out IntPtr ppshf);
+
+        [DllImport("shell32.dll", EntryPoint = "SHGetNameFromIDList")]
+        public static extern int SHGetNameFromIDList(IntPtr pidl, int sigdnName, out IntPtr ppszName);
+
+        private const int SIGDN_NORMALDISPLAY = 0x00000000;
+        private const int SIGDN_DESKTOPABSOLUTEPARSING = unchecked((int)0x80028000);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int ParseDisplayNameFn(IntPtr psf, IntPtr hwnd, string pszDisplayName,
+                                                IntPtr pchEaten, out IntPtr ppidl,
+                                                IntPtr pdwAttributes);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int EnumObjectsFn(IntPtr psf, IntPtr hwnd, uint grfFlags,
+                                           out IntPtr ppenumIDList);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int EnumNextFn(IntPtr ppenum, uint celt, out IntPtr rgelt,
+                                        out uint pceltFetched);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate uint ReleaseFn(IntPtr pUnk);
+
+        private static IntPtr ComSlot(IntPtr pUnk, int index)
+        {
+            IntPtr vtbl = Marshal.ReadIntPtr(pUnk);
+            return Marshal.ReadIntPtr(vtbl, index * IntPtr.Size);
+        }
+
+        private static void ComRelease(IntPtr p)
+        {
+            if (p == IntPtr.Zero) return;
+            try
+            {
+                IntPtr rel = ComSlot(p, 2);
+                if (rel != IntPtr.Zero)
+                    ((ReleaseFn)Marshal.GetDelegateForFunctionPointer(rel, typeof(ReleaseFn)))(p);
+            }
+            catch { }
+        }
+
+        /// <summary>PIDL → 显示名（`sigdn` 那一档）。失败返回 null（名字自己 `CoTaskMemFree`）。</summary>
+        private static string NameOfPidl(IntPtr pidl, int sigdn)
+        {
+            if (pidl == IntPtr.Zero) return null;
+            IntPtr p;
+            if (SHGetNameFromIDList(pidl, sigdn, out p) != 0 || p == IntPtr.Zero) return null;
+            try { return Marshal.PtrToStringUni(p); }
+            finally { CoTaskMemFree(p); }
+        }
+
+        /// <summary>
+        /// **设备显示名**（「motorola edge 20 pro」）→ 它的**设备路径**
+        /// （`\\?\usb#vid_18d1&pid_4ee2&…#{6ac27878-…}`）。找不到返回 null。
+        ///
+        /// 为什么要枚举（2026-10-14 实测定案，`probe/mtp_enum_probe.py`）：
+        ///   便携设备**不在**「此电脑」`IShellFolder::ParseDisplayName` 的名字表里 ——
+        ///   拿显示名去解析报 `0x80070002`(FILE_NOT_FOUND)；但 `EnumObjects` 枚举
+        ///   「此电脑」的子项时它**在**（实测第 8 项，相对 PIDL 428 字节，明显比别的项长）。
+        ///   拿到它的绝对 PIDL 之后，`SHGetNameFromIDList(DESKTOPABSOLUTEPARSING)` 就给出
+        ///   那串设备路径文本 —— 而它**才是** `SHParseDisplayName` / `explorer.exe` 认的。
+        ///
+        /// ⚠ 名字比对忽略大小写；「此电脑」本身走 `SHParseDisplayName("::{20D04FE0-…}")` 拿。
+        /// ⚠ 一次枚举 ~40ms，调用方（`PathRules.PortableDeviceRoot`）自己有缓存。
+        /// </summary>
+        public static string PortableDevicePathOf(string deviceDisplayName)
+        {
+            if (string.IsNullOrEmpty(deviceDisplayName)) return null;
+
+            IntPtr pidlPc = IntPtr.Zero, sfPc = IntPtr.Zero, ppenum = IntPtr.Zero;
+            try
+            {
+                try { Application.OleRequired(); } catch { }
+
+                // ① 「此电脑」的绝对 PIDL（`::{20D04FE0-…}` 这一档是 shell 认的）
+                uint attr;
+                if (SHParseDisplayName(ExplorerView.ThisPcPath, IntPtr.Zero, out pidlPc, 0, out attr) != 0
+                    || pidlPc == IntPtr.Zero) return null;
+
+                // ② 从**桌面**绑定它的 IShellFolder（绝对 PIDL 得由桌面绑）
+                IntPtr sfDesk = IntPtr.Zero;
+                try
+                {
+                    Guid iid = new Guid("000214E6-0000-0000-C000-000000000046");   // IID_IShellFolder
+                    if (SHGetDesktopFolder(out sfDesk) != 0 || sfDesk == IntPtr.Zero) return null;
+                    Guid iid2 = iid;
+                    if (SHBindToObject(sfDesk, pidlPc, IntPtr.Zero, ref iid2, out sfPc) != 0
+                        || sfPc == IntPtr.Zero) return null;
+                }
+                finally { ComRelease(sfDesk); }
+
+                // ③ 枚举它的子项，按显示名找设备
+                EnumObjectsFn enumFn = (EnumObjectsFn)Marshal.GetDelegateForFunctionPointer(
+                    ComSlot(sfPc, 4), typeof(EnumObjectsFn));
+                uint SHCONTF = 0x20 | 0x40 | 0x80;      // FOLDERS | NONFOLDERS | INCLUDEHIDDEN
+                if (enumFn(sfPc, IntPtr.Zero, SHCONTF, out ppenum) != 0 || ppenum == IntPtr.Zero)
+                    return null;
+
+                EnumNextFn nextFn = (EnumNextFn)Marshal.GetDelegateForFunctionPointer(
+                    ComSlot(ppenum, 3), typeof(EnumNextFn));
+
+                for (int n = 0; n < 200; n++)           // 防御：正常十几项
+                {
+                    IntPtr one; uint got;
+                    if (nextFn(ppenum, 1, out one, out got) != 0 || got == 0 || one == IntPtr.Zero) break;
+                    IntPtr abs = ILCombine(pidlPc, one);
+                    if (abs == IntPtr.Zero) continue;
+                    try
+                    {
+                        string nd = NameOfPidl(abs, SIGDN_NORMALDISPLAY);
+                        if (nd != null && string.Equals(nd.Trim(), deviceDisplayName.Trim(),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            return NameOfPidl(abs, SIGDN_DESKTOPABSOLUTEPARSING);
+                        }
+                    }
+                    finally { ILFree(abs); }
+                }
+                return null;
+            }
+            catch (Exception ex) { Diag.Log("NativeEx: 枚举便携设备失败 " + ex.Message); return null; }
+            finally
+            {
+                ComRelease(ppenum);
+                ComRelease(sfPc);
+                if (pidlPc != IntPtr.Zero) { try { ILFree(pidlPc); } catch { } }
+            }
+        }
+
+
+        [DllImport("shell32.dll")]
+        public static extern IntPtr ILCombine(IntPtr pidl1, IntPtr pidl2);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        public static extern int SHBindToObject(IntPtr psf, IntPtr pidl, IntPtr pbc,
+                                                ref Guid riid, out IntPtr ppv);
+
+        /// <summary>
+        /// `STRRET` —— shell 返回显示名用的联合体。x64 下是 **272 字节**
+        ///（`uType` 4 + 对齐 4 + 联合 264）。
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STRRET
+        {
+            public uint uType;
+            public IntPtr pOleStr;         // STRRET_WSTR
+            public uint uOffset;           // STRRET_OFFSET
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string cStr;            // STRRET_CSTR
+        }
     }
 
     internal delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
@@ -559,5 +713,7 @@ namespace TabbedExplorer
             GC.KeepAlive(cb);
             return string.Join(" | ", names.ToArray());
         }
+
     }
+
 }

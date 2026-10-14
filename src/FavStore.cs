@@ -562,15 +562,21 @@ namespace TabbedExplorer
             catch { return path; }
         }
 
-        /// <summary>是不是文件夹（决定点击行为：文件夹开标签、文件用默认程序打开）。</summary>
+        /// <summary>是不是文件夹（决定点击行为：文件夹开标签、文件用默认程序打开）。
+        /// ⚠ 便携设备（手机 / 相机）那串没有文件系统路径，`Directory.Exists` 恒假，
+        ///   但点它就该**开标签**（不是交给默认程序去"打开文件"）—— 见 `PathRules.IsPortableDevicePath`。</summary>
         public static bool IsFolder(string path)
         {
-            try { return !string.IsNullOrEmpty(path) && Directory.Exists(path); }
+            if (string.IsNullOrEmpty(path)) return false;
+            if (PathRules.IsPortableDevicePath(path)) return true;
+            try { return Directory.Exists(path); }
             catch { return false; }
         }
 
         /// <summary>
-        /// 收进来的路径先归一：能收进来的只有「真实存在的文件/文件夹」和 shell 虚拟路径。
+        /// 收进来的路径先归一：能收进来的只有「真实存在的文件/文件夹」、shell 虚拟路径、
+        /// 以及**便携设备里的位置**（手机 / 相机，MTP —— 没有文件系统路径，见
+        /// `PathRules.IsPortableDevicePath`）。
         /// 库（视频 / 图片 这种）没有路径，收不了 —— 返回 null。
         /// </summary>
         private static string NormalizePath(string path)
@@ -580,6 +586,9 @@ namespace TabbedExplorer
             if (p.Length == 0) return null;
             if (p.StartsWith("::", StringComparison.Ordinal) ||
                 p.StartsWith("shell:", StringComparison.OrdinalIgnoreCase)) return p;
+            // ⚠ 必须在 `Directory.Exists` 之前：便携设备那串永远过不了存在性检查，
+            //   但它开得了（explorer 自己认）—— 见 `PathRules.Restorable` 同款处理。
+            if (PathRules.IsPortableDevicePath(p)) return p;
             try
             {
                 if (File.Exists(p) || Directory.Exists(p)) return Path.GetFullPath(p);

@@ -1156,15 +1156,23 @@ namespace TabbedExplorer
             name = null;
             string p = rawPath == null ? null : rawPath.Trim().Trim('"');
             if (string.IsNullOrEmpty(p)) return false;
-            bool isDir = FavStore.IsFolder(p);
-            if (!isDir)
+            string full;
+            if (PathRules.IsPortableDevicePath(p))
             {
-                try { if (!System.IO.File.Exists(p)) return false; }
+                // 便携设备（手机 / 相机）：没有文件系统路径，`GetFullPath` 会抛 —— 原样存。
+                full = p;
+            }
+            else
+            {
+                bool isDir = FavStore.IsFolder(p);
+                if (!isDir)
+                {
+                    try { if (!System.IO.File.Exists(p)) return false; }
+                    catch { return false; }
+                }
+                try { full = System.IO.Path.GetFullPath(p); }
                 catch { return false; }
             }
-            string full;
-            try { full = System.IO.Path.GetFullPath(p); }
-            catch { return false; }
             name = FavStore.NameOfPath(full);
 
             bool added = false;

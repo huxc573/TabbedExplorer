@@ -15,7 +15,7 @@ namespace TabbedExplorer
     ///      点一下会**往下列一层**（浏览器就是这么干的）。
     ///   2. **最左边一枚固定的书签图标** —— 这条栏的「名牌」，不跟着内容横向滚动；
     ///      点它开**书签管理器**（原来点它是开数据目录，用户改成了「管理书签」）。
-    ///   3. 项上右键可以**重命名**（改我们自己这份 json 里记的显示名，磁盘上那个文件夹不动）。
+    ///   3. 项上右键可以**编辑**（改显示名 + 目标路径；只动我们自己这份 json，磁盘上那个文件夹不动）。
     ///
     /// 点击行为：文件夹 → 开成新标签；文件 → 交给系统（默认程序）打开。
     ///
@@ -1920,7 +1920,7 @@ namespace TabbedExplorer
                     else
                         m.Add(PopMenu.It("展开这一层", delegate { ShowSubMenu(rowIndex); }));
                 }
-                m.Add(PopMenu.It("重命名…", delegate { Rename(node); }));
+                m.Add(PopMenu.It("编辑…", delegate { Edit(node); }));
                 m.Add(PopMenu.Split());
             }
             else
@@ -1940,7 +1940,7 @@ namespace TabbedExplorer
                 }));
                 // 用户要的：项能改名（改的是**我们自己这份 json 里记的显示名**，
                 // 磁盘上那个文件夹/文件一个字节都不动）
-                m.Add(PopMenu.It("重命名…", delegate { Rename(node); }));
+                m.Add(PopMenu.It("编辑…", delegate { Edit(node); }));
                 m.Add(PopMenu.Split());
             }
 
@@ -2031,16 +2031,49 @@ namespace TabbedExplorer
             }
         }
 
-        /// <summary>改显示名（点小输入框，改完存盘）。</summary>
-        private void Rename(FavNode node)
+        /// <summary>
+        /// 编辑一项：**显示名 + 目标路径**一起改（文件夹只有显示名 —— 它本来就没有目标路径）。
+        ///
+        /// 用户：「书签少了编辑功能吧？为啥只有重命名，路径我也想编辑，重命名直接改成编辑吧。」
+        ///
+        /// 三条要点：
+        /// - 路径改了才过 `FavStore.EditItem` 里的 `NormalizePath`（判据只有那一处）—— **没改就不碰**：
+        ///   项里可能存着「当时能开、现在磁盘不在了」的路径，改个名字不该把它判死。
+        /// - 改出来的路径跟**别处**某一项撞了，按 `Settings.FavAllowDup` 决定收不收
+        ///   （默认允许重复，跟「添加 / 拖入」同一个口径）。「撞自己」不算撞。
+        /// - 文件夹改名走同一套（`Name` 清空 = 回落到路径末级，`FavStore.NameOf` 自己算）。
+        /// </summary>
+        private void Edit(FavNode node)
         {
-            string old = FavStore.NameOf(node);
-            string nn = InputBox.Ask(this, "重命名字签", "显示名", old);
-            if (nn == null) return;
-            nn = nn.Trim();
-            if (nn.Length == 0 || nn == old) return;
-            FavStore.Edit(delegate(List<FavNode> l) { node.Name = nn; });
-            Diag.Step("书签栏: 重命名 " + old + " -> " + nn);
+            if (node == null) return;
+            bool isFolder = node.IsFolder;
+            string shownName = FavStore.NameOf(node);     // 输入框初值 = 眼下看得见的那个名字
+            string oldName = node.Name;                   // 存的值（可能 null = 没设过）
+            string oldPath = node.Path;                   // 文件夹 = null
+
+            string[] r = InputBox.AskEdit(this, isFolder ? "编辑书签文件夹" : "编辑书签",
+                                          shownName, isFolder ? null : oldPath);
+            if (r == null) return;
+
+            string typedName = (r[0] ?? "").Trim();
+            string typedPath = isFolder ? null : (r[1] ?? "").Trim();
+
+            // 名字：没动过就原样存回（⚠ 不能跟 `shownName` 比完存 null —— 文件夹名会丢）；清空 = 不设名字
+            string nameToStore = oldName;
+            if (typedName != shownName) nameToStore = typedName.Length == 0 ? null : typedName;
+
+            // 路径：null = 不动（`.EditItem` 里有判据，只有真改了才校验）
+            string pathArg = (isFolder || string.Equals(typedPath, oldPath ?? "", StringComparison.Ordinal))
+                             ? null : typedPath;
+
+            string fail;
+            if (!FavStore.EditItem(node, nameToStore, pathArg, out fail))
+            {
+                Toast.Show(NotifyItems.FavAddNoPath, "改不了", fail);
+                return;
+            }
+            Diag.Step("书签栏: 编辑 " + shownName + " -> 名字「" + (nameToStore ?? "") + "」"
+                      + (isFolder ? "" : " 路径「" + (node.Path ?? "") + "」(原 " + (oldPath ?? "") + ")"));
         }
 
         protected override void Dispose(bool disposing)

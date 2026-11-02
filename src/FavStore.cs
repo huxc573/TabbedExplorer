@@ -574,6 +574,75 @@ namespace TabbedExplorer
         }
 
         /// <summary>
+        /// 编辑一项：**显示名 + 目标路径**一起写。书签栏右键和书签管理器共用这一个口
+        /// （免得两处各写一套校验，口径早晚会飘）。
+        ///
+        /// - `newName`：要存的显示名，**null = 不设名字**（`NameOf` 回落到路径末级）。
+        /// - `newPath`：**null = 不动路径**（文件夹、或只想改名）；传字符串就过
+        ///   <see cref="NormalizePath"/> 校验 —— 这一处就是「什么算能收的路径」的唯一判据。
+        ///   只有**真的改了**才校验：项里可能存着「当时能开、现在磁盘不在了」的路径，
+        ///   改个名字不该把它判死。
+        /// - 改出来的路径跟**别处**某一项撞了，按 `Settings.FavAllowDup` 决定收不收
+        ///   （默认允许重复，跟「添加 / 拖入」同一口径）。「撞自己」不算撞。
+        ///
+        /// 返回 false 时 `fail` 是给人看的原因（调用方直接塞进提示框）。
+        /// </summary>
+        public static bool EditItem(FavNode node, string newName, string newPath, out string fail)
+        {
+            fail = null;
+            if (node == null) { fail = "这一项已经不在了。"; return false; }
+
+            string pathToStore = node.Path;
+            if (newPath != null && !node.IsFolder)
+            {
+                if (!string.Equals(newPath.Trim(), node.Path ?? "", StringComparison.Ordinal))
+                {
+                    string clean = NormalizePath(newPath);
+                    if (clean == null)
+                    {
+                        fail = string.IsNullOrEmpty((newPath ?? "").Trim())
+                            ? "路径不能空着（不想要它就从书签移除）。"
+                            : "这个位置没有真实路径（库 / 虚拟文件夹），收不进书签。";
+                        return false;
+                    }
+                    if (!Settings.FavAllowDup && DupExcept(node, clean))
+                    {
+                        fail = "「" + NameOfPath(clean) + "」已经在书签里了。";
+                        return false;
+                    }
+                    pathToStore = clean;
+                }
+            }
+
+            Edit(delegate(List<FavNode> l)
+            {
+                node.Name = newName;
+                if (!node.IsFolder) node.Path = pathToStore;
+            });
+            return true;
+        }
+
+        /// <summary>整条栏（含子树）里，**除了 `self` 之外**还有没有项用这个路径。</summary>
+        private static bool DupExcept(FavNode self, string path)
+        {
+            FavNode bar = BarFolder;
+            if (bar == null) return false;
+            return HasPathExcept(bar.Kids, path, self);
+        }
+
+        private static bool HasPathExcept(List<FavNode> l, string path, FavNode self)
+        {
+            for (int i = 0; i < l.Count; i++)
+            {
+                FavNode n = l[i];
+                if (n == self) continue;
+                if (!n.IsFolder && string.Equals(n.Path, path, StringComparison.OrdinalIgnoreCase)) return true;
+                if (n.IsFolder && HasPathExcept(n.Kids, path, self)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// 收进来的路径先归一：能收进来的只有「真实存在的文件/文件夹」、shell 虚拟路径、
         /// 以及**便携设备里的位置**（手机 / 相机，MTP —— 没有文件系统路径，见
         /// `PathRules.IsPortableDevicePath`）。

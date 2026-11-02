@@ -16,7 +16,7 @@ namespace TabbedExplorer
     /// 行为：
     ///   · 左树：点一行 = 选中那个文件夹；点左边的三角 = 展开/收起；双击 = 打开这个文件夹（新标签）
     ///   · 右列：双击 = 打开（文件夹开新标签 / 文件交给系统）；行尾的 ✕ = 从书签移出
-    ///   · 右键：重命名 / 新建文件夹 / 删除 / **设为书签栏**（哪个文件夹喂给横向那条栏）
+    ///   · 右键：编辑 / 新建文件夹 / 删除 / **设为书签栏**（哪个文件夹喂给横向那条栏）
     ///   · 从资源管理器**拖文件夹进来** = 加进当前选中的文件夹（这就是嵌套的做法）
     ///   · 搜索框：输入就跨全树过滤，右边列变成搜索结果（显示它在哪个文件夹里）
     ///
@@ -1033,14 +1033,31 @@ namespace TabbedExplorer
                 m.Add(PopMenu.Split());
             }
 
-            m.Add(Mi("重命名…", delegate
+            // 编辑 = 显示名 + 目标路径（文件夹只有名字）。跟书签栏右键同一个口：`FavStore.EditItem`。
+            m.Add(Mi("编辑…", delegate
             {
-                string nn = InputBox.Ask(this, "重命名", "显示名", FavStore.NameOf(n));
-                if (nn == null) return;
-                nn = nn.Trim();
-                if (nn.Length == 0) return;
-                FavStore.Edit(delegate(List<FavNode> l) { n.Name = nn; });
-                Invalidate();
+                string shownName = FavStore.NameOf(n);
+                string oldPath = n.Path;
+                string[] res = InputBox.AskEdit(this, n.IsFolder ? "编辑书签文件夹" : "编辑书签",
+                                               shownName, n.IsFolder ? null : oldPath);
+                if (res == null) return;
+
+                string typedName = (res[0] ?? "").Trim();
+                string typedPath = n.IsFolder ? null : (res[1] ?? "").Trim();
+
+                string nameToStore = n.Name;
+                if (typedName != shownName) nameToStore = typedName.Length == 0 ? null : typedName;
+
+                string pathArg = (n.IsFolder || string.Equals(typedPath, oldPath ?? "", StringComparison.Ordinal))
+                                 ? null : typedPath;
+
+                string fail;
+                if (!FavStore.EditItem(n, nameToStore, pathArg, out fail))
+                {
+                    Toast.Show(NotifyItems.FavAddNoPath, "改不了", fail);
+                    return;
+                }
+                Rebuild();
             }));
 
             if (n.IsFolder && !n.Bar)

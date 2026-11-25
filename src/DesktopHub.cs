@@ -128,6 +128,16 @@ namespace TabbedExplorer
         /// <summary>被我们清空过绘制区的 shell 窗口（收尾要还原，见 <see cref="BlankShellWindow"/>）。</summary>
         private readonly HashSet<IntPtr> shellBlanked = new HashSet<IntPtr>();
         /// <summary>
+        /// 我们自己用 `SW_SHOW` 拉起来的 shell 窗（hwnd → TickCount）。
+        ///
+        /// 为什么要记：`UnhushShellWindow` 那一下 SHOW 会让系统**再发一条 `EVENT_OBJECT_SHOW`**，
+        /// 而那条事件长得跟「用户又开了一扇文件夹窗」一模一样 ⇒ 我们把它重新收编、再按住、
+        /// 再等路径超时、再放开 …… 1.2 秒一轮无限转（2026-11-25 川报的「一直在创建此电脑窗口」，
+        /// 日志铁证 11:13:29~11:17:53 同一 cab=0x160886 转了 401 条）。
+        /// 见 <see cref="SelfShownRecently"/>。
+        /// </summary>
+        private readonly Dictionary<IntPtr, int> selfShown = new Dictionary<IntPtr, int>();
+        /// <summary>
         /// 「转生之后还得替用户把选中项摆回去」的那批活儿（见 <see cref="ScheduleReveal"/>）。
         ///
         /// 三方（wb / VS Code / 各种「在资源管理器里显示」）点开一个文件夹，走的其实是
@@ -223,6 +233,22 @@ namespace TabbedExplorer
         /// 用户看不见，标签也**不会**因此晚开（路径在关窗之前就交给 UI 线程了，见 `WatchShellWindow`）。
         /// </summary>
         private const int ShellSettleMs = 800;
+        /// <summary>
+        /// 「我们自己刚把这扇 shell 窗显出来」的记忆时长（见 <see cref="SelfShownRecently"/>）。
+        ///
+        /// 取 1.5 秒：SHOW 事件投递 + 我们排队处理，实测 0~47ms 到 300ms 不等；比 `ShellResolveMs`
+        /// (1200ms) 再宽一点，保证上一轮盯梢线程彻底退出之后这段记忆还在。
+        /// </summary>
+        private const int SelfShownGuardMs = 1500;
+        /// <summary>
+        /// 盯梢线程多久允许**问一次地址栏**（`EmbedApi.AddressPathOf`）。
+        ///
+        /// 只在对虚拟根（此电脑 / 回收站 / 控制面板）等路径时才走到这条路 —— `ShellWindows` 的
+        /// `LocationURL` 对它们恒 null。地址栏这一问比清单贵得多（走一遍窗口子树 + 跨进程读文本），
+        /// 而盯梢是 25ms 一轮，不节流等于每 25ms 戳一次正忙着建窗的 explorer。
+        /// 100ms 一次，1.2 秒的等待窗口里还有 12 次机会，够。
+        /// </summary>
+        private const int AddressRetryMs = 100;
         /// <summary>
         /// 「用原生资源管理器打开」的让行期（见 <see cref="OpenNative"/>）。
         ///
@@ -637,6 +663,12 @@ namespace TabbedExplorer
                 // （见 TakeOverShellWindow）。
                 bool shellTake = Settings.CaptureShell && IsShellTakeoverCandidate(h);
                 bool candidate = shellTake || IsHideCandidate(h);
+                // ★ 我们自己刚用 `SW_SHOW` 放开的那扇 shell 窗：这条 SHOW 是我们自己造成的，
+                //   不是「用户又开了一扇文件夹窗」。不挡就是自激死循环 —— 收编 → 按住 → 等路径超时
+                //   → 放开（`SW_SHOW`）→ 又一条 SHOW → 又收编 …… 1.2 秒一轮（见 `selfShown`）。
+                //   挡掉之后它停在**正常可见**状态（符合「不许在 shell 里留隐形窗」那条红线）；
+                //   它要是还开着某个目录，`DrainShell` 那条 250ms 轮询照旧会把它转生掉。
+                if (shellTake && SelfShownRecently(h)) return;
                 // ★ 用户刚点了「用原生资源管理器打开」：这几秒里冒出来的候选窗口就是他要的 ——
                 //   原样放过，**而且认下这一扇**（`MarkNativeKeep`，挂在 `IsClaimed` 上）。
                 //   放在 candidate 之后判：只有「本来会被我们动手」的窗口才吃这笔凭据，
@@ -923,6 +955,7 @@ namespace TabbedExplorer
                 {
                     DateTime deadline = DateTime.Now.AddMilliseconds(ShellResolveMs);
                     int closeAt = 0;         // 0 = 还没读到路径；否则 = 「落定」之后再关的时刻（TickCount）
+                    int nextAddrTry = 0;     // 下次允许问地址栏的时刻（TickCount）；见 AddressRetryMs
                     string path = null;
                     while (true)
                     {
@@ -937,7 +970,23 @@ namespace TabbedExplorer
                         }
                         if (closeAt == 0)
                         {
+                            // ★ 只问 `ShellWindows` 的 `LocationURL` 不够：「此电脑 / 回收站 / 控制面板」
+                            //   这类虚拟根的 LocationURL 是 `::{CLSID}`，而 `FileUrlToPath` 只认 `file:///`
+                            //   ⇒ 恒返回 null ⇒ 这里等满 1.2 秒放开 ⇒ 放开那一下的 `SW_SHOW` 又发 SHOW 事件
+                            //   ⇒ 我们自己再收编一遍 ⇒ 1.2 秒一轮死循环（2026-11-25 川报的「一直在创建
+                            //   此电脑窗口」，日志 11:13:29~11:17:53 同一 cab=0x160886 转了 401 条）。
+                            //   地址栏那条读得出「此电脑」、并按 `PathRules.Store` 换成 `::{CLSID}`。
+                            //   force=true 是必须的：负缓存 1200ms 正好盖住整个等待期（见 AddressPathOf）。
                             string p = ShellBrowserReg.PathOfWindow(h);
+                            // ★ 地址栏那条比清单贵（要 `EnumChildWindows` 走一遍 + 跨进程读 toolbar 文本）：
+                            //   这一问在 25ms 一轮的盯梢里，**100ms 才问一次**就够 —— 1.2 秒的等待窗口里
+                            //   还有 12 次机会，而 explorer 那边的负担降到四分之一（它在建窗期间很忙，
+                            //   反复戳它的窗口树会把 Ribbon / 内容就绪一起往后推）。
+                            if (p == null && Environment.TickCount - nextAddrTry >= 0)
+                            {
+                                nextAddrTry = Environment.TickCount + AddressRetryMs;
+                                p = EmbedApi.AddressPathOf(h, true);
+                            }
                             if (p != null)
                             {
                                 // ★ 路径先交出去（UI 线程这就去开标签）—— 推迟关窗**不会**拖慢标签。
@@ -1136,9 +1185,40 @@ namespace TabbedExplorer
                 if (!NativeMethods.IsWindow(h)) return;
                 if (EmbedApi.IsWindowVisible(h)) return;
                 EmbedApi.ShowWindow(h, EmbedApi.SW_SHOW);
+                // ★ 这一下 SHOW 会**再发一条 `EVENT_OBJECT_SHOW`**，看着跟「用户又开了一扇文件夹窗」
+                //   一模一样。不记账的话我们会把它重新收编：按住 → 等路径超时 → 又放开 → 再 SHOW……
+                //   1.2 秒一轮无限转（见 `selfShown` 的注释）。记下来，让 `OnWindowShown` 认出
+                //   「这是我自己刚显出来的」并且**原样放过**（它现在是一扇正常可见的窗，符合红线）。
+                NoteSelfShown(h);
                 Diag.Log("Hub: shell 那扇窗没能关掉（" + why + "），已恢复显示 —— 不留隐形窗");
             }
             catch (Exception ex) { Diag.Log("Hub: 恢复 shell 窗口失败 " + ex.Message); }
+        }
+
+        /// <summary>记下「这扇 shell 窗是我们自己刚 `SW_SHOW` 出来的」。见 <see cref="selfShown"/>。</summary>
+        private void NoteSelfShown(IntPtr h)
+        {
+            lock (selfShown) selfShown[h] = Environment.TickCount;
+        }
+
+        /// <summary>
+        /// 这扇窗的「显示」是不是**我们自己刚才那一下 `SW_SHOW`** —— 是就别当新窗口收编。
+        ///
+        /// ⚠ 不这么判的后果是自激回环：`UnhushShellWindow` 的 SHOW → 我们收编 → Hush → 1.2 秒
+        ///   读不到路径 → Unhush → 又 SHOW …… 循环里那扇窗实际一直隐形（探针 6 轮全 `vis=False`），
+        ///   正好踩中「在 shell 进程里留隐形窗 ⇒ Win+E 按下去没反应」那条红线。
+        /// ⚠ 记忆到期自己作废（`SelfShownGuardMs`），不是一次性开关：用户真去点同一扇窗时照常收。
+        /// </summary>
+        private bool SelfShownRecently(IntPtr h)
+        {
+            lock (selfShown)
+            {
+                int at;
+                if (!selfShown.TryGetValue(h, out at)) return false;
+                if (Environment.TickCount - at < SelfShownGuardMs) return true;
+                selfShown.Remove(h);
+                return false;
+            }
         }
 
         /// <summary>取走盯梢线程交上来的路径（取了就清）。见 <see cref="WatchShellWindow"/>。</summary>

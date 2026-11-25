@@ -2,6 +2,21 @@
 
 版本号唯一来源 = 仓库根 `VERSION` 文件（单行），标签 `v<X.Y.Z>`（附注标签）。
 口径：新功能抬 MINOR，修 bug 只走 PATCH，不兼容才抬 MAJOR。
+同一版本下反复修的多个 bug **并入同一条目**，不为了单个 bug 抬版本号。
+
+## [v1.21.2] - 2026-11-25
+
+**主题：修掉「一直在创建此电脑窗口」的自激回环**
+
+### 修复
+- **shell 那扇「此电脑」窗每 1.28 秒被重新收编一次，日志无限增长、窗口全程隐形。**
+  虚拟根的 `ShellWindows.LocationURL` 是 `::{CLSID}`，`FileUrlToPath` 只认 `file:///` ⇒ 盯梢线程
+  等满 1.2 秒读不到路径 ⇒ 放开那一下 `SW_SHOW` 又发一条 `EVENT_OBJECT_SHOW` ⇒ 被自己当新窗收编
+  ⇒ 死循环（日志 `11:13:29`~`11:17:53` 同一 `cab=0x160886` 401 条；50ms 采样 3 秒只有 1 个句柄、零新
+  pid ⇒ **不是外部程序**）。修法两处：① 盯梢线程读不到就退化问地址栏
+  （`EmbedApi.AddressPathOf(h, true)`，100ms 节流一次）；② `UnhushShellWindow` 记 `selfShown`，
+  `OnWindowShown` 对「自己刚 `SW_SHOW` 出来的同一 hwnd」放行 1.5 秒。
+
 
 ## [v1.21.1] - 2026-11-02 23:50
 
